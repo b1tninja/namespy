@@ -6,3 +6,16 @@ debug-*.log
 __pycache__/
 *.pyc
 *.pyo
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/

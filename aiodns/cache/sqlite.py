@@ -61,13 +61,15 @@ def _unpack_records(payload):
 def _name_text(name):
     """Canonical text form of ``name`` for the SQLite key.
 
-    Uppercased label sequence, no trailing root terminator — matches
-    :meth:`DomainName._labels` so case and the trailing ``.`` do not
-    fragment cache keys.
+    Case-folded, escaped, root-terminated — :attr:`DomainName.canonical_text`
+    is exactly the identity a cache key needs, so ``EXAMPLE.COM``,
+    ``example.com`` and ``example.com.`` collapse to one row instead of
+    fragmenting into three. Escaped form also means a label containing a dot
+    cannot forge a second key.
     """
     if not isinstance(name, DomainName):
         name = DomainName(str(name))
-    return ".".join(name._labels())
+    return name.canonical_text
 
 
 class SqliteDnsCache(DnsCache):
