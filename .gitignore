@@ -1,7 +1,23 @@
-named.root
+# Root hints ship INSIDE the package (aiodns/named.root) and are loaded through
+# importlib.resources, so that file must stay tracked and must not be ignored --
+# hatchling derives its default wheel/sdist excludes from this file, and an
+# ignore rule here once meant a built wheel would have had no hints at all.
+# Only a file dropped in the working tree for ad-hoc testing is disposable.
+/named.root
+
+# Traces the CLI writes with --trace; generated, never committed. Matches at
+# any depth, which is how aiodns/last_resolution.md got committed in the first
+# place while being "ignored" -- it was tracked, so the rule never applied.
+last_resolution.md
+
+# Editor/agent scratch. Plans and workspace state are local working notes, not
+# project history; committing them made diffs noisy and conflicted constantly.
+.cursor/
+.vscode/
+.idea/
+
 venv/
 .venv/
-.idea/
 debug-*.log
 __pycache__/
 *.pyc
@@ -13,9 +29,17 @@ dist/
 *.egg-info/
 .eggs/
 
-# Test and lint caches
+# Test, lint and type-check caches
 .pytest_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 .mypy_cache/
+.pyright_cache/
+
+# Local-only caches and captures from manual experiments
+*.sqlite
+*.pcap
+*.cap
+

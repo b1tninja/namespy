@@ -50,7 +50,14 @@ python -m aiodns
 
 On success you should see a log line about startup; the process then **runs until you press Ctrl+C**.
 
-Root hints for the recursive resolver are read from `named.root` in the current working directory if present, otherwise the code may attempt to **fetch** [Internic’s `named.root`](https://www.internic.net/domain/named.root) (see `aiodns/resolver.py` and your `.gitignore` for `named.root`).
+Root hints come from `named.root` **shipped inside the package** and loaded with
+`importlib.resources`, so a fresh install resolves from the root servers with no
+setup and no network fetch at construction time. To use your own copy, pass
+`root_hints_path=` to `RecursiveResolver`; to pull a current version from
+[Internic](https://www.internic.net/domain/named.root), `await
+resolver.refresh_root_hints()`. Nothing reaches the network unless you await
+that call — an earlier revision called `urlretrieve` inside `__init__`, with no
+timeout, which made constructing a resolver an unbounded blocking operation.
 
 ## Tracing
 
