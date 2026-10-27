@@ -31,8 +31,11 @@ from aiodns.rdata import (
     RData_SOA,
     RData_SRV,
     RData_TXT,
+    all_rdata_classes,
     generic_presentation,
     rdata_class_for,
+    split_charstrings,
+    type_name_of,
 )
 
 NAME = DomainName("www.example.com")
@@ -206,6 +209,36 @@ def test_txt_long_text_splits_at_255() -> None:
     record = RData_TXT.from_text(text)
     assert [len(part) for part in record.strings] == [255, 255, 90]
     assert RData_TXT.parse_from(bytes(record), 0, len(bytes(record))).text == text
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b"", [b""]),  # empty text is one zero-length string, not zero strings
+        (b"x" * 255, [b"x" * 255]),  # exactly at the limit stays whole
+        (b"x" * 256, [b"x" * 255, b"x"]),  # one octet over forces a second string
+    ],
+)
+def test_split_charstrings_boundaries(payload: bytes, expected: list[bytes]) -> None:
+    """The chunker must not invent an empty trailing chunk nor merge at the edge.
+
+    An extra ``b""`` at the end would change the wire form and so the RDATA hash,
+    which the cache keys on; two chunks where one belongs breaks re-signing and
+    any consumer that compares RDATA byte-for-byte.
+    """
+    assert split_charstrings(payload) == expected
+
+
+def test_txt_empty_text_is_one_empty_string() -> None:
+    """``""`` on the wire is ``\\x00`` -- a single zero-length character-string."""
+    assert bytes(RData_TXT.from_text("")) == b"\x00"
+    assert RData_TXT.parse_from(b"\x00", 0, 1).text == ""
+
+
+def test_txt_rejects_an_oversized_single_string() -> None:
+    """Constructing an un-splittable string is a caller error, not a wire error."""
+    with pytest.raises(ValueError, match="exceeds"):
+        RData_TXT([b"y" * 256])
 
 
 def test_txt_escapes_nonprinting_octets() -> None:
@@ -398,3 +431,81 @@ def test_unknown_opcode_degrades_to_int() -> None:
     flags1 = 0b10000000 | (7 << 3)  # response, OPCODE 7 (unassigned)
     packet, _ = DnsPacket.parse(struct.pack("!HBBHHHH", 1, flags1, 0, 0, 0, 0, 0))
     assert int(packet.OPCODE) == 7
+
+
+# ------------------------------------------------- codec registry and naming
+
+
+def test_every_codec_the_library_ships_is_registered() -> None:
+    """A missing registration is silent: the type just stays opaque."""
+    registry = all_rdata_classes()
+    for rtype in (
+        DnsRType.A,
+        DnsRType.AAAA,
+        DnsRType.NS,
+        DnsRType.CNAME,
+        DnsRType.SOA,
+        DnsRType.MX,
+        DnsRType.TXT,
+        DnsRType.SRV,
+        DnsRType.PTR,
+        DnsRType.DNAME,
+    ):
+        assert registry[int(rtype)].RType is rtype
+
+
+def test_unknown_type_name_uses_the_rfc3597_mnemonic() -> None:
+    """RFC 3597 section 5 gives ``TYPE<n>`` when there is no mnemonic."""
+    assert type_name_of(int(DnsRType.A)) == "A"
+    assert type_name_of(65280) == "TYPE65280"
+    assert type_name_of(None) == "RDATA"
+
+
+def test_constructor_rejects_bad_arguments_with_typeerror() -> None:
+    """These were ``assert`` checks, so ``-O`` turned them into silent accepts."""
+    with pytest.raises(TypeError):
+        DnsPacket(answers=(DnsRecord(NAME, rdata=b"\x00" * 4),))
+    with pytest.raises(TypeError):
+        DnsPacket(questions=[], suffix="not bytes")
+
+
+def test_parse_rejects_a_non_bytes_object_and_a_bad_offset() -> None:
+    with pytest.raises(TypeError):
+        DnsPacket.parse("not bytes")
+    with pytest.raises(DnsPacketParseError):
+        DnsPacket.parse(b"\x00" * 12, offset=99)
+
+
+def test_sections_are_read_to_their_own_counts_in_order() -> None:
+    """The original loop filled each section from "whatever remains".
+
+    That accepted a message whose header promised fewer records than it carried,
+    and left octets nobody owned when a section ran short.
+    """
+    qname = b"\x07example\x03com\x00"
+    answer = rr_wire(qname, int(DnsRType.A), 1, 60, b"\x01\x02\x03\x04")
+    authority = rr_wire(qname, int(DnsRType.NS), 1, 60, b"\x03ns1\xc0\x0c")
+    additional = rr_wire(qname, int(DnsRType.A), 1, 60, b"\x05\x06\x07\x08")
+    payload = (
+        struct.pack("!HBBHHHH", 1, 0b10000000, 0x80, 1, 1, 1, 1)
+        + qname
+        + struct.pack("!HH", 1, 1)
+        + answer
+        + authority
+        + additional
+    )
+    packet, consumed = DnsPacket.parse(payload)
+    assert consumed == len(payload)
+    assert [int(r.rtype) for r in packet.answers] == [int(DnsRType.A)]
+    assert [int(r.rtype) for r in packet.nameservers] == [int(DnsRType.NS)]
+    assert [int(r.rtype) for r in packet.additional_records] == [int(DnsRType.A)]
+    assert str(packet.nameservers[0].rdata) == "ns1.example.com."
+
+
+def test_count_shortfall_is_rejected_rather_than_tolerated() -> None:
+    """A header promising two answers and carrying one is corrupt, not partial."""
+    header = struct.pack("!HBBHHHH", 1, 0b10000000, 0x80, 1, 2, 0, 0)
+    payload = header + b"\x07example\x03com\x00" + struct.pack("!HH", 1, 1)
+    payload += rr_wire(b"\x07example\x03com\x00", 1, 1, 60, b"\x01\x02\x03\x04")
+    with pytest.raises(DnsPacketParseError):
+        DnsPacket.parse(payload)

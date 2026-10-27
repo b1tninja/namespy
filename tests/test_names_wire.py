@@ -214,7 +214,7 @@ def test_parser_has_no_bare_assert() -> None:
     anyone reintroduces one, in either the name parser or the shared primitives.
     """
     package = pathlib.Path(__file__).resolve().parent.parent / "aiodns"
-    for filename in ("names.py", "wire.py"):
+    for filename in ("names.py", "wire.py", "packet.py", "rdata.py"):
         tree = ast.parse((package / filename).read_text(encoding="utf-8"))
         offenders = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
         assert offenders == [], f"{filename} asserts at {offenders}"

@@ -18,9 +18,11 @@ IANA table printed ``BADCOOKIE=23``, which collides with ``BADALG``; the
 registry lists it at 25, and that is what is used here.
 
 **QTYPE is a superset of RTYPE.** ``AXFR``, ``MAILB``, ``MAILA`` and ``ANY``
-(252-255) are query-only pseudo-types (RFC 1035 sections 3.2.3 and 6), and
-``OPT`` (41) never appears as a stored record (RFC 6891 section 6.3). Both
-enums are written out explicitly rather than derived from one another so type
+(252-255) are query-only pseudo-types (RFC 1035 sections 3.2.3 and 6). ``OPT``
+(41) is different in kind: IANA lists it in the RR TYPEs registry, so a receiver
+must be able to decode it, but RFC 6891 section 6.3 forbids storing it -- the
+restriction is on the cache and answer path, not on the type space. Both enums
+are written out explicitly rather than derived from one another so type
 checkers can resolve ``DnsRType.SOA``; ``test_enums.py`` asserts the
 superset relation, so the two tables cannot drift.
 
