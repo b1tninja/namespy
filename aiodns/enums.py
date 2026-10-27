@@ -33,7 +33,8 @@ therefore fall back to the raw ``int`` rather than raising, which is why the
 member lookup in :class:`~aiodns.packet.DnsRecord` is guarded.
 """
 
-from enum import IntEnum, nonmember
+from enum import IntEnum
+from typing import TYPE_CHECKING, ClassVar
 
 
 class _TypeMixin:
@@ -47,11 +48,25 @@ class _TypeMixin:
     """
 
     #: Prefix used by :meth:`mnemonic` for values with no member, so ``TYPE65``
-    #: and ``CLASS65535`` stay distinguishable (RFC 3597 section 5). Declared via
-    #: :func:`enum.nonmember` in each enum body: an Enum turns *every* plain name
-    #: in the class body into a member attempt, and both ``_NAME`` and ``_NAME_``
-    #: are rejected outright on modern CPython (the latter as a reserved sunder).
-    _prefix = "TYPE"
+    #: and ``CLASS65535`` stay distinguishable (RFC 3597 section 5).
+    #:
+    #: Named with leading *and* trailing dunder on purpose. An ``Enum`` body
+    #: turns every plain assignment into a member attempt, and the usual
+    #: escapes are all unavailable here: ``_prefix`` is rejected as a private
+    #: name, ``_prefix_`` as a reserved sunder, and ``nonmember()`` types as
+    #: :data:`~typing.Final`, which then collides with this base declaration
+    #: under a type checker. A dunder is skipped by ``Enum``'s class body
+    #: processing entirely, and is not name-mangled either.
+    __prefix__: ClassVar[str] = "TYPE"
+
+    if TYPE_CHECKING:
+        # What IntEnum contributes once this is mixed in ahead of it. Declared
+        # only for the type checker so the helpers can call ``cls(value)`` and
+        # read ``member.name`` without reaching for casts; at runtime these names
+        # come from the enum base and this block never executes.
+        name: str
+
+        def __init__(self, value: int) -> None: ...
 
     @classmethod
     def parse(cls, value: int):
@@ -71,13 +86,13 @@ class _TypeMixin:
         bare number, which is also what makes a log line round-trippable.
         """
         if value is None:
-            return cls._prefix
+            return cls.__prefix__
         if isinstance(value, cls):
             return value.name
         try:
             return cls(int(value)).name
         except (ValueError, TypeError):
-            return f"{cls._prefix}{int(value)}"
+            return f"{cls.__prefix__}{int(value)}"
 
 
 class DnsResponseCode(_TypeMixin, IntEnum):
@@ -92,7 +107,7 @@ class DnsResponseCode(_TypeMixin, IntEnum):
     #: An unknown RCODE must not render as ``TYPE11``: that string means "no such
     #: RR type" to anyone reading a log, and RFC 6891 section 6.1.3 widened this
     #: space to 12 bits, so unassigned values 11-15 are reachable in practice.
-    _prefix = nonmember("RCODE")
+    __prefix__ = "RCODE"
 
     NO_ERROR = 0  # NOERROR
     FORMAT_ERROR = 1  # FORMERR -- RFC 1035 section 4.1.1
@@ -130,8 +145,8 @@ class DnsOpCode(_TypeMixin, IntEnum):
     server using an opcode this enum has never heard of is still inspectable.
     """
 
-    #: ``OPCODE9`` rather than a misleading ``TYPE9`` (see the mixin's ``_prefix``).
-    _prefix = nonmember("OPCODE")
+    #: ``OPCODE9`` rather than a misleading ``TYPE9`` (see the mixin's ``__prefix__``).
+    __prefix__ = "OPCODE"
 
     QUERY = 0  # RFC 1035
     IQUERY = 1  # RFC 1035 -- obsolete, must not be emitted (RFC 8906)
@@ -150,7 +165,7 @@ class DnsQR(IntEnum):
 class DnsRClass(_TypeMixin, IntEnum):
     """RR CLASS for stored records (RFC 1035 section 3.2.4)."""
 
-    _prefix = nonmember("CLASS")
+    __prefix__ = "CLASS"
 
     IN = 1
     CS = 2  # CSNET -- historical
@@ -163,7 +178,7 @@ class DnsRClass(_TypeMixin, IntEnum):
 class DnsQClass(_TypeMixin, IntEnum):
     """QCLASS: every RR class plus the ``ANY`` wildcard (RFC 1035 section 3.2.3)."""
 
-    _prefix = nonmember("CLASS")
+    __prefix__ = "CLASS"
 
     IN = 1
     CS = 2

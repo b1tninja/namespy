@@ -164,6 +164,14 @@ class DomainName:
     :param offset: the octet offset of the name within ``buffer``, if any.
     """
 
+    #: Declared at class level so ``__init__`` can read ``name.name`` to build a
+    #: copy: left to inference from ``self.name = text``, and with ``text``
+    #: derived from that same attribute, a type checker sees a cycle rather than
+    #: a ``str``.
+    name: str
+    buffer: bytes | None
+    offset: int | None
+
     def __init__(self, name, buffer: bytes | None = None, offset: int | None = None):
         text: str
         if isinstance(name, DomainName):

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ipaddress
 import struct
+from typing import ClassVar
 
 from .enums import DnsRType
 from .names import DomainName
@@ -220,10 +221,15 @@ class RData_A(RData):
     RType = DnsRType.A
 
     #: The :mod:`ipaddress` class used to validate and render the payload.
-    _ADDRESS_TYPE = ipaddress.IPv4Address
+    #: Annotated explicitly because the subclass narrows it: left to inference,
+    #: the base reads as ``type[IPv4Address]`` and :class:`RData_AAAA` assigning
+    #: ``IPv6Address`` would be an incompatible redefinition.
+    _ADDRESS_TYPE: ClassVar[type[ipaddress.IPv4Address] | type[ipaddress.IPv6Address]] = (
+        ipaddress.IPv4Address
+    )
 
     #: RFC 1035 section 3.4.1 / RFC 3596 section 3: a fixed RDLENGTH.
-    _WIRE_OCTETS = 4
+    _WIRE_OCTETS: ClassVar[int] = 4
 
     def __init__(self, ip, *, wire: bytes | None = None) -> None:
         if isinstance(ip, (bytes, bytearray, memoryview)):
@@ -275,8 +281,8 @@ class RData_AAAA(RData_A):
     """``AAAA`` RDATA -- sixteen octets of IPv6 address (RFC 3596 section 3)."""
 
     RType = DnsRType.AAAA
-    _ADDRESS_TYPE = ipaddress.IPv6Address
-    _WIRE_OCTETS = 16
+    _ADDRESS_TYPE: ClassVar[type[ipaddress.IPv6Address]] = ipaddress.IPv6Address
+    _WIRE_OCTETS: ClassVar[int] = 16
 
 
 # ------------------------------------------------- names inside bounded RDATA

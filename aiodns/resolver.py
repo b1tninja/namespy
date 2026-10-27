@@ -45,6 +45,7 @@ import secrets
 import socket
 import struct
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import resources
 from socket import gaierror
@@ -520,7 +521,10 @@ class Referral:
 class Answer:
     """The answer section holds RRs of the requested type -- RFC 1034 section 5.3.3(a)."""
 
-    records: tuple
+    #: Accepts any sequence, since callers naturally hold a list; the value is
+    #: always stored as a tuple (see __post_init__), so declaring the narrow
+    #: type would contradict the constructor.
+    records: Sequence
 
     def __post_init__(self):
         # Freeze the sequence: these events are recorded in a Trace and read
