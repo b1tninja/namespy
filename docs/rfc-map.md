@@ -235,9 +235,14 @@ Deliberately unimplemented, each with the spec that would drive it:
   (RFC 6891 §6.1.2-6.1.3), but outbound queries carry no OPT. That leaves the
   UDP payload ceiling at 512 octets (§6.2.3) and caps us at the 4-bit RCODEs.
 - **`TC` is parsed and never acted on.** A truncated response is used as if it
-  were complete. The fix is a TCP retry on the same server (RFC 7766 §6), which
-  needs a connection path this library does not have yet — there is no TCP
-  transport anywhere in the package.
+  were complete (RFC 1035 §4.3.1, RFC 7766 §6). TCP itself is not the missing
+  piece — `Resolver._query_tcp` exists and speaks the RFC 1035 §4.2.2 length
+  prefix, and is reached today for two reasons: AXFR is forced onto TCP, and a
+  UDP attempt that fails outright falls back to TCP. What is missing is the
+  third trigger: re-asking the *same* server over TCP because its answer came
+  back with `TC` set. The response is already decoded by the time the bit could
+  be checked, so this wants a decision point between `_send_for_entry` and the
+  generator rather than new transport code.
 - **QNAME minimisation** (RFC 9156) is not done: the full QNAME goes to every
   server on the way down. See the note in `resolve_steps`.
 - **No DNSSEC validation.** The `AD` bit is surfaced but not verified; nothing
