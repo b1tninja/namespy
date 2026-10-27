@@ -69,7 +69,15 @@ testpaths = ["tests"]
 # async test cannot be silently skipped the way an unmarked one would be.
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-filterwarnings = ["error::DeprecationWarning"]
+filterwarnings = [
+  "error::DeprecationWarning",
+  # Leaked descriptors were a live bug here (the root-hints reader opened the
+  # file and never closed it), and a ResourceWarning is only visible if
+  # something asks for it. Escalated so a future unclosed file or socket fails
+  # the ordinary run rather than surfacing only under -W in CI logs nobody
+  # reads.
+  "error::ResourceWarning",
+]
 
 [tool.coverage.run]
 source = ["aiodns"]

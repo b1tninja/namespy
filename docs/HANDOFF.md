@@ -17,7 +17,8 @@ git status --short                # must be clean; if not, finish or commit it
 |---|---|
 | Branch | `master`, pushed and in sync with `origin/master` |
 | Commits in this effort | 10 (`fe1741e` … `3676c06`) |
-| Suite | 265 passed, 0 failed, ~0.7s |
+| Suite | 265 passed, 0 failed, ~0.7s; clean under `python -O` too |
+| Warnings | `DeprecationWarning` and `ResourceWarning` are escalated to errors in `filterwarnings`, so a leaked file/socket fails the ordinary run, not just a `-W` CI job |
 | Coverage | 81.2% (floor 80 in `pyproject.toml`) |
 | Lint | `ruff check` clean over E,W,F,I,B,N,UP,SIM,C4,PT,RUF,S,RET,ARG; `ruff format --check` clean |
 | Types | `mypy` advisory, 12 errors in 4 files (listed under "left to do") |

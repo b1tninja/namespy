@@ -1335,11 +1335,20 @@ class RecursiveResolver(Resolver):
 
     @staticmethod
     def _master_file_lines(zone_file):
-        """Yield the text lines of a path, traversable, or readable object."""
+        """Yield the text lines of a path, traversable, or readable object.
+
+        Every branch that opens something closes it. The traversable branch used
+        to be ``zone_file.open("r", encoding="utf-8").read()`` with no close at
+        all, which leaked a descriptor on every hints load -- a ResourceWarning
+        under CI, and a real leak for a resolver that refreshes its root hints in
+        a long-lived process. An object handed in already open is *not* closed
+        here: the caller opened it, so the caller keeps ownership.
+        """
         if hasattr(zone_file, "read"):
             data = zone_file.read()
         elif hasattr(zone_file, "open"):  # importlib.resources.Traversable
-            data = zone_file.open("r", encoding="utf-8").read()
+            with zone_file.open("r", encoding="utf-8") as handle:
+                data = handle.read()
         else:
             with open(zone_file, encoding="utf-8") as handle:
                 data = handle.read()
