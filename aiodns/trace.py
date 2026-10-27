@@ -30,7 +30,9 @@ class Trace:
 
     def __repr__(self):
         return "<Trace sname=%r events=%d children=%d>" % (
-            self.sname, len(self.events), len(self.children),
+            self.sname,
+            len(self.events),
+            len(self.children),
         )
 
     def to_mermaid(self):
@@ -66,9 +68,15 @@ class Trace:
                 body.append("    C->>%s: %s %s" % (pid, qname, qtype_name))
                 last_zone_id[0] = pid
             elif cn == "Referral":
-                body.append("    %s-->>C: referral %s (match %d->%d)" % (
-                    last_zone_id[0], ev.new_zone, ev.match_before, ev.match_after,
-                ))
+                body.append(
+                    "    %s-->>C: referral %s (match %d->%d)"
+                    % (
+                        last_zone_id[0],
+                        ev.new_zone,
+                        ev.match_before,
+                        ev.match_after,
+                    )
+                )
             elif cn == "Answer":
                 body.append("    %s-->>C: AA, %d records" % (last_zone_id[0], len(ev.records)))
             elif cn == "Nodata":

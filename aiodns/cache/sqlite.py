@@ -5,6 +5,7 @@ A single ``rrset_cache`` table keyed on ``(name, qtype, qclass)`` with an
 (``!H`` + bytes from :meth:`DnsRecord.__bytes__`); negative entries store
 just the SOA's wire form (or empty bytes if the response carried none).
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -51,7 +52,7 @@ def _unpack_records(payload):
     while off + 2 <= len(buf):
         (n,) = struct.unpack_from("!H", buf, off)
         off += 2
-        chunk = buf[off:off + n]
+        chunk = buf[off : off + n]
         off += n
         rec, _ = DnsRecord.parse(chunk, 0)
         records.append(rec)
@@ -114,7 +115,9 @@ class SqliteDnsCache(DnsCache):
             return None
         if kind == _KIND_POSITIVE:
             return PositiveEntry(
-                name, qtype, qclass,
+                name,
+                qtype,
+                qclass,
                 _unpack_records(payload),
                 expires_at,
                 bool(authoritative),
@@ -138,11 +141,7 @@ class SqliteDnsCache(DnsCache):
             payload = _pack_records(entry.records)
         elif isinstance(entry, NegativeEntry):
             rcode_int = int(entry.rcode)
-            kind = (
-                _KIND_NXDOMAIN
-                if rcode_int == int(DnsResponseCode.name_error)
-                else _KIND_NODATA
-            )
+            kind = _KIND_NXDOMAIN if rcode_int == int(DnsResponseCode.name_error) else _KIND_NODATA
             rcode = rcode_int
             authoritative = 0
             payload = bytes(entry.soa) if entry.soa is not None else b""
@@ -153,8 +152,14 @@ class SqliteDnsCache(DnsCache):
             "(name, qtype, qclass, kind, rcode, expires_at, authoritative, payload) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                key_name, qt, qc, kind, rcode,
-                float(entry.expires_at), authoritative, payload,
+                key_name,
+                qt,
+                qc,
+                kind,
+                rcode,
+                float(entry.expires_at),
+                authoritative,
+                payload,
             ),
         )
         self._conn.commit()

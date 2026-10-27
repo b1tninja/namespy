@@ -88,6 +88,7 @@ def _dump_last_resolution_md(resolver_protocol, path="last_resolution.md") -> No
 
 # Dig-style CLI.
 
+
 def _parse_qtype(token):
     s = str(token).upper()
     try:
@@ -159,12 +160,24 @@ def _format_response(response, args, elapsed_ms):
         flags.append("ra")
 
     lines.append(";; Got answer:")
-    lines.append(";; ->>HEADER<<- opcode: %s, status: %s, id: %d" % (
-        response.OPCODE.name, response.RCODE.name, response.ID,
-    ))
-    lines.append(";; flags: %s; QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d" % (
-        " ".join(flags), response.QDCOUNT, response.ANCOUNT, response.NSCOUNT, response.ARCOUNT,
-    ))
+    lines.append(
+        ";; ->>HEADER<<- opcode: %s, status: %s, id: %d"
+        % (
+            response.OPCODE.name,
+            response.RCODE.name,
+            response.ID,
+        )
+    )
+    lines.append(
+        ";; flags: %s; QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d"
+        % (
+            " ".join(flags),
+            response.QDCOUNT,
+            response.ANCOUNT,
+            response.NSCOUNT,
+            response.ARCOUNT,
+        )
+    )
     lines.append("")
 
     if response.questions:
@@ -213,39 +226,68 @@ def build_parser():
         prog="aiodns",
         description="DNSpy: a dig-style CLI for the recursive resolver, plus a demo server mode.",
         epilog="Examples:\n"
-               "  python -m aiodns example.com\n"
-               "  python -m aiodns example.com MX\n"
-               "  python -m aiodns +short example.com\n"
-               "  python -m aiodns +trace example.com A\n"
-               "  python -m aiodns --serve",
+        "  python -m aiodns example.com\n"
+        "  python -m aiodns example.com MX\n"
+        "  python -m aiodns +short example.com\n"
+        "  python -m aiodns +trace example.com A\n"
+        "  python -m aiodns --serve",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("name", nargs="?", help="domain name to resolve (presentation form)")
-    p.add_argument("type", nargs="?", type=_parse_qtype, default=DnsQType.A,
-                   help="record type (A, AAAA, NS, MX, TXT, CNAME, SOA, ANY, ...). Default: A")
-    p.add_argument("qclass", nargs="?", type=_parse_qclass, default=DnsRClass.IN, metavar="class",
-                   help="record class (IN, CH, HS). Default: IN")
-    p.add_argument("--serve", action="store_true",
-                   help="run the demo server (binds 127.0.0.1:53) instead of doing a one-shot lookup")
-    p.add_argument("--short", action="store_true",
-                   help="dig +short style: print only RDATA, one record per line")
-    p.add_argument("--trace", action="store_true",
-                   help="write the resolution trace to last_resolution.md")
-    p.add_argument("--trace-file", default="last_resolution.md",
-                   help="path for --trace output (default: last_resolution.md)")
-    p.add_argument("--root-hints", default="named.root",
-                   help="path to the root hints zone file (default: named.root)")
-    p.add_argument("--dns-suffix", default=None,
-                   help="DNS suffix the resolver assumes for relative names "
-                        "(names without a trailing root terminator). A "
-                        "trailing '.' on the supplied name disables suffix "
-                        "application.")
-    p.add_argument("--timeout", type=float, default=LOOKUP_TIMEOUT_S,
-                   help="overall lookup timeout in seconds (default: %(default)s)")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="enable INFO-level logging")
-    p.add_argument("--debug", action="store_true",
-                   help="enable DEBUG-level logging")
+    p.add_argument(
+        "type",
+        nargs="?",
+        type=_parse_qtype,
+        default=DnsQType.A,
+        help="record type (A, AAAA, NS, MX, TXT, CNAME, SOA, ANY, ...). Default: A",
+    )
+    p.add_argument(
+        "qclass",
+        nargs="?",
+        type=_parse_qclass,
+        default=DnsRClass.IN,
+        metavar="class",
+        help="record class (IN, CH, HS). Default: IN",
+    )
+    p.add_argument(
+        "--serve",
+        action="store_true",
+        help="run the demo server (binds 127.0.0.1:53) instead of doing a one-shot lookup",
+    )
+    p.add_argument(
+        "--short",
+        action="store_true",
+        help="dig +short style: print only RDATA, one record per line",
+    )
+    p.add_argument(
+        "--trace", action="store_true", help="write the resolution trace to last_resolution.md"
+    )
+    p.add_argument(
+        "--trace-file",
+        default="last_resolution.md",
+        help="path for --trace output (default: last_resolution.md)",
+    )
+    p.add_argument(
+        "--root-hints",
+        default="named.root",
+        help="path to the root hints zone file (default: named.root)",
+    )
+    p.add_argument(
+        "--dns-suffix",
+        default=None,
+        help="DNS suffix the resolver assumes for relative names "
+        "(names without a trailing root terminator). A "
+        "trailing '.' on the supplied name disables suffix "
+        "application.",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=LOOKUP_TIMEOUT_S,
+        help="overall lookup timeout in seconds (default: %(default)s)",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="enable INFO-level logging")
+    p.add_argument("--debug", action="store_true", help="enable DEBUG-level logging")
     return p
 
 
@@ -266,7 +308,8 @@ async def cli_query(args) -> int:
         start = time.monotonic()
         try:
             response = await asyncio.wait_for(
-                resolver_protocol.resolve(query), timeout=args.timeout,
+                resolver_protocol.resolve(query),
+                timeout=args.timeout,
             )
         except TimeoutError:
             print(";; query timed out after %.1f s" % args.timeout, file=sys.stderr)
@@ -316,7 +359,9 @@ async def serve(args) -> int:
         traceback.print_exc()
         return 1
     else:
-        logging.info("Startup successful. Querying %s (A) through DnsServer %s ...", EXAMPLE_NAME, LOCAL_DNS)
+        logging.info(
+            "Startup successful. Querying %s (A) through DnsServer %s ...", EXAMPLE_NAME, LOCAL_DNS
+        )
         await _lookup_example_org_via_local_server(loop)
         if resolver_protocol is not None and args.trace:
             _dump_last_resolution_md(resolver_protocol, path=args.trace_file)

@@ -34,10 +34,12 @@ def _a_record(name="example.com.", ttl=300, ip="93.184.216.34"):
     )
 
 
-@pytest.fixture(params=[
-    pytest.param("memory", id="memory"),
-    pytest.param("sqlite", id="sqlite"),
-])
+@pytest.fixture(
+    params=[
+        pytest.param("memory", id="memory"),
+        pytest.param("sqlite", id="sqlite"),
+    ]
+)
 def make_cache(request):
     """Factory: ``make_cache(clock) -> DnsCache``.
 
@@ -64,10 +66,16 @@ def test_positive_entry_round_trip(make_cache):
     clock = _Clock()
     cache = make_cache(clock)
     rec = _a_record()
-    cache.put(PositiveEntry(
-        DomainName("example.com."), DnsRType.A, DnsRClass.IN,
-        [rec], expires_at=clock.t + 300, authoritative=True,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("example.com."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [rec],
+            expires_at=clock.t + 300,
+            authoritative=True,
+        )
+    )
     got = cache.get(DomainName("example.com."), DnsRType.A, DnsRClass.IN)
     assert isinstance(got, PositiveEntry)
     assert got.authoritative is True
@@ -79,10 +87,15 @@ def test_positive_entry_round_trip(make_cache):
 def test_positive_entry_expires_on_read(make_cache):
     clock = _Clock()
     cache = make_cache(clock)
-    cache.put(PositiveEntry(
-        DomainName("example.com."), DnsRType.A, DnsRClass.IN,
-        [_a_record()], expires_at=clock.t + 10,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("example.com."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record()],
+            expires_at=clock.t + 10,
+        )
+    )
     assert cache.get(DomainName("example.com."), DnsRType.A, DnsRClass.IN) is not None
     clock.t += 20
     assert cache.get(DomainName("example.com."), DnsRType.A, DnsRClass.IN) is None
@@ -94,12 +107,22 @@ def test_nxdomain_round_trip(make_cache):
     clock = _Clock()
     cache = make_cache(clock)
     soa = DnsRecord(
-        DomainName("example.com."), DnsRType.SOA, DnsRClass.IN, 60, rdata=b"",
+        DomainName("example.com."),
+        DnsRType.SOA,
+        DnsRClass.IN,
+        60,
+        rdata=b"",
     )
-    cache.put(NegativeEntry(
-        DomainName("nx.example.com."), DnsRType.A, DnsRClass.IN,
-        DnsResponseCode.name_error, soa, clock.t + 60,
-    ))
+    cache.put(
+        NegativeEntry(
+            DomainName("nx.example.com."),
+            DnsRType.A,
+            DnsRClass.IN,
+            DnsResponseCode.name_error,
+            soa,
+            clock.t + 60,
+        )
+    )
     got = cache.get(DomainName("nx.example.com."), DnsRType.A, DnsRClass.IN)
     assert isinstance(got, NegativeEntry)
     assert got.rcode == DnsResponseCode.name_error
@@ -109,12 +132,22 @@ def test_nodata_round_trip(make_cache):
     clock = _Clock()
     cache = make_cache(clock)
     soa = DnsRecord(
-        DomainName("example.com."), DnsRType.SOA, DnsRClass.IN, 60, rdata=b"",
+        DomainName("example.com."),
+        DnsRType.SOA,
+        DnsRClass.IN,
+        60,
+        rdata=b"",
     )
-    cache.put(NegativeEntry(
-        DomainName("example.com."), DnsRType.MX, DnsRClass.IN,
-        DnsResponseCode.no_error, soa, clock.t + 60,
-    ))
+    cache.put(
+        NegativeEntry(
+            DomainName("example.com."),
+            DnsRType.MX,
+            DnsRClass.IN,
+            DnsResponseCode.no_error,
+            soa,
+            clock.t + 60,
+        )
+    )
     got = cache.get(DomainName("example.com."), DnsRType.MX, DnsRClass.IN)
     assert isinstance(got, NegativeEntry)
     assert got.rcode == DnsResponseCode.no_error
@@ -126,10 +159,15 @@ def test_case_and_trailing_dot_collapse_to_one_key(make_cache):
     # forms of the same wire name share a single entry.
     clock = _Clock()
     cache = make_cache(clock)
-    cache.put(PositiveEntry(
-        DomainName("Example.Com."), DnsRType.A, DnsRClass.IN,
-        [_a_record()], clock.t + 300,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("Example.Com."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record()],
+            clock.t + 300,
+        )
+    )
     got = cache.get(DomainName("example.com"), DnsRType.A, DnsRClass.IN)
     assert isinstance(got, PositiveEntry)
 
@@ -137,14 +175,24 @@ def test_case_and_trailing_dot_collapse_to_one_key(make_cache):
 def test_prune_removes_expired(make_cache):
     clock = _Clock()
     cache = make_cache(clock)
-    cache.put(PositiveEntry(
-        DomainName("a.example."), DnsRType.A, DnsRClass.IN,
-        [_a_record("a.example.")], clock.t + 1,
-    ))
-    cache.put(PositiveEntry(
-        DomainName("b.example."), DnsRType.A, DnsRClass.IN,
-        [_a_record("b.example.")], clock.t + 100,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("a.example."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record("a.example.")],
+            clock.t + 1,
+        )
+    )
+    cache.put(
+        PositiveEntry(
+            DomainName("b.example."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record("b.example.")],
+            clock.t + 100,
+        )
+    )
     clock.t += 10
     n = cache.prune()
     assert n == 1
@@ -155,19 +203,34 @@ def test_prune_removes_expired(make_cache):
 def test_memory_lru_evicts_oldest():
     clock = _Clock()
     cache = MemoryDnsCache(max_entries=2, time_fn=clock)
-    cache.put(PositiveEntry(
-        DomainName("a.example."), DnsRType.A, DnsRClass.IN,
-        [_a_record("a.example.")], clock.t + 1000,
-    ))
-    cache.put(PositiveEntry(
-        DomainName("b.example."), DnsRType.A, DnsRClass.IN,
-        [_a_record("b.example.")], clock.t + 1000,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("a.example."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record("a.example.")],
+            clock.t + 1000,
+        )
+    )
+    cache.put(
+        PositiveEntry(
+            DomainName("b.example."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record("b.example.")],
+            clock.t + 1000,
+        )
+    )
     cache.get(DomainName("a.example."), DnsRType.A, DnsRClass.IN)  # touch a
-    cache.put(PositiveEntry(
-        DomainName("c.example."), DnsRType.A, DnsRClass.IN,
-        [_a_record("c.example.")], clock.t + 1000,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("c.example."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record("c.example.")],
+            clock.t + 1000,
+        )
+    )
     assert cache.get(DomainName("b.example."), DnsRType.A, DnsRClass.IN) is None
     assert cache.get(DomainName("a.example."), DnsRType.A, DnsRClass.IN) is not None
     assert cache.get(DomainName("c.example."), DnsRType.A, DnsRClass.IN) is not None
@@ -176,15 +239,24 @@ def test_memory_lru_evicts_oldest():
 def test_put_replaces_existing(make_cache):
     clock = _Clock()
     cache = make_cache(clock)
-    cache.put(PositiveEntry(
-        DomainName("example.com."), DnsRType.A, DnsRClass.IN,
-        [_a_record(ip="1.1.1.1")], clock.t + 300,
-    ))
-    cache.put(PositiveEntry(
-        DomainName("example.com."), DnsRType.A, DnsRClass.IN,
-        [_a_record(ip="2.2.2.2")], clock.t + 300,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("example.com."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record(ip="1.1.1.1")],
+            clock.t + 300,
+        )
+    )
+    cache.put(
+        PositiveEntry(
+            DomainName("example.com."),
+            DnsRType.A,
+            DnsRClass.IN,
+            [_a_record(ip="2.2.2.2")],
+            clock.t + 300,
+        )
+    )
     assert len(cache) == 1
     got = cache.get(DomainName("example.com."), DnsRType.A, DnsRClass.IN)
-    assert ipaddress.IPv4Address(bytes(got.records[0].rdata)) == \
-        ipaddress.IPv4Address("2.2.2.2")
+    assert ipaddress.IPv4Address(bytes(got.records[0].rdata)) == ipaddress.IPv4Address("2.2.2.2")

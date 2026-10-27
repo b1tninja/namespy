@@ -19,12 +19,8 @@ from aiodns.resolver import (
 
 
 def _make_referral(qname, new_zone, ns_targets, glue=()):
-    ns_records = [
-        DnsRecord(new_zone, DnsRType.NS, DnsRClass.IN, 0, rdata=t) for t in ns_targets
-    ]
-    ar_records = [
-        DnsRecord(t, DnsRType.A, DnsRClass.IN, 0, rdata=ip.packed) for t, ip in glue
-    ]
+    ns_records = [DnsRecord(new_zone, DnsRType.NS, DnsRClass.IN, 0, rdata=t) for t in ns_targets]
+    ar_records = [DnsRecord(t, DnsRType.A, DnsRClass.IN, 0, rdata=ip.packed) for t, ip in glue]
     return Response(
         QR=DnsQR.response,
         AA=False,

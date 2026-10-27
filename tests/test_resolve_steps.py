@@ -22,12 +22,8 @@ from aiodns.resolver import (
 
 
 def _make_referral(qname, new_zone, ns_targets, glue=()):
-    ns_records = [
-        DnsRecord(new_zone, DnsRType.NS, DnsRClass.IN, 0, rdata=t) for t in ns_targets
-    ]
-    ar_records = [
-        DnsRecord(t, DnsRType.A, DnsRClass.IN, 0, rdata=ip.packed) for t, ip in glue
-    ]
+    ns_records = [DnsRecord(new_zone, DnsRType.NS, DnsRClass.IN, 0, rdata=t) for t in ns_targets]
+    ar_records = [DnsRecord(t, DnsRType.A, DnsRClass.IN, 0, rdata=ip.packed) for t, ip in glue]
     return Response(
         QR=DnsQR.response,
         AA=False,
@@ -160,7 +156,13 @@ def test_sbelt_copy_for_seeds_root_zone():
         AA=True,
         questions=[DnsQuestion(DomainName("."), DnsQType.NS)],
         nameservers=[
-            DnsRecord(DomainName("."), DnsRType.NS, DnsRClass.IN, 0, rdata=DomainName("a.root-servers.net")),
+            DnsRecord(
+                DomainName("."),
+                DnsRType.NS,
+                DnsRClass.IN,
+                0,
+                rdata=DomainName("a.root-servers.net"),
+            ),
         ],
         additional_records=[
             DnsRecord(
@@ -235,8 +237,8 @@ def test_resolve_steps_glueless_subresolution_walks_to_authoritative_ns():
     # generator would yield `NeedAddress`, sending us into an infinite
     # glueless loop instead of asking the authoritative server.
     step = next(gen)
-    assert isinstance(step, SendQuery), (
-        "expected SendQuery to a glued cloudflare NS, got %r" % (step,)
+    assert isinstance(step, SendQuery), "expected SendQuery to a glued cloudflare NS, got %r" % (
+        step,
     )
     assert step.entry.zone == DomainName("cloudflare.com.")
     assert step.entry.addresses, "glue should have been attached to the SLIST entry"
@@ -297,13 +299,22 @@ def test_resolve_steps_cache_short_circuits_to_answer():
     )
     cache = MemoryDnsCache(time_fn=lambda: 1000.0)
     answer = DnsRecord(
-        DomainName("example.com."), DnsRType.A, DnsRClass.IN, 60,
+        DomainName("example.com."),
+        DnsRType.A,
+        DnsRClass.IN,
+        60,
         rdata=ipaddress.IPv4Address("93.184.216.34").packed,
     )
-    cache.put(PositiveEntry(
-        DomainName("example.com."), DnsQType.A, DnsRClass.IN,
-        [answer], expires_at=1060.0, authoritative=True,
-    ))
+    cache.put(
+        PositiveEntry(
+            DomainName("example.com."),
+            DnsQType.A,
+            DnsRClass.IN,
+            [answer],
+            expires_at=1060.0,
+            authoritative=True,
+        )
+    )
 
     gen = resolve_steps(sname, slist, cache)
     step = next(gen)
@@ -326,12 +337,22 @@ def test_resolve_steps_cache_short_circuits_to_nxdomain():
     )
     cache = MemoryDnsCache(time_fn=lambda: 1000.0)
     soa = DnsRecord(
-        DomainName("example.com."), DnsRType.SOA, DnsRClass.IN, 60, rdata=b"",
+        DomainName("example.com."),
+        DnsRType.SOA,
+        DnsRClass.IN,
+        60,
+        rdata=b"",
     )
-    cache.put(NegativeEntry(
-        DomainName("nx.example.com."), DnsQType.A, DnsRClass.IN,
-        DnsResponseCode.name_error, soa, expires_at=1060.0,
-    ))
+    cache.put(
+        NegativeEntry(
+            DomainName("nx.example.com."),
+            DnsQType.A,
+            DnsRClass.IN,
+            DnsResponseCode.name_error,
+            soa,
+            expires_at=1060.0,
+        )
+    )
 
     gen = resolve_steps(sname, slist, cache)
     step = next(gen)
@@ -358,7 +379,10 @@ def test_resolve_steps_populates_cache_after_authoritative_answer():
     assert isinstance(step, SendQuery)
 
     answer_record = DnsRecord(
-        DomainName("example.com."), DnsRType.A, DnsRClass.IN, 300,
+        DomainName("example.com."),
+        DnsRType.A,
+        DnsRClass.IN,
+        300,
         rdata=ipaddress.IPv4Address("93.184.216.34").packed,
     )
     response = Response(

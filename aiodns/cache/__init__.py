@@ -12,6 +12,7 @@ top of each :func:`aiodns.resolver.resolve_steps` iteration before sending
 any query, and writes back positive/negative results when an authoritative
 response classifies as ``Answer`` / ``Nodata`` / ``Nxdomain``.
 """
+
 from __future__ import annotations
 
 import time
@@ -69,7 +70,10 @@ class PositiveEntry(CacheEntry):
 
     def __repr__(self):
         return "<PositiveEntry %s/%s n=%d aa=%s>" % (
-            self.name, self.qtype, len(self.records), self.authoritative,
+            self.name,
+            self.qtype,
+            len(self.records),
+            self.authoritative,
         )
 
 
@@ -116,8 +120,7 @@ class DnsCache(ABC):
         """Store ``entry``, replacing any existing entry under the same key."""
 
     @abstractmethod
-    def __len__(self):
-        ...
+    def __len__(self): ...
 
     def prune(self):
         """Sweep expired entries and return how many were removed."""

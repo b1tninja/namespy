@@ -331,10 +331,51 @@ def test_a_referral_must_actually_get_closer():
 
     events = list(classify(response, sname, slist, slist.best()))
 
-    assert _kinds(events) == ["Referral"]
+    assert _kinds(events) == ["Referral", "Demote"]
     assert slist.zone == DomainName("sub.example.com")
     assert slist.match == 3
     assert slist.entries[0].ns == DomainName("ns1.sub.example.com")
+    # RFC 1035 section 6: ns1.sub.example.com is inside the zone it serves and
+    # arrived without glue, so it is unreachable by construction. Demoting it now
+    # is what stops the resolver sub-resolving it and descending into the same
+    # zone again -- a descent that branches (A and AAAA) at every level.
+    assert slist.entries[0].history["demoted"] is True
+    assert "in-bailiwick" in slist.entries[0].history["lame"]
+
+
+def test_in_bailiwick_nameserver_with_glue_is_not_demoted():
+    """The lame rule keys on missing glue, not merely on being in-bailiwick.
+
+    The identical delegation plus A glue at the target is perfectly usable, and
+    demoting it would break ordinary zone delegation -- most zones do name their
+    nameservers inside themselves.
+    """
+    sname = Sname(DomainName("host.sub.example.com"), DnsQType.A)
+    slist = _seed_slist(DomainName("example.com"), ROOT_NS, ROOT_IP, sname, match=2)
+    target = DomainName("ns1.sub.example.com")
+    authority = [_record(DomainName("sub.example.com"), DnsRType.NS, target)]
+    additional = [_record(target, DnsRType.A, ipaddress.IPv4Address("192.0.2.53").packed)]
+    response = _response(sname.qname, aa=False, nameservers=authority, additional=additional)
+
+    events = list(classify(response, sname, slist, slist.best()))
+
+    assert _kinds(events) == ["Referral"]
+    assert slist.entries[0].history["demoted"] is False
+    assert slist.entries[0].addresses == [ipaddress.IPv4Address("192.0.2.53")]
+
+
+def test_out_of_bailiwick_nameserver_without_glue_is_not_demoted():
+    """A target outside the delegated zone may be resolved elsewhere (RFC 5625 2.6)."""
+    sname = Sname(DomainName("host.sub.example.com"), DnsQType.A)
+    slist = _seed_slist(DomainName("example.com"), ROOT_NS, ROOT_IP, sname, match=2)
+    authority = [_record(DomainName("sub.example.com"), DnsRType.NS, DomainName("ns1.other.net"))]
+    response = _response(sname.qname, aa=False, nameservers=authority)
+
+    events = list(classify(response, sname, slist, slist.best()))
+
+    assert _kinds(events) == ["Referral"]
+    assert slist.entries[0].history["demoted"] is False
+    assert slist.entries[0].addresses == []
 
 
 def test_referral_glue_ignores_a_cname_at_the_target():

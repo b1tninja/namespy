@@ -37,15 +37,17 @@ def test_to_mermaid_emits_sequence_diagram_with_zone_lanes():
     trace.record(Referral(DomainName("."), DomainName("com"), 0, 1))
     trace.record(SendQuery(com_entry, sname.questions))
     trace.record(
-        Answer([
-            DnsRecord(
-                DomainName("example.com"),
-                DnsRType.A,
-                DnsRClass.IN,
-                0,
-                rdata=b"\x5d\xb8\xd8\x22",
-            )
-        ])
+        Answer(
+            [
+                DnsRecord(
+                    DomainName("example.com"),
+                    DnsRType.A,
+                    DnsRClass.IN,
+                    0,
+                    rdata=b"\x5d\xb8\xd8\x22",
+                )
+            ]
+        )
     )
     trace.record(Done(None))
 
@@ -115,15 +117,17 @@ def test_to_mermaid_glueless_child_appended_below_parent():
     )
     child.record(SendQuery(child_entry, child.sname.questions))
     child.record(
-        Answer([
-            DnsRecord(
-                DomainName("ns.glueless"),
-                DnsRType.A,
-                DnsRClass.IN,
-                0,
-                rdata=b"\xcb\x00\x71\x01",
-            )
-        ])
+        Answer(
+            [
+                DnsRecord(
+                    DomainName("ns.glueless"),
+                    DnsRType.A,
+                    DnsRClass.IN,
+                    0,
+                    rdata=b"\xcb\x00\x71\x01",
+                )
+            ]
+        )
     )
     child.record(Done(None))
 

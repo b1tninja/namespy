@@ -1,62 +1,169 @@
+"""A UDP DNS server that answers by recursing with :class:`RecursiveResolver`.
+
+Serving has a different risk profile from resolving. A resolver receives input
+from servers it chose; a server receives input from anyone, and every unanswered
+query it forwards is a candidate for a reflection/amplification attack. Three
+consequences shape this module:
+
+* **Never emit output the operator did not ask for.** The module previously built
+  a fresh ``logging.Logger("server")`` and attached a module-global handler to it,
+  so importing DNSpy and constructing a server produced output regardless of
+  application configuration -- and an ``INFO`` line per query plus a ``print`` of
+  every response turned a query flood into a log flood.
+* **Bound the in-flight upstream lookups.** Each inbound datagram previously
+  spawned ``asyncio.create_task`` with no reference kept, so the task could be
+  garbage-collected mid-flight, and concurrency was whatever the sender chose.
+* **Fail closed on malformed input.** A parse failure gets a ``FORMERR`` and a
+  debug-level note rather than a traceback.
+
+.. rubric:: References
+
+* RFC 1035 section 4.1.1 (header), section 4.3 (server behaviour)
+* RFC 5358 section 4 (BCP 140: do not operate an open recursion service)
+* RFC 5625 section 6.2 (rate-limit, and cap concurrent work)
+"""
+
 import asyncio
 import logging
-import socket
 
-from . import IP_MTU_DISCOVER, IP_PMTUDISC_DO, console
-from .enums import DnsQR
-from .packet import DnsPacket, DnsPacketParseError
+from . import enable_path_mtu_discovery
+from .enums import DnsOpCode, DnsQR, DnsResponseCode
+from .packet import DnsPacket, DnsPacketParseError, Response
 from .resolver import RecursiveResolver
+
+LOGGER = logging.getLogger(__name__)
+
+#: How many upstream lookups one server instance allows at once. Bounded on
+#: purpose: it is what makes this server's *egress* provably limited relative to
+#: its ingress, which is the property an amplification defence needs.
+MAX_CONCURRENT_LOOKUPS = 32
 
 
 class DnsServer(asyncio.Protocol):
-    def __init__(self, resolver):
-        assert isinstance(resolver, RecursiveResolver)
+    """Answer DNS queries over a datagram transport by recursing.
+
+    :param resolver: the :class:`~aiodns.resolver.RecursiveResolver` that does
+        the work. It must already be bound to a transport, which is why resolver
+        and server are connected to the event loop in that order.
+    :param max_concurrent_lookups: cap on outstanding recursive lookups.
+    """
+
+    def __init__(self, resolver, max_concurrent_lookups: int = MAX_CONCURRENT_LOOKUPS):
+        if not isinstance(resolver, RecursiveResolver):
+            raise TypeError(f"resolver must be a RecursiveResolver, got {type(resolver).__name__}")
         self.resolver = resolver
-        self.log = logging.Logger("server")
-        self.log.addHandler(console)
+        self.log = LOGGER
+        self.max_concurrent_lookups = max(1, int(max_concurrent_lookups))
+        # asyncio holds only a weak reference to a task, so a task created here
+        # without being stored can be collected before it finishes.
+        self._tasks: set[asyncio.Task] = set()
+        self._slots = asyncio.Semaphore(self.max_concurrent_lookups)
 
     def connection_made(self, transport):
         self.transport = transport
-        sock = transport.get_extra_info("socket")
+        enable_path_mtu_discovery(transport, self.log)
 
-        sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+    def connection_lost(self, exc):
+        for task in list(self._tasks):
+            task.cancel()
+        self._tasks.clear()
+
+    def _spawn(self, coro):
+        """Create a task, keep a reference to it, retire it when it finishes."""
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _reply(self, response, addr) -> None:
+        wire = bytes(response)
+        self.log.debug(
+            "server_reply(dst=%s id=%#06x rcode=%s octets=%d)",
+            addr[0],
+            response.ID,
+            response.RCODE,
+            len(wire),
+        )
+        self.transport.sendto(wire, addr)
+
+    def _error(self, dns_packet, addr, rcode: DnsResponseCode) -> None:
+        """Reply with *rcode*, echoing the question so the client can match it.
+
+        A client correlates a response with its query by ID *and* the echoed
+        question (RFC 5452 section 5), so an error response with an empty
+        question section is one the client may discard. *dns_packet* is ``None``
+        when the datagram could not be parsed at all, and there is nothing to
+        echo.
+        """
+        questions = list(dns_packet.questions) if dns_packet is not None else []
+        self._reply(
+            Response(
+                ID=0 if dns_packet is None else dns_packet.ID,
+                QR=DnsQR.response,
+                RCODE=rcode,
+                questions=questions,
+            ),
+            addr,
+        )
 
     async def respond_to_packet(self, dns_packet, addr):
-        # self.resolver.db.store_packet(dns_packet, source=addr)
+        if dns_packet.QR != DnsQR.query:
+            self.log.debug("server_not_query(src=%s id=%#06x)", addr[0], dns_packet.ID)
+            return
 
-        if dns_packet.QR == DnsQR.query:
+        if dns_packet.QDCOUNT != 1:
+            # The resolver models one Sname at a time, and answering one of N
+            # questions without saying which is worse than refusing.
+            self._error(dns_packet, addr, DnsResponseCode.format_error)
+            return
+
+        if dns_packet.OPCODE != DnsOpCode.query:
+            self.log.debug(
+                "server_unsupported_opcode(src=%s opcode=%s)", addr[0], dns_packet.OPCODE
+            )
+            self._error(dns_packet, addr, DnsResponseCode.not_implemented)
+            return
+
+        async with self._slots:
             try:
                 response = await self.resolver.resolve(dns_packet)
             except asyncio.CancelledError:
-                self.log.debug("Task cancelled.")
+                self.log.debug("server_cancelled(dst=%s)", addr[0])
+                raise
             except asyncio.InvalidStateError:
-                self.log.debug("Got result, but future was already cancelled.")
-            else:
-                if response:
-                    print(response)
-                    # TODO: RFC2181 FORBIDS mixed TTL values in a record set.
-                    # response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
-                    # TODO: consider making a responses table that refrences a packet to a destination addr,port
-                    # self.resolver.db.store_packet(response, destination=addr)
-                    self.transport.sendto(bytes(response), addr)
-                    pass
+                self.log.debug("server_late_result(dst=%s)", addr[0])
+                return
+            if response is None:
+                self._error(dns_packet, addr, DnsResponseCode.server_failure)
+                return
+            self._reply(response, addr)
 
     def datagram_received(self, data, addr):
-        (host, port) = addr
+        host, port = addr[0], addr[1]
         try:
-            (dns_packet, _offset) = DnsPacket.parse(data)
-        except DnsPacketParseError as e:
-            self.log.warning(
-                "parse failed from %s:%s err=%s offset=%s len=%d hex=%s",
+            dns_packet, _offset = DnsPacket.parse(data)
+        except DnsPacketParseError as exc:
+            # Debug, not warning: this is the attacker-controlled path, and a
+            # warning per datagram is a free log-flood primitive. The offset and
+            # hex stay available to anyone who raises the level.
+            self.log.debug(
+                "server_parse_failed(src=%s:%s err=%s offset=%s octets=%d hex=%s)",
                 host,
                 port,
-                e,
-                e.offset,
-                len(e.data),
-                e.wire_hex(),
+                exc,
+                exc.offset,
+                len(exc.data),
+                exc.wire_hex(),
             )
-        else:
-            self.log.info("Incoming packet: %s" % dns_packet)
-            asyncio.create_task(self.respond_to_packet(dns_packet, addr))
-            # loop.call_later(60, task.cancel) # TODO: play around with timeout parameter
-            # loop.run_until_complete(task)
+            self._error(None, addr, DnsResponseCode.format_error)
+            return
+
+        question = dns_packet.questions[0] if dns_packet.questions else None
+        self.log.debug(
+            "server_query(src=%s:%s id=%#06x q=%s)",
+            host,
+            port,
+            dns_packet.ID,
+            getattr(question, "name", "?"),
+        )
+        self._spawn(self.respond_to_packet(dns_packet, addr))

@@ -28,7 +28,7 @@ raised as one class and caught as the other, so malformed datagrams escaped the
 from __future__ import annotations
 
 import logging
-import random
+import secrets
 import struct
 
 from .enums import (
@@ -283,10 +283,14 @@ class DnsPacket:
         suffix=bytes(),
     ):
         if ID is None:
-            # RFC 5452 section 5: the identifier is one of the few defences
-            # against off-path forgery, so it comes from a CSPRNG rather than a
-            # counter or another low-entropy source.
-            ID = random.getrandbits(16)
+            # RFC 5452 section 5 treats the transaction ID as the resolver's
+            # principal defence against off-path forgery, and section 6.1 asks
+            # for it to be hard to guess. secrets.randbits draws from the
+            # operating system's source of randomness; random.getrandbits is a
+            # Mersenne Twister, whose state an attacker who observes enough IDs
+            # can recover, which is precisely the property a spoofing-resilient
+            # identifier must not have.
+            ID = secrets.randbits(16)
         questions = [] if questions is None else questions
         answers = [] if answers is None else answers
         nameservers = [] if nameservers is None else nameservers

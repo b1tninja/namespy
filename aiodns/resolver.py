@@ -1,23 +1,67 @@
+"""Iterative resolution: RFC 1034 section 5.3.3, as a generator plus an async driver.
+
+The module splits cleanly in two, and the split is the point:
+
+* :func:`resolve_steps` is a *synchronous* generator that yields effect and
+  trace events (``SendQuery``, ``NeedAddress``, ``Answer``, ``Demote``, ...) and
+  receives back whatever the caller fetched. It never touches a socket, a clock,
+  or the cache's clock, so the whole algorithm -- including the parts that took
+  the longest to get right, like telling a referral from a NODATA and following
+  an alias chain across responses -- is testable with a table of canned
+  responses. See ``tests/test_resolve_steps.py`` and
+  ``tests/test_resolver_alias.py``.
+* :class:`Resolver` / :class:`RecursiveResolver` fulfil those effects over UDP
+  and TCP and keep the safety-belt list of servers.
+
+Constructing a resolver performs **no network I/O**: root hints come from the
+``named.root`` shipped inside the package via :mod:`importlib.resources`. A
+constructor that silently called ``urlretrieve`` (as this one did) broke every
+offline test, hung on a network-less host with no timeout, and wrote a file into
+the current working directory as a side effect of ``Resolver()``. Refreshing
+hints from the network is now the explicit, awaited
+:meth:`RecursiveResolver.refresh_root_hints`.
+
+.. rubric:: References
+
+* RFC 1034 section 5.3.2 (resolver state: Sname/Slist/Sbelt), section 5.3.3
+  (the algorithm), section 3.6.2 (aliases must not loop)
+* RFC 1035 section 4.3 (server behaviour), section 5.4.1 (CNAME in the answer)
+* RFC 2308 section 5 (negative caching from SOA.MINIMUM)
+* RFC 5452 sections 5-6 (matching responses to queries; source-port randomness)
+* RFC 6672 section 5.1 (DNAME plus CNAME makes alias loops easier to build)
+* RFC 7766 section 6 (TCP for truncation and for AXFR)
+* RFC 8106 section 2 (root hints: an initial address set is required)
+* RFC 9156 (QNAME minimisation -- not implemented; see the note in resolve_steps)
+"""
+
 import asyncio
+import io
 import ipaddress
 import logging
 import os
 import random
 import re
+import secrets
 import socket
 import struct
 import urllib.request
+from importlib import resources
 from socket import gaierror
 from typing import NamedTuple
 
-from . import IP_MTU_DISCOVER, IP_PMTUDISC_DO, console
+from . import enable_path_mtu_discovery
 from .cache import MemoryDnsCache, NegativeEntry, PositiveEntry
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
 from .packet import DnsPacket, DnsPacketParseError, DnsQuestion, DnsRecord, Query, Response
+from .rdata import RData_A, RData_AAAA, type_name_of
 from .trace import Trace
 
-# RFC 1034 §5.3.3 caps; tunable knobs in this module.
+LOGGER = logging.getLogger(__name__)
+
+# RFC 1034 §5.3.3 caps; these are the defaults, and RecursiveResolver takes each
+# as a constructor argument so a caller can tighten them (a stub resolver serving
+# a constrained client wants smaller, not larger).
 MAX_HOPS = 32
 MAX_DEPTH = 24
 
@@ -42,6 +86,29 @@ QUERY_TIMEOUT_S = 5.0
 
 
 class Resolver(asyncio.Protocol):
+    """Send queries to authoritative servers and match the answers.
+
+    The class attributes are the defaults; :class:`RecursiveResolver` overrides
+    them from its constructor arguments, and a bare ``Resolver`` -- which tests
+    and ad-hoc drivers instantiate without calling ``__init__`` -- therefore
+    still has every knob defined.
+    """
+
+    #: The instance logger. Deliberately :func:`~logging.getLogger`, not a
+    #: freshly-constructed ``logging.Logger``: constructing a Logger directly
+    #: puts it outside the hierarchy, so it does not propagate, does not obey a
+    #: level or handler the application set on the ``aiodns`` logger, and -- with
+    #: a module-global handler attached to each instance -- duplicates output.
+    log = LOGGER
+
+    #: Seconds to wait for one UDP answer before demoting the server.
+    query_timeout = QUERY_TIMEOUT_S
+
+    #: Hop, alias-chain and sub-resolution budgets (see module constants).
+    max_hops = MAX_HOPS
+    max_alias_hops = MAX_ALIAS_HOPS
+    max_depth = MAX_DEPTH
+
     #: Optional DNS suffix the resolver assumes for *relative* names — those
     #: whose presentation form does not end in the root terminator (``.``).
     #: A trailing ``.`` on the SNAME prevents this suffix from being assumed
@@ -52,36 +119,40 @@ class Resolver(asyncio.Protocol):
     dns_suffix = None
 
     async def query(self, questions, nameserver_record, address_record, **kwargs):
-        if nameserver_record:
-            assert isinstance(nameserver_record, DnsRecord)
-        if address_record:
-            assert isinstance(address_record, DnsRecord)
+        for label, value in (
+            ("nameserver_record", nameserver_record),
+            ("address_record", address_record),
+        ):
+            if value is not None and not isinstance(value, DnsRecord):
+                raise TypeError(f"{label} must be a DnsRecord or None, got {type(value).__name__}")
 
         future = asyncio.get_running_loop().create_future()
 
-        ip = ipaddress.ip_address(bytes(address_record.rdata))
-        dns_packet = Query(questions=questions, **kwargs)
-        # RFC 5936: AXFR uses TCP.
-        try:
-            q0 = questions[0] if questions else None
-            if q0 is not None and getattr(q0, "qtype", None) == DnsQType.AXFR:
-                self.log.debug("resolver_force_tcp_axfr(dst=%s id=%s)", ip.exploded, dns_packet.ID)
-                return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet.ID)
-        except Exception:
-            pass
-        key = (ip.exploded, dns_packet.ID)
-        try:
-            q0 = questions[0] if questions else None
-            self.log.debug(
-                "resolver_sendto(dst=%s id=%s q=%s %s %s)",
-                ip.exploded,
-                dns_packet.ID,
-                getattr(q0, "name", ""),
-                getattr(getattr(q0, "qtype", None), "name", getattr(q0, "qtype", "")),
-                getattr(getattr(q0, "qclass", None), "name", getattr(q0, "qclass", "")),
+        ip = _answer_address(address_record)
+        if ip is None:
+            raise ValueError(
+                "address_record must carry valid A or AAAA RDATA, got "
+                f"{type_name_of(address_record.rtype)} with "
+                f"{len(bytes(address_record.rdata))} octet(s)"
             )
-        except Exception:
-            pass
+        dns_packet = Query(questions=questions, **kwargs)
+        # RFC 7766 section 6 / RFC 5936: AXFR is a TCP-only operation, and a UDP
+        # attempt would be answered with a truncated or refused reply rather
+        # than a zone transfer.
+        q0 = questions[0] if questions else None
+        if q0 is not None and getattr(q0, "qtype", None) == DnsQType.AXFR:
+            self.log.debug("resolver_force_tcp_axfr(dst=%s id=%s)", ip.exploded, dns_packet.ID)
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+
+        key = _pending_key(ip.exploded, dns_packet)
+        self.log.debug(
+            "resolver_sendto(dst=%s id=%s q=%s %s %s)",
+            ip.exploded,
+            dns_packet.ID,
+            getattr(q0, "name", ""),
+            getattr(getattr(q0, "qtype", None), "name", getattr(q0, "qtype", "")),
+            getattr(getattr(q0, "qclass", None), "name", getattr(q0, "qclass", "")),
+        )
         if isinstance(ip, ipaddress.IPv6Address):
             # Use IPv6 glue when available.
             if hasattr(self, "_ensure_v6_transport"):
@@ -99,7 +170,7 @@ class Resolver(asyncio.Protocol):
             # On Windows, IPv6 sendto expects the full 4-tuple (host, port, flowinfo, scopeid).
             transport_v6.sendto(bytes(dns_packet), (ip.exploded, 53, 0, 0))
             try:
-                return await asyncio.wait_for(future, timeout=QUERY_TIMEOUT_S)
+                return await asyncio.wait_for(future, timeout=self.query_timeout)
             except TimeoutError:
                 queue_v6.pop(key, None)
                 self.log.debug(
@@ -114,7 +185,7 @@ class Resolver(asyncio.Protocol):
         self.queue[key] = (dns_packet, future)
         self.transport.sendto(bytes(dns_packet), (ip.exploded, 53))
         try:
-            return await asyncio.wait_for(future, timeout=QUERY_TIMEOUT_S)
+            return await asyncio.wait_for(future, timeout=self.query_timeout)
         except TimeoutError:
             # Drop the queue slot so a late response doesn't try to fulfil
             # a cancelled future (and so the slot doesn't leak); the caller
@@ -124,33 +195,64 @@ class Resolver(asyncio.Protocol):
                 "resolver_timeout_udp(dst=%s id=%s ip_version=4)", ip.exploded, dns_packet.ID
             )
             # UDP may be blocked; try TCP (RFC 1035).
-            tcp = await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet.ID)
+            tcp = await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
             return tcp
 
-    async def _query_tcp(self, host, wire, qid):
-        self.log.debug("resolver_tcp_try(dst=%s id=%s)", host, qid)
+    async def _query_tcp(self, host, wire, query_packet):
+        """Query over TCP, with the 2-octet length prefix RFC 1035 section 4.2.2.
+
+        TCP is the fallback for three distinct reasons, all reached from here:
+        the UDP attempt timed out, a response had ``TC`` set (handled by the
+        caller), and zone transfers, which are TCP-only. The timeouts are
+        per-phase rather than one budget for the whole exchange, so a server that
+        accepts the connection and then stalls cannot hold the lookup open for
+        three times the query timeout.
+
+        The answer is checked against *query_packet* just as a UDP answer is.
+        Point-to-point transport removes the off-path forgery threat that
+        RFC 5452 addresses, but not the mundane ones: a middlebox, a stale
+        pipelined response, or a server with a broken ID field can all hand back
+        something that is not the answer to this question, and silently using it
+        would be a wrong answer rather than a failure.
+        """
+        self.log.debug("resolver_tcp_try(dst=%s id=%s)", host, query_packet.ID)
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, 53), timeout=QUERY_TIMEOUT_S
+                asyncio.open_connection(host, 53), timeout=self.query_timeout
             )
         except Exception as e:
             self.log.debug(
-                "resolver_tcp_connect_failed(dst=%s id=%s err=%s)", host, qid, type(e).__name__
+                "resolver_tcp_connect_failed(dst=%s id=%s err=%s)",
+                host,
+                query_packet.ID,
+                type(e).__name__,
             )
             return None
         try:
             writer.write(struct.pack("!H", len(wire)) + wire)
             await writer.drain()
-            nbuf = await asyncio.wait_for(reader.readexactly(2), timeout=QUERY_TIMEOUT_S)
+            nbuf = await asyncio.wait_for(reader.readexactly(2), timeout=self.query_timeout)
             (n,) = struct.unpack("!H", nbuf)
-            data = await asyncio.wait_for(reader.readexactly(n), timeout=QUERY_TIMEOUT_S)
+            data = await asyncio.wait_for(reader.readexactly(n), timeout=self.query_timeout)
             (pkt, _off) = DnsPacket.parse(data)
+            if int(pkt.ID) != int(query_packet.ID) or not _is_expected_response(
+                query_packet, pkt, host
+            ):
+                self.log.warning(
+                    "resolver_tcp_response_mismatch(dst=%s id=%s)", host, pkt.ID
+                )
+                return None
             self.log.debug(
                 "resolver_tcp_ok(dst=%s id=%s rcvd_len=%d)", host, getattr(pkt, "ID", -1), len(data)
             )
             return pkt
         except Exception as e:
-            self.log.debug("resolver_tcp_failed(dst=%s id=%s err=%s)", host, qid, type(e).__name__)
+            self.log.debug(
+                "resolver_tcp_failed(dst=%s id=%s err=%s)",
+                host,
+                query_packet.ID,
+                type(e).__name__,
+            )
             return None
         finally:
             try:
@@ -161,27 +263,37 @@ class Resolver(asyncio.Protocol):
 
     @staticmethod
     def enumerate_nameserver_addresses(nameserver_records, additional_records):
+        """Yield (NS record, address record) pairs, shuffled.
+
+        The shuffle is not cosmetic. RFC 8106 section 2 and RFC 1034 section 5.3.3
+        both assume a resolver will try *several* servers rather than the first one
+        listed; without the shuffle, every resolver using this library hammers the
+        same root server -- ``a.root-servers.net`` is first in ``named.root`` --
+        which is both a self-inflicted denial-of-service risk and a way to make
+        one server's outage look like global DNS failure.
+
+        Non-NS nameserver records and non-address glue are skipped rather than
+        raising: a response carries the additional section as a convenience, so it
+        legitimately contains RRs that are not glue.
+        """
         nameserver_records = list(nameserver_records)
         additional_records = list(additional_records)
         random.shuffle(nameserver_records)
         random.shuffle(additional_records)
 
         for nameserver_record in nameserver_records:
-            assert isinstance(nameserver_record, DnsRecord)
-            if nameserver_record.rtype == DnsRType.NS:
-                for address_record in additional_records:
-                    assert isinstance(address_record, DnsRecord)
-                    if address_record.name == nameserver_record.rdata and address_record.rtype in [
-                        DnsRType.A,
-                        DnsRType.AAAA,
-                    ]:
-                        yield (nameserver_record, address_record)
-
-
-class Forwarder(asyncio.Protocol):
-    def __init__(self, nameservers=None):
-        if nameservers is None:
-            nameservers = ["8.8.8.8", "8.8.4.4", "4.2.2.2", "1.1.1.1"]
+            if not isinstance(nameserver_record, DnsRecord):
+                continue
+            if nameserver_record.rtype != DnsRType.NS:
+                continue
+            for address_record in additional_records:
+                if not isinstance(address_record, DnsRecord):
+                    continue
+                if address_record.name == nameserver_record.rdata and address_record.rtype in (
+                    DnsRType.A,
+                    DnsRType.AAAA,
+                ):
+                    yield (nameserver_record, address_record)
 
 
 # RFC 1034 §5.3.2 resolver state.
@@ -324,8 +436,9 @@ class Sbelt(Slist):
             addresses = []
             for ar in response.additional_records:
                 if ar.name == ns_target and ar.rtype in (DnsRType.A, DnsRType.AAAA):
-                    ip = ipaddress.ip_address(bytes(ar.rdata))
-                    addresses.append(ip)
+                    ip = _answer_address(ar)
+                    if ip is not None:
+                        addresses.append(ip)
             sb.entries.append(SlistEntry(DomainName("."), ns_target, addresses))
         return sb
 
@@ -333,9 +446,29 @@ class Sbelt(Slist):
         s = Slist(sname)
         s.zone = DomainName(".")
         s.match = sname.match_count(s.zone) if sname is not None else 0
-        s.entries = [SlistEntry(e.zone, e.ns, list(e.addresses)) for e in self.entries]
+        s.entries = [self._copy_entry(e) for e in self.entries]
         random.shuffle(s.entries)
         return s
+
+    @staticmethod
+    def _copy_entry(entry):
+        """Clone an entry, carrying the structural lame marker but not liveness.
+
+        Two different things live in ``history``. ``lame`` is a property of the
+        delegation itself -- an in-bailiwick nameserver with no glue is
+        unreachable no matter how many times it is retried -- so it must survive,
+        otherwise each copy restarts the descent the demotion exists to prevent.
+        ``demoted`` from a timeout, by contrast, is an observation about one
+        attempt; propagating it would let a single dropped packet retire a root
+        server for the lifetime of the resolver, which is why real resolvers use
+        backoff instead of permanent exclusion (RFC 1034 section 5.4.1).
+        """
+        clone = SlistEntry(entry.zone, entry.ns, list(entry.addresses))
+        lame = entry.history.get("lame")
+        if lame:
+            clone.history["lame"] = lame
+            clone.history["demoted"] = True
+        return clone
 
 
 # Effect / step / trace event types.
@@ -434,6 +567,93 @@ class Fail:
         return "<Fail %s>" % self.reason
 
 
+def _answer_address(record):
+    """The address in an ``A``/``AAAA`` answer, or ``None`` for anything else.
+
+    Goes through the RDATA codecs rather than reading raw octets, because a
+    record may hold an :class:`~aiodns.rdata.RData_A` (parsed) or plain bytes
+    (hand-built by the root-hints loader), and because a malformed address must
+    yield "no address" here rather than raise inside a resolution loop.
+    """
+    rtype = int(record.rtype)
+    if rtype not in (int(DnsRType.A), int(DnsRType.AAAA)):
+        return None
+    try:
+        codec = RData_A if rtype == int(DnsRType.A) else RData_AAAA
+        wire = record.rdata if isinstance(record.rdata, bytes) else bytes(record.rdata)
+        return codec(wire).ip
+    except (DnsPacketParseError, ValueError):
+        return None
+
+
+def _canonical_address(host) -> str:
+    """An address in the one text form both sides of a lookup can agree on.
+
+    Needed because the two sides do not naturally produce the same string. On
+    send we hold an :class:`ipaddress.IPv6Address` and tend to use ``.exploded``;
+    what a socket reports as a sender comes from the OS and Python renders in
+    *compressed* form. ``2001:db8:0:0:0:0:0:53`` and ``2001:db8::53`` are the same
+    server and would never compare equal as text -- which silently made every
+    IPv6 response miss its pending query, so an IPv6 lookup always timed out.
+    IPv4 is unaffected, where the two forms coincide.
+
+    Anything that does not parse as an address is returned unchanged, so a caller
+    passing an already-canonical string, or a hostname, still gets a stable key.
+    """
+    text = str(host)
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text
+
+
+def _pending_key(dst, packet):
+    """The identity a response must match for us to accept it as *the* answer.
+
+    Keyed on destination address, transaction ID, **and the question**, not just
+    address and ID. RFC 5452 sections 5 and 6 are the reason: the ID alone is 16
+    bits, which an off-path sender can brute-force, whereas a response must also
+    reproduce the QNAME, QTYPE and QCLASS we asked about before it can be taken
+    for an answer. That turns a 65k-guess problem into one that also requires
+    knowing the name being resolved, and it is the difference between a resolver
+    that can be poisoned by a stray or forged packet and one that cannot.
+
+    The key is derived from whichever packet it is handed, so the same function
+    serves both sides: the outgoing query registers under it, and an incoming
+    response is looked up by it. A response that omits the question section
+    entirely therefore never matches -- which is the intended strictness. RFC 1035
+    section 4.1 says the question section "MUST be present in any DNS query or
+    DNS response message", and RFC 5452 section 5 tells a client to verify it
+    rather than assume it.
+    """
+    question = packet.questions[0] if packet.questions else None
+    address = _canonical_address(dst)
+    if question is None:
+        return (address, int(packet.ID), None, None, None)
+    return (
+        address,
+        int(packet.ID),
+        question.name,
+        int(question.qtype),
+        int(question.qclass),
+    )
+
+
+def _is_expected_response(query_packet, response_packet, dst) -> bool:
+    """Whether *response_packet* may be credited to *query_packet*.
+
+    Checks, in order of cost: the QR bit says this is a response and not some
+    unrelated query that happens to share an ID; the question section is echoed
+    faithfully. Both are required by RFC 1035 section 4.1.1 and both are
+    explicitly named as client-side validation by RFC 5452 section 5.
+    """
+    if response_packet.QR != DnsQR.response:
+        return False
+    if not response_packet.questions:
+        return False
+    return _pending_key(dst, response_packet) == _pending_key(dst, query_packet)
+
+
 def _records_by_owner(response):
     """Group a response's answer-section records by owner name.
 
@@ -529,7 +749,7 @@ class AliasWalk(NamedTuple):
     failure: str | None = None
 
 
-def _follow_aliases(response, sname) -> AliasWalk:
+def _follow_aliases(response, sname, max_alias_hops: int = MAX_ALIAS_HOPS) -> AliasWalk:
     """Walk the CNAME/DNAME chain in a response's answer section.
 
     A DNAME is honoured even without the synthesised CNAME a server is supposed
@@ -593,11 +813,11 @@ def _follow_aliases(response, sname) -> AliasWalk:
         seen.add(target)
         current = target
 
-        if len(traversed) >= MAX_ALIAS_HOPS:
+        if len(traversed) >= max_alias_hops:
             # Same reasoning: no answer of this shape deserves another query, and
             # returning `current` here would merely move the decision to the
             # driver's own counter instead of failing where the evidence is.
-            return AliasWalk(None, events, failure=f"alias chain longer than {MAX_ALIAS_HOPS}")
+            return AliasWalk(None, events, failure=f"alias chain longer than {max_alias_hops}")
 
 
 def _find_closer_delegation(response, sname, slist):
@@ -629,7 +849,7 @@ def _find_closer_delegation(response, sname, slist):
     return new_zone, ns_targets, match_after
 
 
-def classify(response, sname, slist, entry):
+def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS):
     """Apply RFC 1034 §5.3.3 step 4 to a single response.
 
     Yields a sequence of trace events. Mutates `slist` for valid referrals
@@ -661,7 +881,7 @@ def classify(response, sname, slist, entry):
     # whose target still needs looking up (RFC 1034 §5.3.3 step 4c: "if the
     # answer contains a CNAME RR, set SNAME to the contents of the RDATA field
     # of the displayed CNAME RR, and go to step 2").
-    walk = _follow_aliases(response, sname)
+    walk = _follow_aliases(response, sname, max_alias_hops=max_alias_hops)
     for event in walk.events:
         yield event
     if walk.failure is not None:
@@ -732,15 +952,25 @@ def classify(response, sname, slist, entry):
                 # address record to be a CNAME, which is not glue at all.
                 if ar.name != ns_target:
                     continue
-                if int(ar.rtype) == int(DnsRType.A):
-                    ip = ipaddress.ip_address(bytes(ar.rdata))
-                    if isinstance(ip, ipaddress.IPv4Address):
-                        addresses.append(ip)
-                elif int(ar.rtype) == int(DnsRType.AAAA):
-                    ip = ipaddress.ip_address(bytes(ar.rdata))
-                    if isinstance(ip, ipaddress.IPv6Address):
-                        addresses.append(ip)
-            new_entries.append(SlistEntry(new_zone, ns_target, addresses))
+                ip = _answer_address(ar)
+                # _answer_address validates the family against the RR type, so a
+                # 16-octet "A" or a 4-octet "AAAA" contributes nothing rather
+                # than raising out of the resolution loop.
+                if ip is not None:
+                    addresses.append(ip)
+            entry = SlistEntry(new_zone, ns_target, addresses)
+            new_entries.append(entry)
+            if not addresses and ns_target.is_subdomain_of(new_zone):
+                # RFC 1035 section 6 / RFC 1034 section 5.4.1: a nameserver
+                # inside the zone it is delegated to can only be reached via glue
+                # supplied by the parent, because asking it for its own address
+                # means already having reached it. Such a target is *lame*, so it
+                # is demoted immediately: sub-resolving it would descend into the
+                # very zone we are trying to reach, and with an A and an AAAA
+                # attempt per level that is a 2x branching blowup rather than a
+                # lookup that simply fails.
+                entry.history["demoted"] = True
+                entry.history["lame"] = "in-bailiwick without glue"
         random.shuffle(new_entries)
 
         slist.entries = new_entries
@@ -748,6 +978,9 @@ def classify(response, sname, slist, entry):
         slist.match = match_after
 
         yield Referral(old_zone, new_zone, match_before, match_after)
+        for entry in new_entries:
+            if entry.history.get("lame"):
+                yield Demote(entry, entry.history["lame"])
         return
 
     # ANCOUNT > 0, yet nothing matched QTYPE and no alias chain led anywhere.
@@ -769,7 +1002,13 @@ def classify(response, sname, slist, entry):
     yield Done(response)
 
 
-def resolve_steps(sname, slist, cache=None):
+def resolve_steps(
+    sname,
+    slist,
+    cache=None,
+    max_hops: int = MAX_HOPS,
+    max_alias_hops: int = MAX_ALIAS_HOPS,
+):
     """Drive resolution as a generator of effect/trace events.
 
     The generator is fully synchronous; it never touches sockets. The async
@@ -790,7 +1029,7 @@ def resolve_steps(sname, slist, cache=None):
     alias_hops = 0
     seen_names = {sname.qname}
 
-    for _ in range(MAX_HOPS):
+    for _ in range(max_hops):
         if cache is not None:
             hit = cache.get(sname.qname, sname.qtype, sname.qclass)
             if hit is not None:
@@ -817,7 +1056,7 @@ def resolve_steps(sname, slist, cache=None):
         response = yield SendQuery(entry, sname.questions)
         terminal = False
         alias_target = None
-        for step in classify(response, sname, slist, entry):
+        for step in classify(response, sname, slist, entry, max_alias_hops=max_alias_hops):
             # Write to cache *before* yielding the terminal event so callers
             # (including tests) can observe a populated cache the moment the
             # Answer/Nxdomain/Nodata is visible — the generator pauses at
@@ -850,8 +1089,8 @@ def resolve_steps(sname, slist, cache=None):
             # is how a resolver hangs rather than fails.
             yield Fail(f"alias loop at {alias_target}")
             return
-        if alias_hops >= MAX_ALIAS_HOPS:
-            yield Fail(f"alias chain longer than {MAX_ALIAS_HOPS}")
+        if alias_hops >= max_alias_hops:
+            yield Fail(f"alias chain longer than {max_alias_hops}")
             return
         seen_names.add(alias_target)
         alias_hops += 1
@@ -978,57 +1217,148 @@ class RecursiveResolver(Resolver):
             pass
         self.log.critical(exception)
 
-    def record_reader(self, zone_file):
-        with open(zone_file, "r") as root_hints_file:
-            for i, line in enumerate(root_hints_file):
-                if not line or line[0] == ";":
-                    continue
-                tokens = re.split(r"\s+", line.rstrip())
-                if len(tokens) == 5:
-                    (name, ttl, rclass, rtype, rdata) = tokens
-                    rclass = DnsRClass[rclass]
-                elif len(tokens) == 4:
-                    (name, ttl, rtype, rdata) = tokens
-                    rclass = DnsRClass.IN  # lets just assume
-                else:
-                    logging.warning("Unrecognized entry on line %d of zone file: %s", i, zone_file)
-                    continue
+    def record_reader(self, zone_file, source=None):
+        """Read NS and address records from a root-hints style master file.
 
+        Accepts a filesystem path, an :mod:`importlib.resources` traversable, or
+        any readable file-like object -- the packaged hints are read through a
+        traversable, fetched hints come from a string, and a user's own file comes
+        as a path, and none of those three should need a temp file to reach here.
+
+        Unrecognised lines are skipped with a warning naming the line number. The
+        file is authoritative-server documentation rather than attacker input, but
+        the two-line comment header in ``named.root`` is *not* unusual, and a
+        previous version treated a blank line as an unrecognised entry and warned
+        once per blank line.
+
+        Deliberately unimplemented: ``$ORIGIN``/``$TTL`` directives and the
+        owner-name inheritance rules of RFC 2308 section 2, because root hints use
+        neither -- every line is fully qualified. Do not use this to load a real
+        zone file.
+        """
+        source_name = source if source is not None else str(zone_file)
+        lines = self._master_file_lines(zone_file)
+
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
+            tokens = re.split(r"\s+", stripped)
+            if len(tokens) == 5:
+                (name, ttl, rclass, rtype, rdata) = tokens
                 try:
-                    rtype = DnsRType[rtype]
-                    ttl = int(ttl)
-                except ValueError:
-                    self.log.critical("Malformed glue records.")
+                    rclass = DnsRClass[rclass]
+                except KeyError:
+                    self.log.warning(
+                        "Unrecognized class %r on line %d of zone file: %s",
+                        rclass,
+                        i,
+                        source_name,
+                    )
                     continue
+            elif len(tokens) == 4:
+                (name, ttl, rtype, rdata) = tokens
+                rclass = DnsRClass.IN  # hints are IN-class; RFC 8106 section 2
+            else:
+                self.log.warning("Unrecognized entry on line %d of zone file: %s", i, source_name)
+                continue
 
-                name = DomainName(name)
-                if rtype == DnsRType.SOA:
-                    pass
+            try:
+                rtype = DnsRType[rtype]
+                ttl = int(ttl)
+            except (KeyError, ValueError):
+                self.log.warning(
+                    "Skipping line %d of %s: unrecognized type %r or TTL %r",
+                    i,
+                    source_name,
+                    rtype,
+                    ttl,
+                )
+                continue
+
+            try:
+                record_name = DomainName(name)
                 if rtype == DnsRType.NS:
-                    record = DnsRecord(name, rtype, rclass, ttl, rdata=DomainName(rdata))
+                    yield DnsRecord(record_name, rtype, rclass, ttl, rdata=DomainName(rdata))
                 elif rtype == DnsRType.A:
-                    record = DnsRecord(
-                        name, rtype, rclass, ttl, rdata=ipaddress.IPv4Address(rdata).packed
+                    yield DnsRecord(
+                        record_name,
+                        rtype,
+                        rclass,
+                        ttl,
+                        rdata=RData_A(ipaddress.IPv4Address(rdata)),
                     )
                 elif rtype == DnsRType.AAAA:
-                    record = DnsRecord(
-                        name, rtype, rclass, ttl, rdata=ipaddress.IPv6Address(rdata).packed
+                    yield DnsRecord(
+                        record_name,
+                        rtype,
+                        rclass,
+                        ttl,
+                        rdata=RData_AAAA(ipaddress.IPv6Address(rdata)),
                     )
                 else:
-                    logging.warning(
-                        "Skipping %s record for %s from zone: %s", rtype, name, zone_file
+                    self.log.debug(
+                        "Skipping %s record for %s on line %d of %s",
+                        rtype,
+                        record_name,
+                        i,
+                        source_name,
                     )
-                    continue
+            except (ValueError, TypeError) as exc:
+                self.log.warning(
+                    "Skipping malformed glue on line %d of %s: %s", i, source_name, exc
+                )
+                continue
 
-                yield record
+    @staticmethod
+    def _master_file_lines(zone_file):
+        """Yield the text lines of a path, traversable, or readable object."""
+        if hasattr(zone_file, "read"):
+            data = zone_file.read()
+        elif hasattr(zone_file, "open"):  # importlib.resources.Traversable
+            data = zone_file.open("r", encoding="utf-8").read()
+        else:
+            with open(zone_file, "r", encoding="utf-8") as handle:
+                data = handle.read()
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", "replace")
+        return iter(data.splitlines())
 
-    def __init__(self, root_hints_path="named.root", dns_suffix=None, cache=None):
+    #: Where the root server address set comes from (RFC 8106 section 2: a
+    #: resolver needs an initial set of root server addresses, and the only
+    #: questions are where it got them and how stale they are).
+    ROOT_HINTS_URL = "https://www.internic.net/domain/named.root"
+
+    def __init__(
+        self,
+        root_hints_path=None,
+        dns_suffix=None,
+        cache=None,
+        max_hops: int = MAX_HOPS,
+        max_depth: int = MAX_DEPTH,
+        max_alias_hops: int = MAX_ALIAS_HOPS,
+        query_timeout: float = QUERY_TIMEOUT_S,
+    ):
+        """Build a resolver without touching the network.
+
+        :param root_hints_path: a master-file path to read hints from. Left
+            ``None``, the copy packaged inside DNSpy is used, which is what makes
+            ``RecursiveResolver()`` work offline, in a test, and on a host with no
+            route to internic. A path that is given but does not exist is an
+            error rather than a licence to fetch: silently downloading during
+            ``__init__`` also wrote a file into the current working directory.
+        :param query_timeout: seconds per UDP attempt (and per TCP phase).
+        :raises FileNotFoundError: if *root_hints_path* is named but missing.
+        """
         self.queue = {}
         self.queue_v6 = {}
         self.transport_v6 = None
         self._v6_ready = None
-        self.log = logging.Logger("resolver")
-        self.log.addHandler(console)
+        self.log = LOGGER
+        self.max_hops = max(1, int(max_hops))
+        self.max_depth = max(1, int(max_depth))
+        self.max_alias_hops = max(1, int(max_alias_hops))
+        self.query_timeout = max(0.05, float(query_timeout))
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
@@ -1038,8 +1368,7 @@ class RecursiveResolver(Resolver):
 
     def connection_made(self, transport):
         self.transport = transport
-        sock = transport.get_extra_info("socket")
-        sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+        enable_path_mtu_discovery(transport, self.log)
         # Start bringing up an IPv6 UDP transport in the background so AAAA glue
         # can be used when IPv4 anycast is unreachable.
         try:
@@ -1088,19 +1417,28 @@ class RecursiveResolver(Resolver):
 
     def _datagram_received_v6(self, data, addr):
         try:
-            (dns_packet, offset) = DnsPacket.parse(data)
+            dns_packet, _offset = DnsPacket.parse(data)
         except DnsPacketParseError:
+            # Same policy as the IPv4 path: a malformed datagram is discarded
+            # quietly at debug level, since an attacker who can send us garbage
+            # should not be able to use our log as an amplifier.
+            self.log.debug("resolver_v6_parse_failed(len=%d)", len(data))
             return
 
         host = addr[0]
-        key = (str(host), dns_packet.ID)
-        if key in self.queue_v6:
-            (_query_packet, future) = self.queue_v6[key]
-            del self.queue_v6[key]
-            if not future.done():
-                future.set_result(dns_packet)
-        else:
-            pass
+        key = _pending_key(host, dns_packet)
+        entry = self.queue_v6.get(key)
+        if entry is None:
+            self.log.debug("resolver_v6_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
+            return
+
+        query_packet, future = entry
+        del self.queue_v6[key]
+        if not _is_expected_response(query_packet, dns_packet, host):
+            self.log.warning("resolver_v6_response_mismatch(src=%s id=%s)", host, dns_packet.ID)
+            return
+        if not future.done():
+            future.set_result(dns_packet)
 
     def datagram_received(self, data, addr):
         try:
@@ -1113,60 +1451,165 @@ class RecursiveResolver(Resolver):
                 len(e.data),
                 e.wire_hex(),
             )
+            return
+
+        self.log.debug("resolver_datagram_recieved(%s, %s)" % (dns_packet, addr))
+        host = addr[0]
+        entry = self.queue.get(_pending_key(host, dns_packet))
+        if entry is None:
+            # Nothing asked this server for this (name, type, class) under this
+            # ID. Either it is late, duplicated, or forged; all three are handled
+            # the same way -- discard.
+            self.log.debug("resolver_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
+            return
+
+        query_packet, future = entry
+        del self.queue[_pending_key(host, dns_packet)]
+        if not _is_expected_response(query_packet, dns_packet, host):
+            self.log.warning(
+                "resolver_response_mismatch(src=%s id=%s)", host, dns_packet.ID
+            )
+            return
+        # The future may already be cancelled if the per-query timeout fired
+        # before this late response arrived; ignore that race rather than
+        # propagating InvalidStateError out of the protocol callback.
+        if not future.done():
+            future.set_result(dns_packet)
+
+    @staticmethod
+    def packaged_root_hints():
+        """The ``named.root`` shipped inside the package, as a readable path.
+
+        :mod:`importlib.resources` rather than ``os.path.dirname(__file__)`` so it
+        also works when DNSpy is installed as a zip or wheel, where there may be no
+        directory on disk to name.
+        """
+        return resources.files("aiodns").joinpath("named.root")
+
+    def bootstrap(self, root_hints_path=None):
+        """Build the root-hints ``Response`` from a master file, offline.
+
+        The result is a synthetic ``Response`` whose authority section holds the
+        root NS set and whose additional section holds the glue, because
+        :class:`Sbelt` is built from responses and reusing that shape avoids a
+        second, parallel representation of the same information.
+
+        :raises FileNotFoundError: if *root_hints_path* is given and missing. The
+            message names the packaged alternative so the fix is obvious.
+        """
+        if root_hints_path is None:
+            source = self.packaged_root_hints()
+            self.log.debug("root_hints_source(source=packaged)")
         else:
-            self.log.debug("resolver_datagram_recieved(%s, %s)" % (dns_packet, addr))
-            (host, port) = addr
-            key = (str(host), dns_packet.ID)
-            if key in self.queue:
-                (query_packet, future) = self.queue[key]
-                del self.queue[key]
-                # The future may already be cancelled if the per-query
-                # timeout fired before this late response arrived; ignore
-                # that race rather than propagating InvalidStateError out
-                # of the protocol callback.
-                if not future.done():
-                    future.set_result(dns_packet)
-            else:
-                self.log.debug("resolver_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
-
-    def bootstrap(self, root_hints_path):
-        questions = [DnsQuestion(DomainName.root_label(), qtype=DnsQType.NS)]
-
-        try:
             if not os.path.isfile(root_hints_path):
-                urllib.request.urlretrieve(
-                    "http://www.internic.net/domain/named.root", root_hints_path
+                raise FileNotFoundError(
+                    f"root hints file not found: {root_hints_path!r}. Omit "
+                    f"root_hints_path to use the copy packaged with DNSpy, or "
+                    f"call refresh_root_hints() to fetch a current one."
                 )
-                self.log.info("Attempting to retrieve root hints from internic.")
-            else:
-                self.log.debug("Found root hints, %s" % os.path.basename(root_hints_path))
+            source = root_hints_path
+            self.log.debug("root_hints_source(source=%s)", root_hints_path)
 
-        except IOError:
-            self.log.critical("Unable to retrieve root hints.")
-            return None
+        nameservers = []
+        additional_records = []
+        for record in self.record_reader(source):
+            if record.rtype == DnsRType.NS:
+                nameservers.append(record)
+            if record.rtype in (DnsRType.A, DnsRType.AAAA):
+                additional_records.append(record)
 
-        else:
-            nameservers = []
-            additional_records = []
-            for record in self.record_reader(root_hints_path):
-                if record.rtype == DnsRType.NS:
-                    nameservers.append(record)
-                if record.rtype == DnsRType.A or record.rtype == DnsRType.AAAA:
-                    additional_records.append(record)
-
-            query = Query(QR=DnsQR.query, RD=False, questions=questions)
-            response = Response(
-                QR=DnsQR.response,
-                ID=query.ID,
-                AA=True,
-                RD=False,
-                RA=False,
-                questions=questions,
-                nameservers=nameservers,
-                additional_records=additional_records,
+        if not nameservers:
+            raise ValueError(f"root hints from {str(source)!r} contained no NS records")
+        if not additional_records:
+            # RFC 8106 section 2: hints without addresses are unusable -- the
+            # resolver would have to resolve the root servers' own names, which is
+            # the circular problem hints exist to avoid.
+            raise ValueError(
+                f"root hints from {str(source)!r} contained no glue addresses (RFC 8106 section 2)"
             )
 
+        questions = [DnsQuestion(DomainName.root_label(), qtype=DnsQType.NS)]
+        query = Query(QR=DnsQR.query, RD=False, questions=questions)
+        return Response(
+            QR=DnsQR.response,
+            ID=query.ID,
+            AA=True,
+            RD=False,
+            RA=False,
+            questions=questions,
+            nameservers=nameservers,
+            additional_records=additional_records,
+        )
+
+    async def refresh_root_hints(self, url: str | None = None, timeout: float | None = None):
+        """Fetch current root hints and replace the safety-belt list.
+
+        Explicitly awaited, unlike the ``urlretrieve`` this replaces: root hints
+        change rarely (RFC 8106 section 3 suggests a two-week refresh), so the
+        caller decides when to pay for a fetch, and doing it inside ``__init__``
+        made every resolver construction a network event.
+
+        The fetched file is parsed and *validated* before :attr:`sbelt` is
+        replaced, so a truncated or empty download cannot leave the resolver
+        unable to start a lookup.
+
+        :return: the synthetic hints ``Response`` now in use, or ``None`` if the
+            fetch or parse failed, in which case the previous hints remain.
+        """
+        url = url or self.ROOT_HINTS_URL
+        timeout = self.query_timeout if timeout is None else timeout
+        try:
+            text = await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_text, url, timeout), timeout + 1.0
+            )
+        except Exception as exc:
+            self.log.warning("root_hints_fetch_failed(url=%s err=%s)", url, type(exc).__name__)
+            return None
+
+        try:
+            response = self.bootstrap_from_text(text)
+        except (ValueError, DnsPacketParseError) as exc:
+            self.log.warning("root_hints_parse_failed(url=%s err=%s)", url, exc)
+            return None
+
+        self.root_hints = response
+        self.sbelt = Sbelt.from_response(response)
+        self.log.info(
+            "root_hints_refreshed(url=%s ns=%d glue=%d)",
+            url,
+            len(response.nameservers),
+            len(response.additional_records),
+        )
         return response
+
+    @staticmethod
+    def _fetch_text(url: str, timeout: float) -> str:
+        with urllib.request.urlopen(url, timeout=timeout) as handle:  # noqa: S310
+            return handle.read().decode("utf-8", "replace")
+
+    def bootstrap_from_text(self, text: str):
+        """Same contract as :meth:`bootstrap`, from master-file text in memory."""
+        nameservers = []
+        additional_records = []
+        for record in self.record_reader(io.StringIO(text), source="<fetched>"):
+            if record.rtype == DnsRType.NS:
+                nameservers.append(record)
+            if record.rtype in (DnsRType.A, DnsRType.AAAA):
+                additional_records.append(record)
+        if not nameservers or not additional_records:
+            raise ValueError("fetched root hints had no NS records or no glue addresses")
+
+        questions = [DnsQuestion(DomainName.root_label(), qtype=DnsQType.NS)]
+        return Response(
+            QR=DnsQR.response,
+            ID=secrets.randbits(16),
+            AA=True,
+            RD=False,
+            RA=False,
+            questions=questions,
+            nameservers=nameservers,
+            additional_records=additional_records,
+        )
 
     async def _send_for_entry(self, entry, questions):
         """Send the query to this entry, trying all known addresses."""
@@ -1196,8 +1639,16 @@ class RecursiveResolver(Resolver):
         return None
 
     async def _drive(self, gen, trace, depth=0):
-        """Pump the resolve_steps generator and fulfill its effects."""
-        if depth > MAX_DEPTH:
+        """Pump the resolve_steps generator and fulfill its effects.
+
+        *depth* bounds sub-resolutions (a glueless NS whose address must itself be
+        looked up, which may in turn need glue). Returning ``None`` rather than
+        raising is deliberate: the caller treats it as "no address found" and
+        demotes the entry, so a deep chain degrades instead of aborting the
+        lookup that triggered it.
+        """
+        if depth > self.max_depth:
+            self.log.debug("resolver_depth_exceeded(depth=%d limit=%d)", depth, self.max_depth)
             return None
         sent = None
         while True:
@@ -1211,18 +1662,31 @@ class RecursiveResolver(Resolver):
                 sent = await self._send_for_entry(step.entry, step.questions)
                 continue
             if isinstance(step, NeedAddress):
-                child_sname = Sname(step.ns_name, DnsQType.A, DnsRClass.IN)
-                child_slist = self.sbelt.copy_for(child_sname)
-                child_trace = trace.child(child_sname)
-                sub_gen = resolve_steps(child_sname, child_slist, self.cache)
-                sub_response = await self._drive(sub_gen, child_trace, depth + 1)
+                # RFC 1034 section 5.3.3 and RFC 5625 section 2.6: glue may be
+                # absent (a "glueless" referral), in which case the NS target has
+                # to be resolved in its own right. Ask for A *and* AAAA so a
+                # target reachable only over IPv6 is not silently skipped, and
+                # read the payloads through the RDATA codecs rather than assuming
+                # every answer is four octets.
                 addrs = []
-                if isinstance(sub_response, Response):
-                    for r in sub_response.answers:
-                        if r.rtype == DnsRType.A:
-                            ip = ipaddress.ip_address(bytes(r.rdata))
-                            if isinstance(ip, ipaddress.IPv4Address):
-                                addrs.append(ip)
+                for rtype in (DnsQType.A, DnsQType.AAAA):
+                    child_sname = Sname(step.ns_name, rtype, DnsRClass.IN)
+                    child_slist = self.sbelt.copy_for(child_sname)
+                    child_trace = trace.child(child_sname)
+                    sub_gen = resolve_steps(child_sname, child_slist, self.cache)
+                    sub_response = await self._drive(sub_gen, child_trace, depth + 1)
+                    if not isinstance(sub_response, Response):
+                        continue
+                    for record in sub_response.answers:
+                        # RFC 5625 section 2.5: only accept data for the name
+                        # actually asked about. A server (or an attacker) that
+                        # answers with some other name's address must not be able
+                        # to steer where we send the next query.
+                        if record.name != step.ns_name:
+                            continue
+                        address = _answer_address(record)
+                        if address is not None:
+                            addrs.append(address)
                 sent = addrs
                 continue
             if isinstance(step, Done):
@@ -1232,12 +1696,32 @@ class RecursiveResolver(Resolver):
             sent = None
 
     async def resolve(self, dns_packet):
-        assert isinstance(dns_packet, DnsPacket)
-        assert dns_packet.QDCOUNT > 0
+        """Resolve the first question of *dns_packet* iteratively.
 
-        if dns_packet.QDCOUNT > 1:
-            assert all(q.name == dns_packet.questions[0].name for q in dns_packet.questions[1:])
-            assert all(q.qclass == dns_packet.questions[0].qclass for q in dns_packet.questions[1:])
+        Validation here raises :class:`TypeError` / :class:`ValueError` rather
+        than asserting: these guard a public API against caller mistakes, and an
+        ``assert`` vanishes under ``python -O``, which would let a
+        zero-question packet through to ``questions[0]`` and surface as an
+        ``IndexError`` far from its cause.
+
+        Multiple questions are accepted only when they share a name and class --
+        :meth:`resolve_steps` tracks a single Sname, so silently resolving just
+        the first of several unrelated questions would be a quiet wrong answer.
+        """
+        if not isinstance(dns_packet, DnsPacket):
+            raise TypeError(f"resolve() expects a DnsPacket, got {type(dns_packet).__name__}")
+        if not dns_packet.questions:
+            raise ValueError("resolve() needs a packet with at least one question")
+
+        first = dns_packet.questions[0]
+        if len(dns_packet.questions) > 1 and any(
+            question.name != first.name or question.qclass != first.qclass
+            for question in dns_packet.questions[1:]
+        ):
+            raise ValueError(
+                "resolve() handles one (name, class) per call; multi-question "
+                "packets must agree on name and class"
+            )
 
         # Apply the resolver's DNS suffix. Names already terminated by a
         # trailing ``.`` pass through unchanged; relative names are promoted
@@ -1247,7 +1731,13 @@ class RecursiveResolver(Resolver):
         sname = Sname(qname, question.qtype, question.qclass)
         self.last_trace = Trace(sname)
         slist = self.sbelt.copy_for(sname)
-        gen = resolve_steps(sname, slist, self.cache)
+        gen = resolve_steps(
+            sname,
+            slist,
+            self.cache,
+            max_hops=self.max_hops,
+            max_alias_hops=self.max_alias_hops,
+        )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):
             response.ID = dns_packet.ID
