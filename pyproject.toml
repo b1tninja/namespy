@@ -79,11 +79,18 @@ branch = true
 # A floor, not a target: it exists so CI notices a module losing its tests,
 # which is the failure mode a parser-heavy library has to watch for.
 #
-# Set just under the measured total (69.7%) rather than at a round aspirational
+# Set just under the measured total (81%) rather than at a round aspirational
 # number, because a gate that fails on arrival gets ignored, and an ignored gate
-# protects nothing. server.py and __main__.py are at 0% and are what has to rise
-# before this can move up; ratchet it in step with tests, never ahead of them.
-fail_under = 68
+# protects nothing. Ratchet it in step with tests, never ahead of them.
+#
+# Where the remaining 19% lives, and whether it is worth chasing:
+#   resolver.py  67%  -- the real sockets and the root-hints bootstrap. Needs a
+#                        live-network tier, not more unit tests; see below.
+#   rdata.py     85%  -- mostly defensive branches for malformed RDATA that the
+#                        hostile-input tests reach only through DnsRecord.parse.
+#   __init__.py  50%  -- the re-export table has no logic to test.
+# Anything else dropping materially below these numbers is a module losing cover.
+fail_under = 80
 show_missing = true
 exclude_lines = [
   "if __name__ == .__main__.:",

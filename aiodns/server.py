@@ -102,7 +102,7 @@ class DnsServer(asyncio.Protocol):
         self._reply(
             Response(
                 ID=0 if dns_packet is None else dns_packet.ID,
-                QR=DnsQR.response,
+                QR=DnsQR.RESPONSE,
                 RCODE=rcode,
                 questions=questions,
             ),
@@ -110,21 +110,21 @@ class DnsServer(asyncio.Protocol):
         )
 
     async def respond_to_packet(self, dns_packet, addr):
-        if DnsQR.query != dns_packet.QR:
+        if DnsQR.QUERY != dns_packet.QR:
             self.log.debug("server_not_query(src=%s id=%#06x)", addr[0], dns_packet.ID)
             return
 
         if dns_packet.QDCOUNT != 1:
             # The resolver models one Sname at a time, and answering one of N
             # questions without saying which is worse than refusing.
-            self._error(dns_packet, addr, DnsResponseCode.format_error)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
             return
 
-        if DnsOpCode.query != dns_packet.OPCODE:
+        if DnsOpCode.QUERY != dns_packet.OPCODE:
             self.log.debug(
                 "server_unsupported_opcode(src=%s opcode=%s)", addr[0], dns_packet.OPCODE
             )
-            self._error(dns_packet, addr, DnsResponseCode.not_implemented)
+            self._error(dns_packet, addr, DnsResponseCode.NOT_IMPLEMENTED)
             return
 
         async with self._slots:
@@ -137,7 +137,7 @@ class DnsServer(asyncio.Protocol):
                 self.log.debug("server_late_result(dst=%s)", addr[0])
                 return
             if response is None:
-                self._error(dns_packet, addr, DnsResponseCode.server_failure)
+                self._error(dns_packet, addr, DnsResponseCode.SERVER_FAILURE)
                 return
             self._reply(response, addr)
 
@@ -158,7 +158,7 @@ class DnsServer(asyncio.Protocol):
                 len(exc.data),
                 exc.wire_hex(),
             )
-            self._error(None, addr, DnsResponseCode.format_error)
+            self._error(None, addr, DnsResponseCode.FORMAT_ERROR)
             return
 
         question = dns_packet.questions[0] if dns_packet.questions else None

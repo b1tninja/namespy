@@ -48,13 +48,13 @@ def _response(
     qtype=DnsQType.A,
     *,
     aa=False,
-    rcode=DnsResponseCode.no_error,
+    rcode=DnsResponseCode.NO_ERROR,
     answers=(),
     nameservers=(),
     additional=(),
 ):
     return Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=aa,
         RCODE=rcode,
         questions=[DnsQuestion(qname, qtype)],
@@ -424,7 +424,7 @@ def test_nxdomain_is_terminal():
     response = _response(
         sname.qname,
         aa=True,
-        rcode=DnsResponseCode.name_error,
+        rcode=DnsResponseCode.NAME_ERROR,
         nameservers=[_soa(DomainName("example.com"))],
     )
 

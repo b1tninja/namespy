@@ -140,13 +140,13 @@ def test_nxdomain_with_soa_round_trip() -> None:
     )
     response = Response(
         ID=0x9999,
-        QR=DnsQR.response,
-        RCODE=DnsResponseCode.name_error,
+        QR=DnsQR.RESPONSE,
+        RCODE=DnsResponseCode.NAME_ERROR,
         questions=[DnsQuestion(DomainName("missing.example.com"), DnsQType.A)],
         nameservers=[soa],
     )
     parsed, _ = DnsPacket.parse(bytes(response))
-    assert DnsResponseCode.name_error == parsed.RCODE
+    assert DnsResponseCode.NAME_ERROR == parsed.RCODE
     assert parsed.nameservers[0].rdata.minimum == 300
 
 
@@ -289,7 +289,7 @@ def _with_opt(*records, ttl: int, rcode: int = 0) -> bytes:
     return bytes(
         Response(
             ID=7,
-            QR=DnsQR.response,
+            QR=DnsQR.RESPONSE,
             RCODE=rcode,
             questions=[DnsQuestion(NAME, DnsQType.A)],
             additional_records=[_opt(ttl)],
@@ -322,8 +322,8 @@ def test_no_opt_means_header_rcode() -> None:
         bytes(
             Response(
                 ID=1,
-                QR=DnsQR.response,
-                RCODE=DnsResponseCode.not_auth,
+                QR=DnsQR.RESPONSE,
+                RCODE=DnsResponseCode.NOT_AUTH,
                 questions=[DnsQuestion(NAME, DnsQType.A)],
             )
         )
@@ -334,7 +334,7 @@ def test_no_opt_means_header_rcode() -> None:
 
 
 def test_header_rcode_above_fifteen_needs_opt() -> None:
-    response = Response(ID=1, QR=DnsQR.response, RCODE=16, questions=[])
+    response = Response(ID=1, QR=DnsQR.RESPONSE, RCODE=16, questions=[])
     with pytest.raises(ValueError, match="EDNS"):
         bytes(response)
 
@@ -412,7 +412,7 @@ def test_query_and_response_classes_survive_round_trip() -> None:
     assert isinstance(
         DnsPacket.parse(bytes(Query(questions=[DnsQuestion(NAME, DnsQType.A)])))[0], Query
     )
-    response = Response(ID=1, QR=DnsQR.response, questions=[DnsQuestion(NAME, DnsQType.A)])
+    response = Response(ID=1, QR=DnsQR.RESPONSE, questions=[DnsQuestion(NAME, DnsQType.A)])
     assert isinstance(DnsPacket.parse(bytes(response))[0], Response)
 
 

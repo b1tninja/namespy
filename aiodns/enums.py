@@ -89,27 +89,32 @@ class DnsResponseCode(_TypeMixin, IntEnum):
     discarded.
     """
 
-    no_error = 0  # NOERROR
-    format_error = 1  # FORMERR -- RFC 1035 section 4.1.1
-    server_failure = 2  # SERVFAIL
-    name_error = 3  # NXDOMAIN
-    not_implemented = 4  # NOTIMP
-    refused = 5  # REFUSED
-    yxdomain = 6  # RFC 2136 section 2.3 (UPDATE)
-    yxrrset = 7  # RFC 2136 section 2.3
-    nxrrset = 8  # RFC 2136 section 2.3
-    not_auth = 9  # NOTAUTH -- RFC 2136 section 2.3
-    not_zone = 10  # NOTZONE -- RFC 2136 section 2.3
-    badvers = 16  # RFC 6891 section 6.1.3 (also spelled BADVERS)
-    badsig = 17  # RFC 8945 (TSIG); 16 before RFC 6891 displaced it
-    badkey = 18  # RFC 8945
-    badtime = 19  # RFC 8945
-    badmode = 20  # RFC 2930 (SIG(0)/TKEY)
-    badname = 21  # RFC 2930
-    badkey_policy = 22  # second BADKEY in the registry, from RFC 2930
-    badalg = 23  # RFC 2930
-    badtrunc = 24  # RFC 8945 (TSIG truncated a keyed hash)
-    badcookie = 25  # RFC 7873; registry lists 25, the RFC's table said 23
+    #: An unknown RCODE must not render as ``TYPE11``: that string means "no such
+    #: RR type" to anyone reading a log, and RFC 6891 section 6.1.3 widened this
+    #: space to 12 bits, so unassigned values 11-15 are reachable in practice.
+    _prefix = nonmember("RCODE")
+
+    NO_ERROR = 0  # NOERROR
+    FORMAT_ERROR = 1  # FORMERR -- RFC 1035 section 4.1.1
+    SERVER_FAILURE = 2  # SERVFAIL
+    NAME_ERROR = 3  # NXDOMAIN
+    NOT_IMPLEMENTED = 4  # NOTIMP
+    REFUSED = 5  # REFUSED
+    YXDOMAIN = 6  # RFC 2136 section 2.3 (UPDATE)
+    YXRRSET = 7  # RFC 2136 section 2.3
+    NXRRSET = 8  # RFC 2136 section 2.3
+    NOT_AUTH = 9  # NOTAUTH -- RFC 2136 section 2.3
+    NOT_ZONE = 10  # NOTZONE -- RFC 2136 section 2.3
+    BADVERS = 16  # RFC 6891 section 6.1.3 (also spelled BADVERS)
+    BADSIG = 17  # RFC 8945 (TSIG); 16 before RFC 6891 displaced it
+    BADKEY = 18  # RFC 8945
+    BADTIME = 19  # RFC 8945
+    BADMODE = 20  # RFC 2930 (SIG(0)/TKEY)
+    BADNAME = 21  # RFC 2930
+    BADKEY_POLICY = 22  # second BADKEY in the registry, from RFC 2930
+    BADALG = 23  # RFC 2930
+    BADTRUNC = 24  # RFC 8945 (TSIG truncated a keyed hash)
+    BADCOOKIE = 25  # RFC 7873; registry lists 25, the RFC's table said 23
 
     def __str__(self) -> str:
         return self.name
@@ -125,18 +130,21 @@ class DnsOpCode(_TypeMixin, IntEnum):
     server using an opcode this enum has never heard of is still inspectable.
     """
 
-    query = 0  # RFC 1035
-    iquery = 1  # RFC 1035 -- obsolete, must not be emitted (RFC 8906)
-    status = 2  # RFC 1035
-    notify = 4  # RFC 1996 section 2
-    update = 5  # RFC 2136 section 2
+    #: ``OPCODE9`` rather than a misleading ``TYPE9`` (see the mixin's ``_prefix``).
+    _prefix = nonmember("OPCODE")
+
+    QUERY = 0  # RFC 1035
+    IQUERY = 1  # RFC 1035 -- obsolete, must not be emitted (RFC 8906)
+    STATUS = 2  # RFC 1035
+    NOTIFY = 4  # RFC 1996 section 2
+    UPDATE = 5  # RFC 2136 section 2
 
 
 class DnsQR(IntEnum):
     """Header QR bit: a query or a response (RFC 1035 section 4.1.1)."""
 
-    query = 0
-    response = 1
+    QUERY = 0
+    RESPONSE = 1
 
 
 class DnsRClass(_TypeMixin, IntEnum):

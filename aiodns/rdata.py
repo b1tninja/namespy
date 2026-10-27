@@ -102,7 +102,14 @@ def generic_presentation(blob: bytes) -> str:
     The backslash is what tells a master file this is unknown-type data rather
     than text that happens to look like hex; callers that only want the payload
     can read :attr:`RData.blob`.
+
+    An empty RDATA prints as ``\# 0`` with no trailing space -- RFC 3597's
+    grammar allows the hex-string to be absent exactly when the length is zero,
+    and a dangling space is what distinguishes considered output from a format
+    string that never met an empty case.
     """
+    if not blob:
+        return r"\# 0"
     return rf"\# {len(blob)} {blob.hex()}"
 
 

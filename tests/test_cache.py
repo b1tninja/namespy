@@ -118,14 +118,14 @@ def test_nxdomain_round_trip(make_cache):
             DomainName("nx.example.com."),
             DnsRType.A,
             DnsRClass.IN,
-            DnsResponseCode.name_error,
+            DnsResponseCode.NAME_ERROR,
             soa,
             clock.t + 60,
         )
     )
     got = cache.get(DomainName("nx.example.com."), DnsRType.A, DnsRClass.IN)
     assert isinstance(got, NegativeEntry)
-    assert got.rcode == DnsResponseCode.name_error
+    assert got.rcode == DnsResponseCode.NAME_ERROR
 
 
 def test_nodata_round_trip(make_cache):
@@ -143,14 +143,14 @@ def test_nodata_round_trip(make_cache):
             DomainName("example.com."),
             DnsRType.MX,
             DnsRClass.IN,
-            DnsResponseCode.no_error,
+            DnsResponseCode.NO_ERROR,
             soa,
             clock.t + 60,
         )
     )
     got = cache.get(DomainName("example.com."), DnsRType.MX, DnsRClass.IN)
     assert isinstance(got, NegativeEntry)
-    assert got.rcode == DnsResponseCode.no_error
+    assert got.rcode == DnsResponseCode.NO_ERROR
 
 
 def test_case_and_trailing_dot_collapse_to_one_key(make_cache):

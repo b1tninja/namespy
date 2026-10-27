@@ -19,7 +19,7 @@ from .enums import (
     DnsRType,
 )
 from .names import DomainName
-from .packet import DnsPacket, DnsQuestion, Query
+from .packet import OPT_RTYPE, DnsPacket, DnsQuestion, Query
 from .rdata import generic_presentation, type_name_of
 from .resolver import RecursiveResolver
 from .server import DnsServer
@@ -27,6 +27,9 @@ from .server import DnsServer
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
 EXAMPLE_NAME = "example.org"
 LOOKUP_TIMEOUT_S = 120.0
+
+#: QTYPE and QCLASS are each 16 bits (RFC 1035 sections 4.1.3, 6).
+MAX_WIRE_FIELD = 0xFFFF
 
 
 class _LocalDnsResponseWaiter(asyncio.DatagramProtocol):
@@ -99,27 +102,55 @@ def _dump_last_resolution_md(resolver_protocol, path="last_resolution.md") -> No
 
 
 def _parse_qtype(token):
+    """Resolve a record type given as a mnemonic or a number.
+
+    A number with no mnemonic is *accepted*. Refusing it would mean the CLI
+    cannot ask for a type until this library happens to list it, which is the
+    opposite of what RFC 3597 section 3 requires of a receiver: unknown types are
+    legitimate wire values, and a freshly assigned one should be queryable on the
+    day it is registered, not after DNSpy catches up.
+    """
     s = str(token).upper()
     try:
         return DnsQType[s]
     except KeyError:
         pass
-    try:
-        return DnsQType(int(s))
-    except (ValueError, KeyError):
-        raise argparse.ArgumentTypeError(f"unknown record type: {token}") from None
+    return _parse_field(s, token, DnsQType, "record type")
 
 
 def _parse_qclass(token):
+    """Resolve a record class, mnemonic or number (see :func:`_parse_qtype`).
+
+    Both paths return :class:`~aiodns.enums.DnsQClass`, the space of the question
+    section's QCLASS field. Reaching for :class:`~aiodns.enums.DnsRClass` on the
+    mnemonic path made the return type depend on how the user spelled the same
+    value -- ``IN`` yielding one enum and ``1`` the other -- which is invisible
+    while comparing by value and surprising the moment anything keys on type.
+    """
     s = str(token).upper()
     try:
-        return DnsRClass[s]
+        return DnsQClass[s]
     except KeyError:
         pass
+    return _parse_field(s, token, DnsQClass, "record class")
+
+
+def _parse_field(text, token, enum, label):
+    """Coerce a 16-bit protocol field, keeping an unregistered value as an int.
+
+    The range check is the only hard limit: QTYPE and QCLASS are each 16 bits on
+    the wire (RFC 1035 sections 4.1.3, 6), so anything larger cannot be sent and
+    failing here beats emitting a truncated field later.
+    """
     try:
-        return DnsRClass(int(s))
-    except (ValueError, KeyError):
-        raise argparse.ArgumentTypeError(f"unknown record class: {token}") from None
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"unknown {label}: {token}") from None
+    if not 0 <= value <= MAX_WIRE_FIELD:
+        raise argparse.ArgumentTypeError(
+            f"{label} {token} is outside the 16-bit range 0-{MAX_WIRE_FIELD}"
+        )
+    return enum.parse(value)
 
 
 def _format_rdata(record):
@@ -173,7 +204,7 @@ def _format_response(response, args, elapsed_ms):
         return "\n".join(lines)
 
     flags = []
-    if DnsQR.response == response.QR:
+    if DnsQR.RESPONSE == response.QR:
         flags.append("qr")
     if response.AA:
         flags.append("aa")
@@ -218,8 +249,13 @@ def _format_response(response, args, elapsed_ms):
     for label, section in (
         ("ANSWER", response.answers),
         ("AUTHORITY", response.nameservers),
-        ("ADDITIONAL", response.additional_records),
+        ("ADDITIONAL", [r for r in response.additional_records if int(r.rtype) != OPT_RTYPE]),
     ):
+        # OPT is deliberately excluded from the ADDITIONAL listing above, while
+        # still counted in the ARCOUNT figure: it is a transport pseudo-record
+        # with no zone meaning, already fully described by the pseudo-section, and
+        # printing it as a row invites someone to read its CLASS field -- the
+        # sender's UDP payload size -- as a record class.
         if section:
             lines.append(f";; {label} SECTION:")
             for r in section:
@@ -286,7 +322,7 @@ def build_parser():
         "qclass",
         nargs="?",
         type=_parse_qclass,
-        default=DnsRClass.IN,
+        default=DnsQClass.IN,
         metavar="class",
         help="record class (IN, CH, HS). Default: IN",
     )

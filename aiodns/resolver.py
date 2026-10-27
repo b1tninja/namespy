@@ -665,7 +665,7 @@ def _is_expected_response(query_packet, response_packet, dst) -> bool:
     faithfully. Both are required by RFC 1035 section 4.1.1 and both are
     explicitly named as client-side validation by RFC 5452 section 5.
     """
-    if DnsQR.response != response_packet.QR:
+    if DnsQR.RESPONSE != response_packet.QR:
         return False
     if not response_packet.questions:
         return False
@@ -886,13 +886,19 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
         yield Demote(entry, "no response")
         return
 
-    if DnsResponseCode.name_error == response.RCODE:
+    if DnsResponseCode.NAME_ERROR == response.RCODE:
         yield Nxdomain()
         yield Done(response)
         return
 
-    if DnsResponseCode.no_error != response.RCODE:
-        yield Demote(entry, "rcode " + response.RCODE.name)
+    if DnsResponseCode.NO_ERROR != response.RCODE:
+        # Not response.RCODE.name: RCODE is a plain int whenever the header held
+        # a value this enum has no member for, and .name on an int is an
+        # AttributeError inside the classifier -- which, reached from a datagram,
+        # would turn "unfamiliar RCODE" into a crash instead of a demotion.
+        # RFC 2929 section 3.1 makes unassigned codes a routine occurrence, so
+        # this is the normal path for a server ahead of the registry, not an edge.
+        yield Demote(entry, "rcode " + DnsResponseCode.mnemonic(response.RCODE))
         return
 
     # Answer section: either a complete answer, or a chain parked on an alias
@@ -1052,7 +1058,7 @@ def resolve_steps(
             if hit is not None:
                 if isinstance(hit, PositiveEntry):
                     yield Answer(hit.records)
-                elif hit.rcode == DnsResponseCode.name_error:
+                elif hit.rcode == DnsResponseCode.NAME_ERROR:
                     yield Nxdomain()
                 else:
                     yield Nodata(hit.soa)
@@ -1125,16 +1131,16 @@ def _synthesize_response(sname, hit):
     questions = list(sname.questions)
     if isinstance(hit, PositiveEntry):
         return Response(
-            QR=DnsQR.response,
+            QR=DnsQR.RESPONSE,
             AA=hit.authoritative,
-            RCODE=DnsResponseCode.no_error,
+            RCODE=DnsResponseCode.NO_ERROR,
             questions=questions,
             answers=list(hit.records),
         )
     rcode = hit.rcode if isinstance(hit.rcode, DnsResponseCode) else DnsResponseCode(int(hit.rcode))
     nameservers = [hit.soa] if hit.soa is not None else []
     return Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=False,
         RCODE=rcode,
         questions=questions,
@@ -1200,7 +1206,7 @@ def _write_cache(cache, sname, terminal_event, response):
                 sname.qname,
                 sname.qtype,
                 sname.qclass,
-                DnsResponseCode.no_error,
+                DnsResponseCode.NO_ERROR,
                 terminal_event.soa,
                 now + ttl,
             )
@@ -1221,7 +1227,7 @@ def _write_cache(cache, sname, terminal_event, response):
                 sname.qname,
                 sname.qtype,
                 sname.qclass,
-                DnsResponseCode.name_error,
+                DnsResponseCode.NAME_ERROR,
                 soa,
                 now + ttl,
             )
@@ -1539,9 +1545,9 @@ class RecursiveResolver(Resolver):
             )
 
         questions = [DnsQuestion(DomainName.root_label(), qtype=DnsQType.NS)]
-        query = Query(QR=DnsQR.query, RD=False, questions=questions)
+        query = Query(QR=DnsQR.QUERY, RD=False, questions=questions)
         return Response(
-            QR=DnsQR.response,
+            QR=DnsQR.RESPONSE,
             ID=query.ID,
             AA=True,
             RD=False,
@@ -1611,7 +1617,7 @@ class RecursiveResolver(Resolver):
 
         questions = [DnsQuestion(DomainName.root_label(), qtype=DnsQType.NS)]
         return Response(
-            QR=DnsQR.response,
+            QR=DnsQR.RESPONSE,
             ID=secrets.randbits(16),
             AA=True,
             RD=False,

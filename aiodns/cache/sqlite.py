@@ -180,12 +180,12 @@ class SqliteDnsCache(DnsCache):
         qc = int(entry.qclass)
         if isinstance(entry, PositiveEntry):
             kind = _KIND_POSITIVE
-            rcode = int(DnsResponseCode.no_error)
+            rcode = int(DnsResponseCode.NO_ERROR)
             authoritative = 1 if entry.authoritative else 0
             payload = _pack_records(entry.records)
         elif isinstance(entry, NegativeEntry):
             rcode_int = int(entry.rcode)
-            kind = _KIND_NXDOMAIN if rcode_int == int(DnsResponseCode.name_error) else _KIND_NODATA
+            kind = _KIND_NXDOMAIN if rcode_int == int(DnsResponseCode.NAME_ERROR) else _KIND_NODATA
             rcode = rcode_int
             authoritative = 0
             payload = bytes(entry.soa) if entry.soa is not None else b""

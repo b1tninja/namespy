@@ -22,7 +22,7 @@ def _make_referral(qname, new_zone, ns_targets, glue=()):
     ns_records = [DnsRecord(new_zone, DnsRType.NS, DnsRClass.IN, 0, rdata=t) for t in ns_targets]
     ar_records = [DnsRecord(t, DnsRType.A, DnsRClass.IN, 0, rdata=ip.packed) for t, ip in glue]
     return Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=False,
         questions=[DnsQuestion(qname, DnsQType.A)],
         nameservers=ns_records,
@@ -32,7 +32,7 @@ def _make_referral(qname, new_zone, ns_targets, glue=()):
 
 def _make_answer(qname, addr):
     return Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
         questions=[DnsQuestion(qname, DnsQType.A)],
         answers=[DnsRecord(qname, DnsRType.A, DnsRClass.IN, 0, rdata=addr.packed)],
@@ -135,9 +135,9 @@ def test_classify_nxdomain():
     entry = slist.best()
 
     response = Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
-        RCODE=DnsResponseCode.name_error,
+        RCODE=DnsResponseCode.NAME_ERROR,
         questions=[DnsQuestion(DomainName("nx.example.com"), DnsQType.A)],
     )
 
@@ -160,7 +160,7 @@ def test_classify_nodata_with_soa():
 
     soa = DnsRecord(DomainName("example.com"), DnsRType.SOA, DnsRClass.IN, 0, rdata=b"")
     response = Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
         questions=[DnsQuestion(DomainName("example.com"), DnsQType.MX)],
         nameservers=[soa],
@@ -185,8 +185,8 @@ def test_classify_servfail_demotes():
     entry = slist.best()
 
     response = Response(
-        QR=DnsQR.response,
-        RCODE=DnsResponseCode.server_failure,
+        QR=DnsQR.RESPONSE,
+        RCODE=DnsResponseCode.SERVER_FAILURE,
         questions=[DnsQuestion(DomainName("example.com"), DnsQType.A)],
     )
 
@@ -211,6 +211,75 @@ def test_classify_no_response_demotes():
     assert len(steps) == 1
     assert isinstance(steps[0], Demote)
     assert "no response" in steps[0].reason
+
+
+def test_classify_unassigned_rcode_demotes_without_crashing():
+    """A response code we have no member for must demote, not raise.
+
+    Regression: this path used to read ``response.RCODE.name``, and RCODE is a
+    plain ``int`` whenever the header held an unassigned value -- so the
+    classifier died with ``AttributeError: 'int' object has no attribute
+    'name'`` on a datagram, which is the opposite of what ``DnsResponseCode
+    .parse`` exists to allow. Values 11-15 are unassigned today and RFC 6891
+    section 6.1.3 makes the field 12 bits wide, so a server ahead of the
+    registry is expected traffic (RFC 2929 section 3.1).
+    """
+    sname = Sname(DomainName("example.com"), DnsQType.A)
+    slist = _seed_slist(
+        DomainName("."),
+        DomainName("a.root-servers.net"),
+        ipaddress.IPv4Address("198.41.0.4"),
+        sname=sname,
+        match=0,
+    )
+    entry = slist.best()
+
+    response = Response(
+        QR=DnsQR.RESPONSE,
+        RCODE=11,
+        questions=[DnsQuestion(DomainName("example.com"), DnsQType.A)],
+    )
+    assert not isinstance(response.RCODE, DnsResponseCode)
+
+    steps = list(classify(response, sname, slist, entry))
+    assert len(steps) == 1
+    assert isinstance(steps[0], Demote)
+    assert steps[0].reason == "rcode RCODE11"
+
+
+def test_classify_nodata_from_non_authoritative_server():
+    """SOA and no NS in the authority section is NODATA even when AA is clear.
+
+    RFC 2308 section 2.2.1 defines this as "type 2" NODATA and recommends
+    authoritative servers emit it precisely because the alternative reads as a
+    referral. The classifier here used to test ``AA`` before looking at the
+    authority section at all, so a non-authoritative server's NODATA -- the shape
+    most recursive resolvers actually see, since the answer usually arrives from a
+    cached intermediary -- went down the referral path and the lookup demoted a
+    perfectly good server.
+    """
+    sname = Sname(DomainName("example.com"), DnsQType.MX)
+    slist = _seed_slist(
+        DomainName("example.com"),
+        DomainName("ns.example.com"),
+        ipaddress.IPv4Address("1.2.3.4"),
+        sname=sname,
+        match=2,
+    )
+    entry = slist.best()
+
+    soa = DnsRecord(DomainName("example.com"), DnsRType.SOA, DnsRClass.IN, 3600, rdata=b"")
+    response = Response(
+        QR=DnsQR.RESPONSE,
+        AA=False,
+        questions=[DnsQuestion(DomainName("example.com"), DnsQType.MX)],
+        nameservers=[soa],
+    )
+
+    steps = list(classify(response, sname, slist, entry))
+    assert [type(s).__name__ for s in steps] == ["Nodata", "Done"]
+    assert steps[0].soa is soa
+    assert not entry.history["demoted"]
 
 
 def test_classify_cname_in_authoritative_answer():
@@ -239,7 +308,7 @@ def test_classify_cname_in_authoritative_answer():
         rdata=ipaddress.IPv4Address("93.184.216.34").packed,
     )
     response = Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
         questions=[DnsQuestion(DomainName("www.example.com"), DnsQType.A)],
         answers=[cname, a],

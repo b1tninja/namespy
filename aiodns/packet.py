@@ -45,6 +45,7 @@ from .rdata import RData, rdata_class_for, type_name_of
 from .wire import HEADER_OCTETS, DnsPacketParseError, read_octets
 
 __all__ = [
+    "OPT_RTYPE",
     "DnsPacket",
     "DnsPacketParseError",
     "DnsQuestion",
@@ -260,14 +261,14 @@ class DnsPacket:
     def __init__(
         self,
         ID=None,
-        QR=DnsQR.query,
-        OPCODE=DnsOpCode.query,
+        QR=DnsQR.QUERY,
+        OPCODE=DnsOpCode.QUERY,
         AA=False,
         TC=False,
         RD=True,
         RA=False,
         Z=0,
-        RCODE=DnsResponseCode.no_error,
+        RCODE=DnsResponseCode.NO_ERROR,
         QDCOUNT=None,
         ANCOUNT=None,
         NSCOUNT=None,
@@ -382,7 +383,7 @@ class DnsPacket:
     def __repr__(self) -> str:
         return "<DnsPacket:{:#06x} {} q={} a={} ns={} ar={}>".format(
             self.ID,
-            "response" if DnsQR.response == self.QR else "query",
+            "response" if DnsQR.RESPONSE == self.QR else "query",
             len(self.questions),
             len(self.answers),
             len(self.nameservers),
@@ -406,7 +407,7 @@ class DnsPacket:
                 f"(RFC 6891 section 6.1.3)"
             )
         flags1 = (
-            (0x80 if DnsQR.response == self.QR else 0)
+            (0x80 if DnsQR.RESPONSE == self.QR else 0)
             | (int(self.OPCODE) & 0xF) << 3
             | (0x04 if self.AA else 0)
             | (0x02 if self.TC else 0)
@@ -526,7 +527,7 @@ class DnsPacket:
                 offset=offset,
             )
 
-        packet_cls = Query if DnsQR.query == QR else Response
+        packet_cls = Query if DnsQR.QUERY == QR else Response
         return (
             packet_cls(
                 ID,

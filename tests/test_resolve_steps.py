@@ -25,7 +25,7 @@ def _make_referral(qname, new_zone, ns_targets, glue=()):
     ns_records = [DnsRecord(new_zone, DnsRType.NS, DnsRClass.IN, 0, rdata=t) for t in ns_targets]
     ar_records = [DnsRecord(t, DnsRType.A, DnsRClass.IN, 0, rdata=ip.packed) for t, ip in glue]
     return Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=False,
         questions=[DnsQuestion(qname, DnsQType.A)],
         nameservers=ns_records,
@@ -35,7 +35,7 @@ def _make_referral(qname, new_zone, ns_targets, glue=()):
 
 def _make_answer(qname, addr):
     return Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
         questions=[DnsQuestion(qname, DnsQType.A)],
         answers=[DnsRecord(qname, DnsRType.A, DnsRClass.IN, 0, rdata=addr.packed)],
@@ -152,7 +152,7 @@ def test_resolve_steps_two_hops_root_to_com_to_example():
 def test_sbelt_copy_for_seeds_root_zone():
     sname = Sname(DomainName("example.com"), DnsQType.A)
     response = Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
         questions=[DnsQuestion(DomainName("."), DnsQType.NS)],
         nameservers=[
@@ -346,7 +346,7 @@ def test_resolve_steps_cache_short_circuits_to_nxdomain():
             DomainName("nx.example.com."),
             DnsQType.A,
             DnsRClass.IN,
-            DnsResponseCode.name_error,
+            DnsResponseCode.NAME_ERROR,
             soa,
             expires_at=1060.0,
         )
@@ -357,7 +357,7 @@ def test_resolve_steps_cache_short_circuits_to_nxdomain():
     assert isinstance(step, Nxdomain)
     step = next(gen)
     assert isinstance(step, Done)
-    assert DnsResponseCode.name_error == step.response.RCODE
+    assert DnsResponseCode.NAME_ERROR == step.response.RCODE
 
 
 def test_resolve_steps_populates_cache_after_authoritative_answer():
@@ -384,7 +384,7 @@ def test_resolve_steps_populates_cache_after_authoritative_answer():
         rdata=ipaddress.IPv4Address("93.184.216.34").packed,
     )
     response = Response(
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         AA=True,
         questions=[DnsQuestion(DomainName("example.com."), DnsQType.A)],
         answers=[answer_record],

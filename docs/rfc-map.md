@@ -29,7 +29,7 @@ itself. The `SendQuery` effect builds queries via
 | SCLASS | QCLASS | `Sname.qclass` |
 | SLIST  | Best-known nameservers for the current zone-cut | `Slist` |
 | SBELT  | Safety-belt servers from configuration | `Sbelt` (built from `named.root` in `RecursiveResolver.bootstrap`) |
-| CACHE  | RRs from previous responses | *not yet implemented* — TODO |
+| CACHE  | RRs from previous responses | `DnsCache` (`MemoryDnsCache`, `SqliteDnsCache`), consulted at step 1 and written by `cache.put` |
 
 Each `SlistEntry` is a `(zone, ns, addresses, history)` row representing
 one nameserver candidate.
@@ -51,9 +51,15 @@ flowchart TD
 
 In DNSpy:
 
-- **Step 1** (cache lookup): currently a no-op. The `# TODO` is inside
-  `resolve_steps` at the start of each loop. A cache layer is the next
-  planned addition.
+- **Step 1** (cache lookup): consulted at the top of every iteration of
+  `resolve_steps`, so a re-anchored alias target gets a cache check too rather
+  than only the original QNAME. A hit yields `Answer`/`Nxdomain`/`Nodata` plus
+  `Done(_synthesize_response(...))` and returns without touching the network;
+  a miss falls through to step 2. Writes happen through `cache.put` when a
+  response is classified. See
+  [`aiodns/cache/__init__.py`](aiodns/cache/__init__.py) for `DnsCache`, its
+  in-memory and SQLite backends, and how negative entries take their TTL from
+  the SOA (RFC 2308 §5).
 - **Step 2** (pick best server): `Slist.best()` returns the first
   non-demoted entry. If that entry has no addresses, the generator
   yields `NeedAddress(ns)` and the driver runs a *nested* `resolve_steps`
@@ -66,8 +72,11 @@ In DNSpy:
   - `Answer(records)` + `Done(response)` — final answer (4a),
   - `Referral(old_zone, new_zone, match_before, match_after)` — valid
     "closer" delegation (4b), after extending `Slist`,
-  - `Cname(target)` — CNAME chase placeholder (4c, see TODO),
-  - `Demote(entry, reason)` — SERVFAIL / bogus / not-closer (4d).
+  - `Cname(target)` — one redirection taken; if no `Done` follows, the driver
+    re-anchors SNAME and restarts at step 2 (4c, see §6),
+  - `Demote(entry, reason)` — SERVFAIL / bogus / not-closer (4d),
+  - `Fail(reason)` — a broken alias chain or exhausted hops, which is
+    deliberately *not* a cacheable negative.
 
 ## 4. Match count and "closer" delegations (§5.3.3 step 4b)
 
@@ -88,20 +97,67 @@ NXDOMAIN and NODATA both carry the SOA in the **authority** section of
 the wire response, *not* the answer section. Our classifier mirrors
 that:
 
-- `RCODE == name_error` → NXDOMAIN. Yields `Nxdomain()` then `Done(response)`.
-- `RCODE == no_error` and `AA=1` and `ANCOUNT == 0` → NODATA. The SOA
-  (if present) is read straight out of `response.nameservers`; yields
-  `Nodata(soa)` then `Done(response)`.
+- `RCODE == NAME_ERROR` → NXDOMAIN. Yields `Nxdomain()` then `Done(response)`.
+- Any other non-`NO_ERROR` RCODE → `Demote(entry, "rcode <mnemonic>")`, and
+  the lookup tries another server. The mnemonic comes from
+  `DnsResponseCode.mnemonic()` because RCODE is a plain `int` for values the
+  enum has no member for (11-15 are unassigned; §6.1.3 of RFC 6891 makes the
+  field 12 bits wide).
+- `ANCOUNT == 0` → the **content of the authority section** decides, per
+  RFC 2308 §2.2.1, which classifies by SOA-versus-NS presence rather than by
+  the `AA` bit:
+  - `AA=1`: a server claiming authority cannot simultaneously be referring us
+    onward, so an empty answer is NODATA whatever else is there.
+  - `AA=0` with SOA and no NS: "type 2" NODATA — a shape RFC 2308 §2.2.1
+    recommends precisely because the alternative is so often misread as a
+    referral.
+  - `AA=0` with NS RRs *closer* than the current zone: a referral (§5.3.3 4b).
+  - `AA=0` with neither: `Demote`, because a negative answer with no SOA has no
+    TTL and RFC 2308 §5 says it "SHOULD NOT be cached as there is no way to
+    prevent the negative responses looping forever".
 
-Do **not** synthesize an extra SOA query — the SOA is already in the
-response we just received, and a second query would race against it.
+The SOA (if present) is read straight out of `response.nameservers`; it is
+never re-queried. Do **not** synthesize an extra SOA query — the SOA is already
+in the response we just received, and a second query would race against it.
 
-## 6. CNAME chasing (§5.3.3 step 4c)
+Classifying on `AA` *before* inspecting the authority section was an earlier
+bug: the non-authoritative NODATA above is the common case for a recursive
+resolver, and it was being sent down the referral path, which demoted a
+perfectly healthy server.
 
-When an authoritative answer contains a CNAME and STYPE != CNAME, the
-canonical name should become the new SNAME and the algorithm restarts
-at step 1. We currently *detect* this by yielding `Cname(target)` for
-trace purposes but do not yet rename SNAME and recurse — flagged TODO.
+## 6. Alias chasing (§5.3.3 step 4c, RFC 6672)
+
+An answer that contains a CNAME whose target is not itself answered is **not
+a conclusion**: §5.3.3 step 4c says "if the answer contains a CNAME RR, set
+SNAME to the contents of the RDATA field of the displayed CNAME RR, and go to
+step 2". So the lookup restarts with QNAME re-anchored at the target, QTYPE
+unchanged — an A query for an aliased name becomes an A query for the target,
+and only the target's RRset can end it.
+
+Two pieces, deliberately split:
+
+- `_follow_aliases(response, sname)` walks the chain *inside one response* and
+  returns an `AliasWalk`: resolved records, the trace `Cname` events, either a
+  `continued_at` target that needs another query, or a `failure`.
+- `resolve_steps` owns the loop *across responses*, because only it can count
+  hops over several round trips. It re-anchors `sname` and re-enters at step 2,
+  bounded by `max_alias_hops` (`MAX_ALIAS_HOPS` by default, configurable per
+  `Resolver`).
+
+A trailing `Cname` with no `Done` is therefore the normal signal for "keep
+going", not an error — `classify` stays a pure per-response classifier so it
+remains directly testable, and the driver owns the state.
+
+A chain that loops or exceeds the hop cap yields `Fail`, **not** NODATA:
+RFC 2308 §5 would have us cache a NODATA against the zone SOA, so one malformed
+alias set would hide a live name for the length of the zone's MINIMUM.
+
+DNAME (RFC 6672) is handled in the same walk: a DNAME at or above QNAME
+redirects the whole subtree, and the synthesized name is QNAME's labels below
+the owner prepended to the DNAME's target (§2.3). The owner itself is never
+redirected — §2.3 says "the owner name of a DNAME RR is not redirected itself"
+— so the enclosing-owner scan uses the strict subdomain test
+(`is_subdomain_of(owner, include_self=False)`).
 
 ## 7. Glueless delegation (§5.3.3 step 2 priorities)
 
@@ -128,11 +184,12 @@ Mapping to our classifier:
 
 | Server emits | Classifier branch |
 |---|---|
-| `AA=1`, `ANCOUNT > 0` | answer (4a, a) |
-| `AA=0`, `ANCOUNT = 0`, `NSCOUNT > 0` | referral (4b, b) |
-| `RCODE = name_error` | NXDOMAIN (4d, c) |
-| `AA=1`, `ANCOUNT = 0` | NODATA (§4.3.4) |
-| `RCODE = server_failure` etc. | demote (4d) |
+| `AA=1`, `ANCOUNT > 0` | answer (4a, a) — after any CNAME/DNAME walk |
+| Alias whose target is unanswered | re-anchor SNAME, go to step 2 (4c) |
+| `AA=0`, `ANCOUNT = 0`, NS closer than current zone | referral (4b, b) |
+| `ANCOUNT = 0`, SOA in authority | NODATA (§4.3.4; RFC 2308 §2.2.1) |
+| `RCODE = NAME_ERROR` | NXDOMAIN (4d, c) |
+| other `RCODE`, or no SOA to time a negative by | demote (4d) |
 
 ## 9. Architecture: generator of effects
 
@@ -169,14 +226,30 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 | Trace tree | [`aiodns/trace.py`](aiodns/trace.py) `Trace` |
 | Mermaid output | `Trace.to_mermaid()` |
 
-## 11. TODOs explicitly tracked here
+## 11. Known gaps
 
-- Cache (§5.3.3 step 1) — `Slist.best()` should consult cache before
-  the network. Step 4 should populate cache from authoritative answers
-  and from referrals.
-- CNAME chasing (§5.3.3 step 4c) — rename SNAME and restart, capped.
-- AAAA glue and IPv6 sending (`Resolver.query` currently cancels on
-  non-IPv4 destinations).
-- Match count is computed against the zone in a referral's authority
-  section. Should also reject referrals that include NS names that are
-  out of bailiwick relative to the new zone (lame delegation guard).
+Deliberately unimplemented, each with the spec that would drive it:
+
+- **EDNS(0) is decoded but not sent.** `DnsPacket` reads an OPT record and
+  exposes `extended_rcode`, `ad`, `cd` and `requestor_payload_size`
+  (RFC 6891 §6.1.2-6.1.3), but outbound queries carry no OPT. That leaves the
+  UDP payload ceiling at 512 octets (§6.2.3) and caps us at the 4-bit RCODEs.
+- **`TC` is parsed and never acted on.** A truncated response is used as if it
+  were complete. The fix is a TCP retry on the same server (RFC 7766 §6), which
+  needs a connection path this library does not have yet — there is no TCP
+  transport anywhere in the package.
+- **QNAME minimisation** (RFC 9156) is not done: the full QNAME goes to every
+  server on the way down. See the note in `resolve_steps`.
+- **No DNSSEC validation.** The `AD` bit is surfaced but not verified; nothing
+  in `RDATA` speaks RRSIG/DNSKEY (RFC 4033/4034/4035), and there is no trust
+  anchor.
+- **Out-of-bailiwick referral names.** `classify` already marks a referral lame
+  when an *in*-bailiwick NS arrives without glue (RFC 5625 §2.5); it does not
+  yet check the reverse case, where the authority section's NS names sit outside
+  the new zone and no glue was offered either.
+- **No IDN/punycode.** Labels are octets, end to end (RFC 2181 §11). A caller
+  wanting RFC 5890-style A-labels must encode before calling.
+
+Closed since this document was first written, and now covered by tests:
+the cache (step 1), CNAME/DNAME chasing (step 4c), and IPv6 glue with a real
+v6 transport.

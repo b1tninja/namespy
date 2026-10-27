@@ -101,16 +101,16 @@ def test_registry_numbers_that_are_easy_to_get_wrong() -> None:
     IANA table printed ``BADCOOKIE=23``, which collides with ``BADALG``; the
     registry places it at 25.
     """
-    assert DnsResponseCode.badvers == 16
-    assert DnsResponseCode.badsig == 17
-    assert DnsResponseCode.badalg == 23
-    assert DnsResponseCode.badcookie == 25
+    assert DnsResponseCode.BADVERS == 16
+    assert DnsResponseCode.BADSIG == 17
+    assert DnsResponseCode.BADALG == 23
+    assert DnsResponseCode.BADCOOKIE == 25
 
 
 def test_extended_rcodes_are_representable() -> None:
     """Values above 15 exist only through EDNS(0) (RFC 6891 section 6.1.3)."""
-    assert DnsResponseCode(16) is DnsResponseCode.badvers
-    assert int(DnsResponseCode.no_error) == 0
+    assert DnsResponseCode(16) is DnsResponseCode.BADVERS
+    assert int(DnsResponseCode.NO_ERROR) == 0
     assert max(int(member) for member in DnsResponseCode if member.value <= 15) == 10
 
 
@@ -148,6 +148,31 @@ def test_class_spaces_share_the_same_numbers() -> None:
 
 
 def test_rcode_str_is_the_mnemonic() -> None:
-    """Formatting a response for a human should not print ``16`` or ``16``."""
-    assert str(DnsResponseCode.name_error) == "name_error"
-    assert f"{DnsResponseCode.refused}" == "refused"
+    """Formatting a response for a human should print a word, not ``16``.
+
+    The mnemonics are uppercase because the member name *is* the mnemonic --
+    ``mnemonic()`` returns ``.name``. Lowercase members would render a response
+    as ``refused`` where every other tool prints ``REFUSED``, and the enum
+    convention that forces the uppercase form is PEP 8's, not a preference.
+    """
+    assert str(DnsResponseCode.NAME_ERROR) == "NAME_ERROR"
+    assert f"{DnsResponseCode.REFUSED}" == "REFUSED"
+    assert DnsResponseCode.mnemonic(DnsResponseCode.NAME_ERROR) == "NAME_ERROR"
+
+
+def test_mnemonic_labels_an_unknown_code() -> None:
+    """An unregistered RCODE has no member, so it must still render usefully.
+
+    RFC 6891 section 6.1.3 widens RCODE to 12 bits and the registry keeps
+    growing, so a decoder cannot assume it has seen every value. ``parse``
+    degrades to a plain ``int``, which is why ``mnemonic`` is a classmethod on
+    the constant space rather than a method on a member: there is no member to
+    call it on. RFC 3597 section 5's ``TYPE<n>`` convention is the model -- the
+    rendering says which space a bare number came from, because type 1 and class
+    1 are both ``1`` and mean ``A`` and ``IN``.
+    """
+    unknown = DnsResponseCode.parse(11)
+    assert isinstance(unknown, int)
+    assert DnsResponseCode.mnemonic(unknown) == "RCODE11"
+    assert DnsRType.mnemonic(1) == "A"
+    assert DnsRClass.mnemonic(1) == "IN"

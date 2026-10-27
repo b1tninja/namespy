@@ -85,7 +85,7 @@ async def drain(server, timeout=1.0):
 def answered_response(packet):
     return Response(
         ID=packet.ID,
-        QR=DnsQR.response,
+        QR=DnsQR.RESPONSE,
         RA=True,
         questions=list(packet.questions),
         answers=[
@@ -129,8 +129,8 @@ def test_truncated_datagram_replies_formerr_and_does_not_raise():
 
     assert transport.sent, "a malformed datagram must still get an answer"
     reply = transport.replies[0]
-    assert reply.RCODE == DnsResponseCode.format_error
-    assert reply.QR == DnsQR.response
+    assert reply.RCODE == DnsResponseCode.FORMAT_ERROR
+    assert reply.QR == DnsQR.RESPONSE
     assert reply.QDCOUNT == 0, "nothing parsed, so there is nothing to echo"
     assert not server._tasks, "a datagram that never parsed must spawn no work"
 
@@ -140,7 +140,7 @@ def test_datagram_claiming_more_questions_than_it_has_is_refused():
     server, _resolver, transport = make_server()
     server.datagram_received(header, ADDR)
 
-    assert transport.replies[0].RCODE == DnsResponseCode.format_error
+    assert transport.replies[0].RCODE == DnsResponseCode.FORMAT_ERROR
     assert not server._tasks
 
 
@@ -159,7 +159,7 @@ def test_random_bytes_never_escape_as_an_exception():
 async def test_incoming_response_is_ignored():
     server, _resolver, transport = make_server()
     packet = query_packet()
-    packet.QR = DnsQR.response
+    packet.QR = DnsQR.RESPONSE
 
     await server.respond_to_packet(packet, ADDR)
     assert transport.sent == []
@@ -178,7 +178,7 @@ async def test_multiple_questions_are_refused_rather_than_partly_answered():
 
     await server.respond_to_packet(packet, ADDR)
     reply = transport.replies[0]
-    assert reply.RCODE == DnsResponseCode.format_error
+    assert reply.RCODE == DnsResponseCode.FORMAT_ERROR
     assert reply.ID == 0x42
     assert reply.QDCOUNT == 2, "the question section must be echoed for matching"
 
@@ -187,10 +187,10 @@ async def test_unsupported_opcode_is_not_implemented_not_dropped():
     """RFC 2929 section 3.1: an unimplemented opcode gets NOTIMP, not silence."""
     server, _resolver, transport = make_server()
     packet = query_packet()
-    packet.OPCODE = DnsOpCode.status
+    packet.OPCODE = DnsOpCode.STATUS
 
     await server.respond_to_packet(packet, ADDR)
-    assert transport.replies[0].RCODE == DnsResponseCode.not_implemented
+    assert transport.replies[0].RCODE == DnsResponseCode.NOT_IMPLEMENTED
 
 
 async def test_resolution_failure_becomes_servfail():
@@ -203,7 +203,7 @@ async def test_resolution_failure_becomes_servfail():
     server.datagram_received(bytes(query_packet()), ADDR)
     await drain(server)
 
-    assert transport.replies[0].RCODE == DnsResponseCode.server_failure
+    assert transport.replies[0].RCODE == DnsResponseCode.SERVER_FAILURE
 
 
 async def test_late_result_after_transport_change_stays_silent():
@@ -236,7 +236,7 @@ async def test_answer_is_forwarded_with_the_query_id_and_question():
     data, addr = transport.sent[0]
     assert addr == ADDR
     reply = DnsPacket.parse(data)[0]
-    assert reply.QR == DnsQR.response
+    assert reply.QR == DnsQR.RESPONSE
     assert reply.RA is True
     # RFC 5452 section 5: ID alone is 16 bits of matching; the echoed question is
     # what lets a client reject a forged reply that happened to guess the ID.
@@ -254,7 +254,7 @@ async def test_recursive_walk_result_is_relayed_end_to_end():
     async def authoritative(entry, questions):
         return Response(
             ID=0,
-            QR=DnsQR.response,
+            QR=DnsQR.RESPONSE,
             AA=True,
             questions=list(questions),
             answers=[

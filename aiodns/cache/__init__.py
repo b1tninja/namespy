@@ -78,8 +78,8 @@ class PositiveEntry(CacheEntry):
 class NegativeEntry(CacheEntry):
     """Cached negative response (RFC 2308).
 
-    ``rcode`` distinguishes NXDOMAIN (``DnsResponseCode.name_error``) from
-    NODATA (``DnsResponseCode.no_error`` with empty answer). ``soa`` is the
+    ``rcode`` distinguishes NXDOMAIN (``DnsResponseCode.NAME_ERROR``) from
+    NODATA (``DnsResponseCode.NO_ERROR`` with empty answer). ``soa`` is the
     record from the authority section that established the TTL ceiling
     (may be ``None`` if the upstream did not return one — the caller is
     expected to refuse to cache in that case).
