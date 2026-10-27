@@ -1,403 +1,584 @@
+"""DNS message framing: header, question section, and the three RR sections.
+
+Parsing here is a trust boundary. Everything that arrives is an untrusted
+datagram, so the rules set out in :mod:`aiodns.wire` apply throughout:
+
+* **No :keyword:`assert` on anything that came off the wire.** An ``assert``
+  compiled out by ``python -O`` or ``PYTHONOPTIMIZE`` is not a check, and the
+  previous revision of this module used one for every bounds test.
+* **Every failure is** :class:`~aiodns.wire.DnsPacketParseError`, carrying the
+  datagram and the offset at which parsing gave up.
+* **Structure is validated before it is trusted** -- section counts must be
+  satisfiable, and RDLENGTH must fit inside the message (RFC 9267 section 5).
+
+The exception type lives in :mod:`aiodns.wire` and is re-exported here for
+existing import sites. Having it defined in two places once meant a failure
+raised as one class and caught as the other, so malformed datagrams escaped the
+``except DnsPacketParseError`` handlers in :mod:`aiodns.server` and
+:mod:`aiodns.resolver` entirely.
+
+.. rubric:: References
+
+* RFC 1035 section 4.1 (message format), 4.1.1 (header), 4.1.4 (compression)
+* RFC 2181 section 8 (TTLs are relative, and must be clamped when served)
+* RFC 5625 section 6.3 (drop messages that are malformed)
+* RFC 9267 sections 2, 4, 5 (pointer loops, name buffer, RDLENGTH)
+"""
+
+from __future__ import annotations
+
 import logging
 import random
 import struct
 
-from .enums import DnsOpCode, DnsQClass, DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from .enums import (
+    DnsOpCode,
+    DnsQClass,
+    DnsQR,
+    DnsQType,
+    DnsRClass,
+    DnsResponseCode,
+    DnsRType,
+)
 from .names import DomainName
-from .rdata import RData
+from .rdata import RData, rdata_class_for, type_name_of
+from .wire import HEADER_OCTETS, DnsPacketParseError, read_octets
+
+__all__ = [
+    "DnsPacket",
+    "DnsPacketParseError",
+    "DnsQuestion",
+    "DnsRecord",
+    "Query",
+    "Response",
+    "clamp_ttl",
+]
+
+LOGGER = logging.getLogger(__name__)
+
+_HEADER_FMT = "!HBBHHHH"
+_RECORD_FMT = "!HHIH"
+
+#: RFC 2181 section 8: a served TTL must not exceed 2147483647 seconds (~68y).
+MAX_SERVABLE_TTL = 0x7FFFFFFF
 
 
-class DnsPacketParseError(ValueError):
-    """Raised when a DNS wire message cannot be parsed (malformed, truncated, etc.)."""
+def clamp_ttl(ttl: int) -> int:
+    """Clamp a wire TTL to what a resolver may actually serve (RFC 2181 section 8).
 
-    def __init__(
-            self,
-            message: str,
-            *,
-            data: bytes,
-            offset: int | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.data = data
-        self.offset = offset
-
-    def wire_hex(self) -> str:
-        """Contiguous hex for the full datagram (same as :meth:`bytes.hex`)."""
-        return self.data.hex()
+    The wire field is 32 bits unsigned, so a buggy or hostile server can offer
+    ``0xFFFFFFFF``; caching that literally yields an RRset that never expires.
+    RFC 2181 section 8 says a server "MUST NOT serve a TTL value that is larger
+    than 2147483647", and that anything larger must be treated as exactly that.
+    """
+    value = int(ttl)
+    if value < 0:
+        return 0
+    return min(value, MAX_SERVABLE_TTL)
 
 
-class DnsQuestion(object):
-    _STRUCT_FMT = "!HH"
-    _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
+class DnsQuestion:
+    """One entry of the question section (RFC 1035 section 4.1.2).
 
-    def __hash__(self):
-        return hash((self.name, self.qtype, self.qclass))
+    QTYPE and QCLASS are left as plain ``int`` when the registry has no member
+    for them -- RFC 3597 section 3 requires unknown values to pass through
+    rather than abort the parse.
+    """
+
+    _FMT = "!HH"
+    _SIZE = struct.calcsize(_FMT)
+
+    __slots__ = ("name", "qtype", "qclass")
 
     def __init__(self, qname, qtype=DnsQType.ANY, qclass=DnsRClass.IN):
-        self.name = qname
+        self.name = qname if isinstance(qname, DomainName) else DomainName(qname)
         self.qtype = qtype
         self.qclass = qclass
 
-    @staticmethod
-    def parse(data, offset):
-        (label, offset) = DomainName.parse_from(data, offset)
-        if len(data) < offset + DnsQuestion._STRUCT_SIZE:
+    @classmethod
+    def parse(cls, data: bytes, offset: int) -> tuple[DnsQuestion, int]:
+        name, offset = DomainName.parse_from(data, offset)
+        if offset + cls._SIZE > len(data):
             raise DnsPacketParseError(
-                f"truncated question: need {DnsQuestion._STRUCT_SIZE} byte(s) for QTYPE/QCLASS at offset {offset}, "
-                f"have {len(data) - offset} byte(s) in datagram (len={len(data)})",
+                f"truncated question at offset {offset}: missing QTYPE/QCLASS, "
+                f"need {cls._SIZE} octet(s), {len(data) - offset} remain",
                 data=data,
                 offset=offset,
             )
-        (
-            qtype,
-            qclass,
-        ) = struct.unpack_from(DnsQuestion._STRUCT_FMT, data, offset)
-        offset += DnsQuestion._STRUCT_SIZE
+        qtype, qclass = struct.unpack_from(cls._FMT, data, offset)
+        offset += cls._SIZE
+        return cls(name, DnsQType.parse(qtype), DnsQClass.parse(qclass)), offset
 
-        try:
-            qtype = DnsQType(qtype)
-        except ValueError:
-            pass
-        try:
-            qclass = DnsQClass(qclass)
-        except ValueError:
-            pass
+    def __repr__(self) -> str:
+        return f"<DnsQuestion:{self.name},{type_name_of(self.qtype)},{self.qclass}>"
 
+    def __bytes__(self) -> bytes:
+        return bytes(self.name) + struct.pack(self._FMT, int(self.qtype), int(self.qclass))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DnsQuestion):
+            return NotImplemented
         return (
-            DnsQuestion(label, qtype, qclass),
-            offset,
+            self.name == other.name
+            and int(self.qtype) == int(other.qtype)
+            and int(self.qclass) == int(other.qclass)
         )
 
-    def __repr__(self):
-        return "<DnsQuestion:%s,%s,%s>" % (self.name, self.qtype, self.qclass)
-
-    def __bytes__(self):
-        return bytes(self.name) + struct.pack("!HH", self.qtype, self.qclass)
+    def __hash__(self) -> int:
+        return hash((self.name, int(self.qtype), int(self.qclass)))
 
 
-class DnsRecord(object):
-    _RDATA_CLASSES = dict([(cls.RType.value, cls) for cls in RData.__subclasses__()])
+#: Octets in the fixed part of an RR, after the name: TYPE/CLASS/TTL/RDLENGTH.
+RECORD_HEADER_OCTETS = struct.calcsize(_RECORD_FMT)
+
+
+class DnsRecord:
+    """One resource record (RFC 1035 section 4.1.3).
+
+    ``rtype`` and ``rclass`` stay plain :class:`int` when the registry has no
+    member for them, which is what lets an unknown type travel through the
+    resolver intact instead of exploding on an enum attribute -- the failure
+    mode that made a single ``HTTPS`` record (RFC 9460) fatal, because the code
+    reached for ``rtype.value`` on what was already an int.
+
+    :param rdata: an :class:`~aiodns.rdata.RData`, or raw ``bytes`` to be held
+        opaquely. Tests and the root-hints loader build records with
+        ``rdata=b""`` or a bare :class:`~aiodns.names.DomainName`, so the
+        constructor accepts those as given; :meth:`parse` is the strict path.
+    """
+
+    __slots__ = ("name", "rtype", "rclass", "ttl", "rdlength", "rdata")
 
     def __init__(
-            self, name, rtype=DnsRType.A, rclass=DnsRClass.IN, ttl=0, rdlength=None, rdata=b""
+        self, name, rtype=DnsRType.A, rclass=DnsRClass.IN, ttl=0, rdlength=None, rdata=b""
     ):
+        self.name = name if isinstance(name, DomainName) else DomainName(name)
+        self.rtype = DnsRType.parse(rtype)
+        self.rclass = DnsRClass.parse(rclass)
+        self.ttl = int(ttl) & 0xFFFFFFFF
         if isinstance(rdata, str):
-            rdata = bytes(rdata, "ascii")
-
-        self.name = name
-
-        try:
-            self.rtype = DnsRType(rtype)
-        except ValueError:
-            logging.warning("Record type: %d is not implemented", rtype)
-
-        try:
-            self.rclass = DnsRClass(rclass)
-        except ValueError:
-            self.rclass = int(rclass)
-
-        self.ttl = int(ttl)
-        if rdlength is None:
-            rdlength = len(bytes(rdata))
-        self.rdlength = rdlength
-        self.rdata : RData = rdata
+            rdata = rdata.encode("ascii", "surrogateescape")
+        self.rdata = rdata
+        self.rdlength = len(bytes(rdata)) if rdlength is None else int(rdlength)
 
     @classmethod
-    def parse(cls, data, offset):
-        (name, offset) = DomainName.parse_from(data, offset)
-        (rtype, rclass, ttl, rdlength) = struct.unpack_from("!HHIH", data, offset)
+    def parse(cls, data: bytes, offset: int) -> tuple[DnsRecord, int]:
+        """Decode one RR, refusing what the wire format cannot express.
 
-        try:
-            rtype = DnsRType(rtype)
-        except ValueError:
-            pass
+        Two structural checks matter most. RDLENGTH must leave room *inside*
+        this message: the previous implementation sliced ``data[offset:][:rdlength]``,
+        which yields a short slice instead of failing, so a record claiming more
+        RDATA than remained was accepted and only an ``assert`` -- invisible
+        under ``python -O`` -- stood between that and the next record. And an
+        RR whose type has no codec must still parse, as opaque RDATA, per
+        RFC 3597 section 3.
 
-        try:
-            rclass = DnsRClass(rclass)
-        except ValueError:
-            pass
+        Returns the record and the offset at which the next RR begins, which is
+        the end of this one's RDATA even when a compression pointer made the
+        name occupy fewer octets than it expands to.
+        """
+        name, cursor = DomainName.parse_from(data, offset)
+        header = read_octets(data, cursor, RECORD_HEADER_OCTETS, what="RR header")
+        rtype_raw, rclass_raw, ttl, rdlength = struct.unpack_from(_RECORD_FMT, header, 0)
+        cursor += RECORD_HEADER_OCTETS
 
-        offset += struct.calcsize("!HHIH")
+        end = cursor + rdlength
+        if end > len(data):
+            raise DnsPacketParseError(
+                f"RDLENGTH {rdlength} at offset {cursor} overruns the message: "
+                f"{len(data) - cursor} of {len(data)} octet(s) remain",
+                data=data,
+                offset=cursor,
+            )
 
-        rdata = data[offset:][:rdlength]
-        assert len(rdata) == rdlength
+        codec = rdata_class_for(rtype_raw)
+        if codec is None:
+            # RFC 3597 section 3: an unknown type is opaque data, not an error.
+            # It still gets an RData wrapper so presentation and re-encoding
+            # behave the same as for any known type.
+            LOGGER.debug("no RDATA codec for %s; keeping it opaque", type_name_of(rtype_raw))
+            rdata: RData = RData(data[cursor:end])
+        else:
+            rdata = codec.parse_from(data, cursor, rdlength)
 
-        # Message compression is allowed for the DomainNames in these record types
-        # Store normalized data in rdata, and offer compressed_rdata as needed, to reconstruct original packet
-
-        if rtype not in cls._RDATA_CLASSES:
-            logging.warning("No handler for RType %s", rtype)
-
-        # uncompressed_rdata = RData.get_handler(rtype).parse(data, offset).encode()
-        # if uncompressed_rdata != compressed_rdata:
-        #     record = cls(name, rtype, rclass, ttl, uncompressed_rdata)
-        #     record.compressed_rdata = compressed_rdata  # TODO: don't add member variables to classes like this
-        rdata = cls._RDATA_CLASSES.get(rtype.value, RData).parse_from(
-            data,
-            offset,
+        record = cls(
+            name,
+            DnsRType.parse(rtype_raw),
+            DnsRClass.parse(rclass_raw),
+            ttl,
             rdlength,
+            rdata,
         )
+        return record, end
 
-        record = cls(name, rtype, rclass, ttl, rdlength, rdata)
-
-        offset += rdlength
-        return (
-            record,
-            offset,
-        )
-
-    def __repr__(self):
-        return "<Record:%s,%s,%s,%d,%d,%s>" % (
+    def __repr__(self) -> str:
+        return "<Record:{},{},{},{},{}>".format(
             self.name,
-            self.rtype,
+            type_name_of(self.rtype),
             self.rclass,
             self.ttl,
-            self.rdlength,
-            repr(self.rdata),
+            self.rdata,
         )
 
-    def __bytes__(self):
+    def __bytes__(self) -> bytes:
+        """Serialise with RDLENGTH derived from the payload, never stored blindly.
+
+        A record built by hand and one read off the wire must both serialise to
+        something a receiver can parse, so the length field is recomputed from
+        the encoded RDATA -- which :mod:`aiodns.rdata` guarantees is
+        pointer-free. Keeping a stale ``rdlength`` alongside edited RDATA would
+        emit a message whose sections no longer align.
+        """
+        payload = bytes(self.rdata)
         return (
-                bytes(self.name)
-                + struct.pack("!HHIH", self.rtype, self.rclass, self.ttl, self.rdlength)
-                + bytes(self.rdata)
+            bytes(self.name)
+            + struct.pack(_RECORD_FMT, int(self.rtype), int(self.rclass), self.ttl, len(payload))
+            + payload
         )
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DnsRecord):
+            return NotImplemented
+        return bytes(self) == bytes(other)
 
-class DnsPacket(object):
+    def __hash__(self) -> int:
+        return hash(bytes(self))
+
+
+#: RR type of the EDNS(0) pseudo-record (RFC 6891 section 6.1.2).
+OPT_RTYPE = 41
+
+
+class DnsPacket:
+    """A DNS message: header plus a question section and three RR sections.
+
+    Section counts are authoritative on output and validated on input. The
+    header's 4-bit RCODE holds 0-15; larger codes need EDNS(0) and are reachable
+    through :attr:`extended_rcode` (RFC 6891 section 6.1.3).
+
+    :param suffix: octets that followed the last RR when this message was
+        parsed. Kept so a re-serialised copy can be byte-identical to what
+        arrived; :meth:`parse` rejects trailing octets rather than setting it.
+    """
+
     def __init__(
-            self,
-            ID=None,
-            QR=DnsQR.query,
-            OPCODE=DnsOpCode.query,
-            AA=False,
-            TC=False,
-            RD=True,
-            RA=False,
-            Z=0,
-            RCODE=DnsResponseCode.no_error,
-            QDCOUNT=None,
-            ANCOUNT=None,
-            NSCOUNT=None,
-            ARCOUNT=None,
-            questions=None,
-            answers=None,
-            nameservers=None,
-            additional_records=None,
-            suffix=bytes(),
+        self,
+        ID=None,
+        QR=DnsQR.query,
+        OPCODE=DnsOpCode.query,
+        AA=False,
+        TC=False,
+        RD=True,
+        RA=False,
+        Z=0,
+        RCODE=DnsResponseCode.no_error,
+        QDCOUNT=None,
+        ANCOUNT=None,
+        NSCOUNT=None,
+        ARCOUNT=None,
+        questions=None,
+        answers=None,
+        nameservers=None,
+        additional_records=None,
+        suffix=bytes(),
     ):
         if ID is None:
+            # RFC 5452 section 5: the identifier is one of the few defences
+            # against off-path forgery, so it comes from a CSPRNG rather than a
+            # counter or another low-entropy source.
             ID = random.getrandbits(16)
-        if questions is None:
-            questions = []
-        if answers is None:
-            answers = []
-        if nameservers is None:
-            nameservers = []
-        if additional_records is None:
-            additional_records = []
-        if QDCOUNT is None:
-            QDCOUNT = len(questions)
-        if ANCOUNT is None:
-            ANCOUNT = len(answers)
-        if NSCOUNT is None:
-            NSCOUNT = len(nameservers)
-        if ARCOUNT is None:
-            ARCOUNT = len(additional_records)
-        if not isinstance(QR, DnsQR):
-            QR = DnsQR(QR)
-        if not isinstance(OPCODE, DnsOpCode):
-            OPCODE = DnsOpCode(OPCODE)
-        if not isinstance(RCODE, DnsResponseCode):
-            RCODE = DnsResponseCode(RCODE)
+        questions = [] if questions is None else questions
+        answers = [] if answers is None else answers
+        nameservers = [] if nameservers is None else nameservers
+        additional_records = [] if additional_records is None else additional_records
 
-        self.ID = int(ID)
-        self.QR = QR
-        self.OPCODE = OPCODE
+        for label, value in (
+            ("questions", questions),
+            ("answers", answers),
+            ("nameservers", nameservers),
+            ("additional_records", additional_records),
+        ):
+            if not isinstance(value, list):
+                raise TypeError(f"{label} must be a list, got {type(value).__name__}")
+
+        self.ID = int(ID) & 0xFFFF
+        self.QR = QR if isinstance(QR, DnsQR) else DnsQR(int(QR))
+        self.OPCODE = OPCODE if isinstance(OPCODE, DnsOpCode) else DnsOpCode.parse(int(OPCODE))
         self.AA = bool(AA)
         self.TC = bool(TC)
         self.RD = bool(RD)
         self.RA = bool(RA)
-        self.Z = int(Z)
-        self.RCODE = RCODE
-        self.QDCOUNT = int(QDCOUNT)
-        self.ANCOUNT = int(ANCOUNT)
-        self.NSCOUNT = int(NSCOUNT)
-        self.ARCOUNT = int(ARCOUNT)
+        self.Z = int(Z) & 0b111
+        self.RCODE = (
+            RCODE if isinstance(RCODE, DnsResponseCode) else DnsResponseCode.parse(int(RCODE))
+        )
+        self.QDCOUNT = len(questions) if QDCOUNT is None else int(QDCOUNT)
+        self.ANCOUNT = len(answers) if ANCOUNT is None else int(ANCOUNT)
+        self.NSCOUNT = len(nameservers) if NSCOUNT is None else int(NSCOUNT)
+        self.ARCOUNT = len(additional_records) if ARCOUNT is None else int(ARCOUNT)
 
-        assert isinstance(questions, list)
         self.questions = questions
-
-        assert isinstance(answers, list)
         self.answers = answers
-
-        assert isinstance(nameservers, list)
         self.nameservers = nameservers
-
-        assert isinstance(additional_records, list)
         self.additional_records = additional_records
+        if suffix is not None and not isinstance(suffix, bytes):
+            raise TypeError(f"suffix must be bytes, got {type(suffix).__name__}")
+        self.suffix = b"" if suffix is None else suffix
 
-        assert suffix is None or isinstance(suffix, bytes)
-        self.suffix = suffix
+    # ------------------------------------------------------------- accessors
 
-    def __repr__(self):
-        return (
-                "<DnsPacket:%s, questions:%s, answers:%s, nameservers:%s, additional_records: %s>"
-                % (
-                    hex(self.ID),
-                    self.questions,
-                    self.answers,
-                    self.nameservers,
-                    self.additional_records,
-                )
+    @property
+    def all_answers(self):
+        """Answer, authority and additional RRs, in section order."""
+        return [*self.answers, *self.nameservers, *self.additional_records]
+
+    def opt(self):
+        """The EDNS(0) OPT record, or ``None`` (RFC 6891 section 6.1.2).
+
+        OPT is a pseudo-record: it is never stored, its NAME is always the root,
+        and at most one may appear in a message.
+        """
+        for record in self.additional_records:
+            if int(record.rtype) == OPT_RTYPE:
+                return record
+        return None
+
+    @property
+    def extended_rcode(self) -> int:
+        """The effective RCODE, folding in EDNS(0)'s upper eight bits.
+
+        RFC 6891 section 6.1.3 lays OPT's TTL field out as EXTENDED-RCODE (8
+        bits) | FLAGS (16 bits) | reserved (8 bits), and defines the effective
+        value as ``(EXTENDED-RCODE << 4) | RCODE``. The shift is 4 and not 8
+        because the header field is four bits wide; treating it as an octet
+        yields a code sixteen times too large.
+        """
+        record = self.opt()
+        if record is None:
+            return int(self.RCODE)
+        extended = (int(record.ttl) >> 24) & 0xFF
+        return (extended << 4) | (int(self.RCODE) & 0xF)
+
+    @property
+    def ad(self) -> bool:
+        """Authentic Data -- EDNS(0) FLAGS bit 15 (RFC 6891 section 6.1.2)."""
+        record = self.opt()
+        return record is not None and bool(int(record.ttl) & (1 << 15))
+
+    @property
+    def cd(self) -> bool:
+        """Checking Disabled -- EDNS(0) FLAGS bit 14 (RFC 6891 section 6.1.2)."""
+        record = self.opt()
+        return record is not None and bool(int(record.ttl) & (1 << 14))
+
+    @property
+    def requestor_payload_size(self) -> int | None:
+        """OPT's CLASS field: the sender's UDP payload size in octets."""
+        record = self.opt()
+        return None if record is None else int(record.rclass)
+
+    # ---------------------------------------------------------------- output
+
+    def __repr__(self) -> str:
+        return "<DnsPacket:{:#06x} {} q={} a={} ns={} ar={}>".format(
+            self.ID,
+            "response" if self.QR == DnsQR.response else "query",
+            len(self.questions),
+            len(self.answers),
+            len(self.nameservers),
+            len(self.additional_records),
         )
 
     def __hex__(self) -> str:
-        """
-        Wire-form octets as a single lowercase hex string (no ``0x`` prefix).
-        The built-in :func:`hex` only works on :class:`int`; use this for logging/preview
-        of the on-the-wire form: ``"0x" + self.__hex__()`` or :meth:`bytes.hex` on
-        :func:`bytes` of this message.
+        """Wire-form octets as one lowercase hex string, without ``0x``.
+
+        :func:`hex` only applies to :class:`int`; this is its counterpart for
+        the serialized message, for logs and capture comparison.
         """
         return bytes(self).hex()
 
+    def _header_bytes(self) -> bytes:
+        rcode = int(self.RCODE)
+        if rcode > 0xF and self.opt() is None:
+            raise ValueError(
+                f"RCODE {rcode} does not fit the 4-bit header field; add an "
+                f"EDNS(0) OPT record so the upper bits have somewhere to go "
+                f"(RFC 6891 section 6.1.3)"
+            )
+        flags1 = (
+            (0x80 if self.QR == DnsQR.response else 0)
+            | (int(self.OPCODE) & 0xF) << 3
+            | (0x04 if self.AA else 0)
+            | (0x02 if self.TC else 0)
+            | (0x01 if self.RD else 0)
+        )
+        flags2 = (0x80 if self.RA else 0) | (self.Z & 0b111) << 4 | (rcode & 0xF)
+        return struct.pack(
+            _HEADER_FMT,
+            self.ID,
+            flags1,
+            flags2,
+            self.QDCOUNT & 0xFFFF,
+            self.ANCOUNT & 0xFFFF,
+            self.NSCOUNT & 0xFFFF,
+            self.ARCOUNT & 0xFFFF,
+        )
+
+    def __bytes__(self) -> bytes:
+        out = bytearray(self._header_bytes())
+        for question in self.questions:
+            out += bytes(question)
+        for section in (self.answers, self.nameservers, self.additional_records):
+            for record in section:
+                out += bytes(record)
+        out += self.suffix
+        return bytes(out)
+
+    # ----------------------------------------------------------------- input
+
     @classmethod
-    def parse(cls, data, offset=0):
+    def parse(cls, data, offset: int = 0, *, strict: bool = True) -> tuple[DnsPacket, int]:
+        """Decode a message; returns ``(packet, octets_consumed)``.
+
+        :param strict: when true (the default) each section must hold exactly
+            the count the header promises and the message must end there. Set it
+            false to accept a response cut short by the ``TC`` bit or by a
+            datagram lost in transit -- the only way to recover the header and
+            question of an answer too large for one packet, which is the first
+            step of the TCP retry RFC 7766 section 6 calls for.
+
+        Raises :class:`~aiodns.wire.DnsPacketParseError` for anything a receiver
+        should drop rather than interpret (RFC 5625 section 6.3).
+        """
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("DnsPacket.parse expects a bytes-like object")
         buf = bytes(data)
-        o = offset
-        if o < 0 or o > len(buf):
-            raise DnsPacketParseError("offset out of range", data=buf, offset=o)
-        if len(buf) < o + 12:
+        if offset < 0 or offset > len(buf):
+            raise DnsPacketParseError("offset out of range", data=buf, offset=offset)
+        if len(buf) - offset < HEADER_OCTETS:
             raise DnsPacketParseError(
-                f"truncated DNS message: need at least 12 byte header, got {len(buf) - o} byte(s) from offset {o}",
+                f"truncated DNS message: need at least {HEADER_OCTETS} octet(s) "
+                f"of header, got {len(buf) - offset} from offset {offset}",
                 data=buf,
-                offset=o,
+                offset=offset,
             )
-        return cls._parse_impl(buf, o)
+        return cls._parse_impl(buf, offset, strict=strict)
 
     @classmethod
-    def _parse_impl(cls, data, offset):
-        try:
-            # Transaction ID 16
-            (ID,) = struct.unpack_from("!H", data, offset)
-            # Query/Response 1
-            QR = DnsQR((data[offset + 2] & 0b10000000) >> 7)
-            # OpCode 4
-            OPCODE = DnsOpCode((data[offset + 2] & 0b01111000) >> 3)
-            # Authoratative Answer 1
-            AA = data[offset + 2] & 0b100 != 0
-            # Truncation 1
-            TC = data[offset + 2] & 0b10 != 0
-            # Recursion Desired 1
-            RD = data[offset + 2] & 0b1 != 0
-            # Recursion Available 1
-            RA = data[offset + 3] & 0b10000000 != 0
-            # Reserved for future, zero value
-            Z = (data[offset + 3] & 0b01110000) >> 4
-            RCODE = DnsResponseCode(data[offset + 3] & 0b1111)
-            (
-                QDCOUNT,
-                ANCOUNT,
-                NSCOUNT,
-                ARCOUNT,
-            ) = struct.unpack_from("!HHHH", data, offset + 4)
+    def _parse_impl(cls, data: bytes, offset: int, *, strict: bool):
+        ID, flags1, flags2, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT = struct.unpack_from(
+            _HEADER_FMT, data, offset
+        )
+        offset += HEADER_OCTETS
 
-            offset += struct.calcsize("!HHHHHH")
+        QR = DnsQR((flags1 & 0x80) >> 7)
+        OPCODE = DnsOpCode.parse((flags1 & 0x78) >> 3)
+        AA, TC, RD = bool(flags1 & 0x04), bool(flags1 & 0x02), bool(flags1 & 0x01)
+        RA, Z = bool(flags2 & 0x80), (flags2 & 0x70) >> 4
+        RCODE = DnsResponseCode.parse(flags2 & 0x0F)
 
-            questions = []
-            while len(questions) < QDCOUNT:
-                (question, offset) = DnsQuestion.parse(data, offset)
-                questions.append(question)
-
-            answers = []
-            nameservers = []
-            additional_records = []
-            while offset < len(data):
-                (rr, offset) = DnsRecord.parse(data, offset)
-                if len(answers) < ANCOUNT:
-                    answers.append(rr)
-                elif len(nameservers) < NSCOUNT:
-                    nameservers.append(rr)
-                elif len(additional_records) < ARCOUNT:
-                    additional_records.append(rr)
-                else:
-                    raise DnsPacketParseError(
-                        "too many RRs for AN/NS/AR section counts", data=data, offset=offset
-                    )
-            else:
-                assert len(questions) == QDCOUNT
-                assert len(answers) == ANCOUNT
-                assert len(nameservers) == NSCOUNT
-                assert len(additional_records) == ARCOUNT
-                pkt_cls = Query if QR == DnsQR.query else Response
-                return (
-                    pkt_cls(
-                        ID,
-                        QR,
-                        OPCODE,
-                        AA,
-                        TC,
-                        RD,
-                        RA,
-                        Z,
-                        RCODE,
-                        QDCOUNT,
-                        ANCOUNT,
-                        NSCOUNT,
-                        ARCOUNT,
-                        questions,
-                        answers,
-                        nameservers,
-                        additional_records,
-                        suffix=data[offset:],
-                    ),
-                    offset,
-                )
-        except DnsPacketParseError:
-            raise
-        except (AssertionError, struct.error, IndexError) as e:
+        # Sections fill in order; on a TC=1 message the last one may legitimately
+        # be cut off mid-record, so what did parse is kept rather than thrown
+        # away (RFC 1035 section 4.1.1 makes truncation a normal condition, not
+        # corruption). QDCOUNT is checked up front so an absurd value is rejected
+        # before it can drive a loop: RFC 1035 section 4.1.1 permits zero or one
+        # question in current use.
+        if QDCOUNT > 1:
             raise DnsPacketParseError(
-                f"{type(e).__name__}: {e!s}", data=data, offset=offset
-            ) from e
+                f"QDCOUNT={QDCOUNT}: RFC 1035 section 4.1.1 permits zero or one "
+                f"question in current use",
+                data=data,
+                offset=offset,
+            )
 
-    def __bytes__(self):
-        data = struct.pack(
-            "!HBBHHHH",
-            self.ID,
-            (
-                    (0b10000000 if self.QR == DnsQR.response else 0)
-                    | (self.OPCODE << 3)
-                    | (0b100 if self.AA else 0)
-                    | (0b010 if self.TC else 0)
-                    | (0b001 if self.RD else 0)
+        # A TC=1 message is a legitimately partial answer, not a corrupt one
+        # (RFC 1035 section 4.1.1), so in lenient mode the last section may stop
+        # mid-record and what did parse is kept -- the header and question are
+        # enough to drive the TCP retry RFC 7766 section 6 calls for.
+        tolerated = (not strict) and TC
+
+        # Sections are read one after another, each to its own count. Once one
+        # fails, the rest cannot be located, so they stay empty and the octets
+        # land in `suffix`.
+        sections: list[list] = []
+        failure: DnsPacketParseError | None = None
+        for parser, count in (
+            (DnsQuestion, QDCOUNT),
+            (DnsRecord, ANCOUNT),
+            (DnsRecord, NSCOUNT),
+            (DnsRecord, ARCOUNT),
+        ):
+            if failure is not None:
+                sections.append([])
+                continue
+            items, offset, failure = cls._parse_section(parser, data, offset, count)
+            if failure is not None and not tolerated:
+                raise failure
+            sections.append(items)
+
+        questions, answers, nameservers, additional = sections
+
+        if strict and offset != len(data):
+            raise DnsPacketParseError(
+                f"{len(data) - offset} unexpected octet(s) after the last RR "
+                f"(RFC 1035 section 4.1)",
+                data=data,
+                offset=offset,
+            )
+
+        packet_cls = Query if QR == DnsQR.query else Response
+        return (
+            packet_cls(
+                ID,
+                QR,
+                OPCODE,
+                AA,
+                TC,
+                RD,
+                RA,
+                Z,
+                RCODE,
+                len(questions),
+                len(answers),
+                len(nameservers),
+                len(additional),
+                questions,
+                answers,
+                nameservers,
+                additional,
+                suffix=data[offset:],
             ),
-            ((0b10000000 if self.RA else 0) | self.Z << 4 | self.RCODE),
-            self.QDCOUNT,
-            self.ANCOUNT,
-            self.NSCOUNT,
-            self.ARCOUNT,
+            offset,
         )
 
-        for record in self.questions:
-            data += bytes(record)
+    @staticmethod
+    def _parse_section(parser, data: bytes, offset: int, count: int):
+        """Read up to *count* entries; returns ``(items, offset, failure)``.
 
-        for record in self.answers:
-            data += bytes(record)
+        *failure* is the :class:`~aiodns.wire.DnsPacketParseError` that stopped
+        the section, or ``None``. Returning it instead of raising lets the caller
+        distinguish "this message is corrupt, drop it" from "this answer is
+        truncated, keep the part that parsed" without a try/except that would
+        also swallow a failure it had already decided to accept.
 
-        for record in self.nameservers:
-            data += bytes(record)
-
-        for record in self.additional_records:
-            data += bytes(record)
-
-        return data
+        Filling sections from "whatever is left", as the original loop did, meant
+        a message whose header promised fewer RRs than it carried was accepted
+        silently, and one whose sections ran short left octets nobody owned. Each
+        section is read to its own count.
+        """
+        items: list = []
+        try:
+            for _ in range(count):
+                item, offset = parser.parse(data, offset)
+                items.append(item)
+        except DnsPacketParseError as exc:
+            return items, offset, exc
+        return items, offset, None
 
 
 class Query(DnsPacket):
-    pass
+    """A query message -- ``QR`` clear (RFC 1035 section 4.1.1)."""
 
 
 class Response(DnsPacket):
-    pass
+    """A response message -- ``QR`` set (RFC 1035 section 4.1.1)."""

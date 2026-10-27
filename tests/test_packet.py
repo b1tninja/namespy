@@ -59,9 +59,7 @@ def test_in_addr_arpa_ptr_query_with_digit_leading_labels() -> None:
     Previously failed: bare AssertionError (letter-only first char).
     """
     w40 = bytes.fromhex(
-        "000101000001000000000000"
-        "0131013001300331323707696e2d616464720461727061"
-        "00000c0001"
+        "0001010000010000000000000131013001300331323707696e2d61646472046172706100000c0001"
     )
     assert len(w40) == 40
     pkt, off = DnsPacket.parse(w40)
@@ -73,9 +71,7 @@ def test_in_addr_arpa_ptr_query_with_digit_leading_labels() -> None:
 def test_parse_truncated_after_qname() -> None:
     """QTYPE/QCLASS need 4 bytes; clear DnsPacketParseError when tail is short."""
     full = bytes.fromhex(
-        "000101000001000000000000"
-        "0131013001300331323707696e2d616464720461727061"
-        "00000c0001"
+        "0001010000010000000000000131013001300331323707696e2d61646472046172706100000c0001"
     )
     bad = full[:-1]  # drop last byte of QTYPE/QCLASS
     with pytest.raises(DnsPacketParseError) as e:
