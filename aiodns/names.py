@@ -283,6 +283,40 @@ class DomainName:
             out.append(self.__class__(".".join(escape_label(label) for label in tail) + "."))
         return out
 
+    @classmethod
+    def from_labels(cls, labels) -> "DomainName":
+        """Build an absolute name from raw label octets.
+
+        Composition is needed wherever a name is *derived* rather than written
+        down: DNAME target synthesis (RFC 6672 section 2.3) prepends the part of
+        QNAME below the owner to the DNAME's target, and a resolver's search-list
+        walk rebuilds names constantly. Each label passes through
+        :func:`escape_label`, so a label containing a dot or a backslash cannot
+        fabricate extra labels on the way back in.
+        """
+        return cls(".".join(escape_label(label) for label in labels) + ".")
+
+    def is_subdomain_of(self, other, *, include_self: bool = True) -> bool:
+        """Whether this name lies within *other*, compared label-wise from the root.
+
+        RFC 1034 section 3.1: "if Y is a domain and X is a label, then X.Y is a
+        subdomain of Y", and every domain is a subdomain of itself. That reflexive
+        reading is what zone-cut and bailiwick tests want (RFC 5625 section 2.5);
+        a DNAME needs the strict form, because it redirects only names *below* its
+        owner and never the owner itself (RFC 6672 section 2.1).
+
+        Case-insensitive and terminator-insensitive like all other name
+        comparison here, and a name is always within the root.
+        """
+        mine = self._labels()
+        theirs = (
+            other._labels() if isinstance(other, DomainName) else self.__class__(other)._labels()
+        )
+        needed = len(theirs) + (0 if include_self else 1)
+        if len(mine) < needed:
+            return False
+        return mine[len(mine) - len(theirs) :] == theirs
+
     def qualify(self, dns_suffix=None) -> "DomainName":
         """Return an absolute :class:`DomainName`, applying a DNS suffix if needed.
 
