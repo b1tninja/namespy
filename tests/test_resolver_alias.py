@@ -154,7 +154,7 @@ def test_complete_cname_chain_returns_the_alias_with_the_answer():
     # The Cname event is emitted for every redirection taken, even one that
     # completes inside this same response -- the trace has to show the hop.
     assert _kinds(events) == ["Cname", "Answer", "Done"]
-    assert events[1].records == [cname, address]
+    assert list(events[1].records) == [cname, address]
 
 
 def test_direct_data_at_the_name_wins_over_a_redirection():
@@ -169,7 +169,7 @@ def test_direct_data_at_the_name_wins_over_a_redirection():
     events = list(classify(response, sname, slist, slist.best()))
 
     assert _kinds(events) == ["Answer", "Done"]
-    assert events[0].records == [address]
+    assert list(events[0].records) == [address]
 
 
 def test_multi_hop_chain_inside_one_response():
@@ -190,7 +190,7 @@ def test_multi_hop_chain_inside_one_response():
     events = list(classify(response, sname, slist, slist.best()))
 
     assert _kinds(events) == ["Cname", "Cname", "Answer", "Done"]
-    assert events[2].records == answers
+    assert list(events[2].records) == answers
 
 
 def test_alias_loop_inside_one_response_fails():

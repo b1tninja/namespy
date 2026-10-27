@@ -29,13 +29,19 @@ class Trace:
         return c
 
     def __repr__(self):
-        return "<Trace sname=%r events=%d children=%d>" % (
-            self.sname,
-            len(self.events),
-            len(self.children),
+        return (
+            f"<Trace sname={self.sname!r} events={len(self.events)} children={len(self.children)}>"
         )
 
     def to_mermaid(self):
+        """Render this trace, and any sub-traces, as Mermaid sequence diagrams.
+
+        Output is a ``sequenceDiagram`` per trace: the client is always
+        participant ``C``, and each zone visited gets ``Z0``, ``Z1``, ... in the
+        order first queried, which mirrors the descent a reader is trying to
+        follow. Sub-traces (glueless address lookups) are appended as separate
+        diagrams rather than nested, because Mermaid has no composition for that.
+        """
         header = ["sequenceDiagram", "    participant C as client"]
         participants = {}
         body = []
@@ -46,9 +52,9 @@ class Trace:
             if not key:
                 key = "."
             if key not in participants:
-                pid = "Z%d" % len(participants)
+                pid = f"Z{len(participants)}"
                 participants[key] = pid
-                header.append("    participant %s as %s" % (pid, key))
+                header.append(f"    participant {pid} as {key}")
             return participants[key]
 
         title = ""
@@ -56,7 +62,7 @@ class Trace:
             qname = getattr(self.sname, "qname", self.sname)
             qtype = getattr(self.sname, "qtype", None)
             qtype_name = getattr(qtype, "name", str(qtype)) if qtype is not None else ""
-            title = "    Note over C: resolve %s %s" % (qname, qtype_name)
+            title = f"    Note over C: resolve {qname} {qtype_name}"
 
         for ev in self.events:
             cn = ev.__class__.__name__
@@ -65,35 +71,31 @@ class Trace:
                 qname = ev.questions[0].name if ev.questions else "?"
                 qtype = ev.questions[0].qtype if ev.questions else None
                 qtype_name = getattr(qtype, "name", str(qtype))
-                body.append("    C->>%s: %s %s" % (pid, qname, qtype_name))
+                body.append(f"    C->>{pid}: {qname} {qtype_name}")
                 last_zone_id[0] = pid
             elif cn == "Referral":
                 body.append(
-                    "    %s-->>C: referral %s (match %d->%d)"
-                    % (
-                        last_zone_id[0],
-                        ev.new_zone,
-                        ev.match_before,
-                        ev.match_after,
-                    )
+                    f"    {last_zone_id[0]}-->>C: referral {ev.new_zone}"
+                    f" (match {ev.match_before}->{ev.match_after})"
                 )
             elif cn == "Answer":
-                body.append("    %s-->>C: AA, %d records" % (last_zone_id[0], len(ev.records)))
+                body.append(f"    {last_zone_id[0]}-->>C: AA, {len(ev.records)} records")
             elif cn == "Nodata":
-                body.append("    Note over C: NODATA SOA=%s" % (ev.soa.name if ev.soa else "?"))
+                body.append(f"    Note over C: NODATA SOA={ev.soa.name if ev.soa else '?'}")
             elif cn == "Nxdomain":
                 body.append("    Note over C: NXDOMAIN")
             elif cn == "Demote":
                 ns = ev.entry.ns if ev.entry is not None else "?"
-                body.append("    Note over C: demote %s (%s)" % (ns, ev.reason))
+                body.append(f"    Note over C: demote {ns} ({ev.reason})")
             elif cn == "NeedAddress":
-                body.append("    Note over C: glueless: resolve %s" % ev.ns_name)
+                body.append(f"    Note over C: glueless: resolve {ev.ns_name}")
             elif cn == "Cname":
-                body.append("    Note over C: CNAME %s" % ev.target)
+                body.append(f"    Note over C: CNAME {ev.target}")
             elif cn == "Done":
                 body.append("    Note over C: done")
             elif cn == "Fail":
-                body.append("    Note over C: FAIL %s" % ev.reason)
+                body.append(f"    Note over C: FAIL {ev.reason}")
+                body.append(f"    Note over C: FAIL {ev.reason}")
 
         lines = list(header)
         if title:

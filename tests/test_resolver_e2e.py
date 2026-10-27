@@ -106,14 +106,12 @@ class FakeNetwork:
         address = entry.addresses[0] if entry.addresses else None
         qname = questions[0].name
         self.sent.append((str(entry.ns), str(address)))
-        handler = self.by_name.get(_as_name(qname), self.by_address.get(address, self.default))
-        return handler
+        return self.by_name.get(_as_name(qname), self.by_address.get(address, self.default))
 
 
 @pytest.fixture
 def resolver():
-    network_resolver = RecursiveResolver(cache=MemoryDnsCache())
-    return network_resolver
+    return RecursiveResolver(cache=MemoryDnsCache())
 
 
 def _wire(resolver, network):
@@ -291,9 +289,9 @@ async def test_trace_is_attached_and_renders(resolver):
 
 
 async def test_resolve_rejects_bad_input(resolver):
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="expects a DnsPacket"):
         await resolver.resolve("not a packet")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="at least one question"):
         await resolver.resolve(Query(questions=[]))
     mixed = Query(
         questions=[
@@ -301,5 +299,5 @@ async def test_resolve_rejects_bad_input(resolver):
             DnsQuestion(DomainName("other.example."), A_T, 1),
         ]
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must agree on name and class"):
         await resolver.resolve(mixed)

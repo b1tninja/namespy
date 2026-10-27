@@ -88,7 +88,7 @@ class DnsQuestion:
     _FMT = "!HH"
     _SIZE = struct.calcsize(_FMT)
 
-    __slots__ = ("name", "qtype", "qclass")
+    __slots__ = ("name", "qclass", "qtype")
 
     def __init__(self, qname, qtype=DnsQType.ANY, qclass=DnsRClass.IN):
         self.name = qname if isinstance(qname, DomainName) else DomainName(qname)
@@ -147,7 +147,7 @@ class DnsRecord:
         constructor accepts those as given; :meth:`parse` is the strict path.
     """
 
-    __slots__ = ("name", "rtype", "rclass", "ttl", "rdlength", "rdata")
+    __slots__ = ("name", "rclass", "rdata", "rdlength", "rtype", "ttl")
 
     def __init__(
         self, name, rtype=DnsRType.A, rclass=DnsRClass.IN, ttl=0, rdlength=None, rdata=b""
@@ -212,12 +212,8 @@ class DnsRecord:
         return record, end
 
     def __repr__(self) -> str:
-        return "<Record:{},{},{},{},{}>".format(
-            self.name,
-            type_name_of(self.rtype),
-            self.rclass,
-            self.ttl,
-            self.rdata,
+        return (
+            f"<Record:{self.name},{type_name_of(self.rtype)},{self.rclass},{self.ttl},{self.rdata}>"
         )
 
     def __bytes__(self) -> bytes:
@@ -280,7 +276,7 @@ class DnsPacket:
         answers=None,
         nameservers=None,
         additional_records=None,
-        suffix=bytes(),
+        suffix=b"",
     ):
         if ID is None:
             # RFC 5452 section 5 treats the transaction ID as the resolver's
@@ -386,7 +382,7 @@ class DnsPacket:
     def __repr__(self) -> str:
         return "<DnsPacket:{:#06x} {} q={} a={} ns={} ar={}>".format(
             self.ID,
-            "response" if self.QR == DnsQR.response else "query",
+            "response" if DnsQR.response == self.QR else "query",
             len(self.questions),
             len(self.answers),
             len(self.nameservers),
@@ -410,7 +406,7 @@ class DnsPacket:
                 f"(RFC 6891 section 6.1.3)"
             )
         flags1 = (
-            (0x80 if self.QR == DnsQR.response else 0)
+            (0x80 if DnsQR.response == self.QR else 0)
             | (int(self.OPCODE) & 0xF) << 3
             | (0x04 if self.AA else 0)
             | (0x02 if self.TC else 0)
@@ -484,16 +480,16 @@ class DnsPacket:
         # Sections fill in order; on a TC=1 message the last one may legitimately
         # be cut off mid-record, so what did parse is kept rather than thrown
         # away (RFC 1035 section 4.1.1 makes truncation a normal condition, not
-        # corruption). QDCOUNT is checked up front so an absurd value is rejected
-        # before it can drive a loop: RFC 1035 section 4.1.1 permits zero or one
-        # question in current use.
-        if QDCOUNT > 1:
-            raise DnsPacketParseError(
-                f"QDCOUNT={QDCOUNT}: RFC 1035 section 4.1.1 permits zero or one "
-                f"question in current use",
-                data=data,
-                offset=offset,
-            )
+        # corruption).
+        #
+        # QDCOUNT is *not* capped at one here, even though multi-question messages
+        # are what every current server refuses. Decoding is not accepting: this is
+        # an inspection library, so it has to be able to read a message it would
+        # reject, and a server that could not parse the FORMERR reply it sends for a
+        # two-question query would be contradicting itself. The refusal belongs to
+        # the policy layer and lives in aiodns.server, per RFC 8906 section 5.2.
+        # The loop below is bounded by the message itself -- each question consumes
+        # at least three octets -- so a hostile count cannot spin.
 
         # A TC=1 message is a legitimately partial answer, not a corrupt one
         # (RFC 1035 section 4.1.1), so in lenient mode the last section may stop
@@ -530,7 +526,7 @@ class DnsPacket:
                 offset=offset,
             )
 
-        packet_cls = Query if QR == DnsQR.query else Response
+        packet_cls = Query if DnsQR.query == QR else Response
         return (
             packet_cls(
                 ID,

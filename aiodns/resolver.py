@@ -45,6 +45,7 @@ import secrets
 import socket
 import struct
 import urllib.request
+from dataclasses import dataclass
 from importlib import resources
 from socket import gaierror
 from typing import NamedTuple
@@ -71,7 +72,7 @@ MAX_DEPTH = 24
 # followed forever ("a alias name must not map to itself, either directly or
 # indirectly"), and RFC 6672 §5.1 notes that DNAME plus CNAME makes loops easier
 # to construct than either type alone. Some bound is therefore mandatory; this
-# is generous relative to real deployments, where chains of 2–3 are the norm,
+# is generous relative to real deployments, where chains of 2--3 are the norm,
 # and it is deliberately smaller than MAX_HOPS so a pathological chain fails
 # with a clear "alias" error rather than an opaque "max hops".
 MAX_ALIAS_HOPS = 16
@@ -81,7 +82,7 @@ MAX_ALIAS_HOPS = 16
 # but the spec leaves the wait time to the implementation. A small budget
 # is essential: without it, one unreachable anycast NS hangs the whole
 # resolution (and any glueless sub-resolution rooted in it) until the
-# caller's outer timeout fires. BIND uses 1.5–5 s initially; we pick 5 s.
+# caller's outer timeout fires. BIND uses 1.5--5 s initially; we pick 5 s.
 QUERY_TIMEOUT_S = 5.0
 
 
@@ -158,8 +159,11 @@ class Resolver(asyncio.Protocol):
             if hasattr(self, "_ensure_v6_transport"):
                 try:
                     await self._ensure_v6_transport()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # IPv6 glue is an optimisation: without a v6 transport we
+                    # simply cannot use a v6 address, and the caller falls back
+                    # to the v4 ones. Worth a debug line, not an exception.
+                    self.log.debug("resolver_v6_transport_unavailable(err=%s)", type(exc).__name__)
             transport_v6 = getattr(self, "transport_v6", None)
             queue_v6 = getattr(self, "queue_v6", None)
             if transport_v6 is None or queue_v6 is None:
@@ -194,9 +198,8 @@ class Resolver(asyncio.Protocol):
             self.log.debug(
                 "resolver_timeout_udp(dst=%s id=%s ip_version=4)", ip.exploded, dns_packet.ID
             )
-            # UDP may be blocked; try TCP (RFC 1035).
-            tcp = await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
-            return tcp
+            # UDP may be blocked; try TCP (RFC 1035 section 4.2.2).
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
 
     async def _query_tcp(self, host, wire, query_packet):
         """Query over TCP, with the 2-octet length prefix RFC 1035 section 4.2.2.
@@ -238,9 +241,7 @@ class Resolver(asyncio.Protocol):
             if int(pkt.ID) != int(query_packet.ID) or not _is_expected_response(
                 query_packet, pkt, host
             ):
-                self.log.warning(
-                    "resolver_tcp_response_mismatch(dst=%s id=%s)", host, pkt.ID
-                )
+                self.log.warning("resolver_tcp_response_mismatch(dst=%s id=%s)", host, pkt.ID)
                 return None
             self.log.debug(
                 "resolver_tcp_ok(dst=%s id=%s rcvd_len=%d)", host, getattr(pkt, "ID", -1), len(data)
@@ -258,8 +259,11 @@ class Resolver(asyncio.Protocol):
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as exc:
+                # The answer has already been read; a failure while tearing the
+                # connection down (a server that RSTs instead of finishing the
+                # close) must not turn a good response into an error.
+                self.log.debug("resolver_tcp_close_failed(err=%s)", type(exc).__name__)
 
     @staticmethod
     def enumerate_nameserver_addresses(nameserver_records, additional_records):
@@ -371,7 +375,7 @@ class Sname:
         return shared
 
     def __repr__(self):
-        return "<Sname %s %s %s>" % (self.qname, self.qtype, self.qclass)
+        return f"<Sname {self.qname} {self.qtype} {self.qclass}>"
 
 
 class SlistEntry:
@@ -382,11 +386,9 @@ class SlistEntry:
         self.history = {"sent": 0, "received": 0, "demoted": False}
 
     def __repr__(self):
-        return "<SlistEntry zone=%r ns=%r addrs=%d demoted=%s>" % (
-            self.zone,
-            self.ns,
-            len(self.addresses),
-            self.history["demoted"],
+        return (
+            f"<SlistEntry zone={self.zone!r} ns={self.ns!r}"
+            f" addrs={len(self.addresses)} demoted={self.history['demoted']}>"
         )
 
 
@@ -414,11 +416,7 @@ class Slist:
             entry.history["demoted"] = True
 
     def __repr__(self):
-        return "<Slist zone=%r match=%d entries=%d>" % (
-            self.zone,
-            self.match,
-            len(self.entries),
-        )
+        return f"<Slist zone={self.zone!r} match={self.match} entries={len(self.entries)}>"
 
 
 class Sbelt(Slist):
@@ -479,92 +477,112 @@ class Sbelt(Slist):
 # a Trace, then either fulfills the effect or moves on.
 
 
+@dataclass(frozen=True)
 class SendQuery:
-    def __init__(self, entry, questions):
-        self.entry = entry
-        self.questions = questions
+    """Ask the driver to send *questions* to *entry* and hand back the reply.
 
-    def __repr__(self):
-        return "<SendQuery to=%r q=%r>" % (self.entry.ns, self.questions)
+    The one effect that performs I/O. Corresponds to RFC 1034 section 5.3.3
+    step 3 ("query a name server that is further authoritative"), and is also
+    how a glueless NS gets its address resolved.
+    """
+
+    entry: SlistEntry
+    questions: list
 
 
+@dataclass(frozen=True)
 class NeedAddress:
-    def __init__(self, ns_name):
-        self.ns_name = ns_name
+    """The driver must resolve *ns_name* to an address before it can be queried.
 
-    def __repr__(self):
-        return "<NeedAddress %r>" % (self.ns_name,)
+    Raised for a glueless NS -- one whose name appears in the authority section
+    but whose address did not (RFC 1034 section 3.6.4, RFC 5625 section 2.5).
+    """
+
+    ns_name: DomainName
 
 
+@dataclass(frozen=True)
 class Referral:
-    def __init__(self, old_zone, new_zone, match_before, match_after):
-        self.old_zone = old_zone
-        self.new_zone = new_zone
-        self.match_before = match_before
-        self.match_after = match_after
+    """Slist descended from *old_zone* to *new_zone*.
 
-    def __repr__(self):
-        return "<Referral %r->%r match %d->%d>" % (
-            self.old_zone,
-            self.new_zone,
-            self.match_before,
-            self.match_after,
-        )
+    *match_before* and *match_after* are label counts matched before and after,
+    which is how a trace shows progress. Equal counts mean a referral that did
+    not advance, which the algorithm treats as a loop.
+    """
+
+    old_zone: DomainName
+    new_zone: DomainName
+    match_before: int
+    match_after: int
 
 
+@dataclass(frozen=True)
 class Answer:
-    def __init__(self, records):
-        self.records = list(records)
+    """The answer section holds RRs of the requested type -- RFC 1034 section 5.3.3(a)."""
 
-    def __repr__(self):
-        return "<Answer %d>" % len(self.records)
+    records: tuple
+
+    def __post_init__(self):
+        # Freeze the sequence: these events are recorded in a Trace and read
+        # back after the response that produced them is gone, so a caller
+        # mutating the list it passed in must not rewrite history.
+        object.__setattr__(self, "records", tuple(self.records))
 
 
+@dataclass(frozen=True)
 class Nodata:
-    def __init__(self, soa):
-        self.soa = soa
+    """The name exists but has no RR of the requested type.
 
-    def __repr__(self):
-        return "<Nodata soa=%r>" % (self.soa,)
+    The SOA is carried because RFC 2308 section 5 makes it the source of the
+    negative TTL, and because distinguishing this from a referral depends on
+    the authority section holding SOA rather than NS (RFC 2308 section 2.2.1).
+    """
+
+    soa: object
 
 
+@dataclass(frozen=True)
 class Nxdomain:
-    def __repr__(self):
-        return "<Nxdomain>"
+    """The name does not exist -- RFC 1034 section 5.3.3(b), RFC 2308 section 3."""
 
 
+@dataclass(frozen=True)
 class Cname:
-    def __init__(self, target):
-        self.target = target
+    """An alias was encountered; *target* must be re-anchored as the new SNAME.
 
-    def __repr__(self):
-        return "<Cname %r>" % (self.target,)
+    RFC 1034 section 5.3.3 requires the lookup to continue at the CNAME's
+    target rather than returning it, and RFC 6672 section 2.3 adds the DNAME
+    case where a synthesized name replaces the alias outright.
+    """
+
+    target: DomainName
 
 
+@dataclass(frozen=True)
 class Demote:
-    def __init__(self, entry, reason):
-        self.entry = entry
-        self.reason = reason
+    """*entry* is being marked unusable, for *reason*.
 
-    def __repr__(self):
-        ns = self.entry.ns if self.entry is not None else None
-        return "<Demote %r %s>" % (ns, self.reason)
+    RFC 5625 section 2.6 forbids discarding a server on a single failure, so a
+    demotion is a ranking change within the current Slist, not a deletion from
+    the name space.
+    """
+
+    entry: SlistEntry | None
+    reason: str
 
 
+@dataclass(frozen=True)
 class Done:
-    def __init__(self, response):
-        self.response = response
+    """Resolution finished; *response* is the answer to hand back."""
 
-    def __repr__(self):
-        return "<Done>"
+    response: object
 
 
+@dataclass(frozen=True)
 class Fail:
-    def __init__(self, reason):
-        self.reason = reason
+    """No answer can be produced; *reason* is for the trace and the log."""
 
-    def __repr__(self):
-        return "<Fail %s>" % self.reason
+    reason: str
 
 
 def _answer_address(record):
@@ -647,7 +665,7 @@ def _is_expected_response(query_packet, response_packet, dst) -> bool:
     faithfully. Both are required by RFC 1035 section 4.1.1 and both are
     explicitly named as client-side validation by RFC 5452 section 5.
     """
-    if response_packet.QR != DnsQR.response:
+    if DnsQR.response != response_packet.QR:
         return False
     if not response_packet.questions:
         return False
@@ -762,8 +780,8 @@ def _follow_aliases(response, sname, max_alias_hops: int = MAX_ALIAS_HOPS) -> Al
     any_type = qtype == int(DnsQType.ANY)
 
     current = sname.qname
-    traversed = []
-    events = []
+    traversed: list[DomainName] = []
+    events: list[Cname] = []
     seen = {current}
 
     while True:
@@ -868,12 +886,12 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
         yield Demote(entry, "no response")
         return
 
-    if response.RCODE == DnsResponseCode.name_error:
+    if DnsResponseCode.name_error == response.RCODE:
         yield Nxdomain()
         yield Done(response)
         return
 
-    if response.RCODE != DnsResponseCode.no_error:
+    if DnsResponseCode.no_error != response.RCODE:
         yield Demote(entry, "rcode " + response.RCODE.name)
         return
 
@@ -882,8 +900,7 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
     # answer contains a CNAME RR, set SNAME to the contents of the RDATA field
     # of the displayed CNAME RR, and go to step 2").
     walk = _follow_aliases(response, sname, max_alias_hops=max_alias_hops)
-    for event in walk.events:
-        yield event
+    yield from walk.events
     if walk.failure is not None:
         # A loop or an over-long chain is a broken zone, not a negative answer.
         # Letting this fall through reached the ANCOUNT > 0 branch below and
@@ -1318,7 +1335,7 @@ class RecursiveResolver(Resolver):
         elif hasattr(zone_file, "open"):  # importlib.resources.Traversable
             data = zone_file.open("r", encoding="utf-8").read()
         else:
-            with open(zone_file, "r", encoding="utf-8") as handle:
+            with open(zone_file, encoding="utf-8") as handle:
                 data = handle.read()
         if isinstance(data, bytes):
             data = data.decode("utf-8", "replace")
@@ -1350,8 +1367,8 @@ class RecursiveResolver(Resolver):
         :param query_timeout: seconds per UDP attempt (and per TCP phase).
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
         """
-        self.queue = {}
-        self.queue_v6 = {}
+        self.queue: dict[tuple, tuple] = {}
+        self.queue_v6: dict[tuple, tuple] = {}
         self.transport_v6 = None
         self._v6_ready = None
         self.log = LOGGER
@@ -1403,12 +1420,7 @@ class RecursiveResolver(Resolver):
                 family=socket.AF_INET6,
             )
             self.transport_v6 = transport
-            try:
-                self.log.debug(
-                    "resolver_v6_ready(sockname=%s)", transport.get_extra_info("sockname")
-                )
-            except Exception:
-                pass
+            self.log.debug("resolver_v6_ready(sockname=%s)", transport.get_extra_info("sockname"))
             return transport
         except Exception as e:
             self.log.debug("resolver_v6_failed(err=%s)", type(e).__name__)
@@ -1442,7 +1454,7 @@ class RecursiveResolver(Resolver):
 
     def datagram_received(self, data, addr):
         try:
-            (dns_packet, offset) = DnsPacket.parse(data)
+            (dns_packet, _offset) = DnsPacket.parse(data)
         except DnsPacketParseError as e:
             self.log.warning(
                 "parse failed in resolver: err=%s offset=%s len=%d hex=%s",
@@ -1453,7 +1465,7 @@ class RecursiveResolver(Resolver):
             )
             return
 
-        self.log.debug("resolver_datagram_recieved(%s, %s)" % (dns_packet, addr))
+        self.log.debug(f"resolver_datagram_recieved({dns_packet}, {addr})")
         host = addr[0]
         entry = self.queue.get(_pending_key(host, dns_packet))
         if entry is None:
@@ -1466,9 +1478,7 @@ class RecursiveResolver(Resolver):
         query_packet, future = entry
         del self.queue[_pending_key(host, dns_packet)]
         if not _is_expected_response(query_packet, dns_packet, host):
-            self.log.warning(
-                "resolver_response_mismatch(src=%s id=%s)", host, dns_packet.ID
-            )
+            self.log.warning("resolver_response_mismatch(src=%s id=%s)", host, dns_packet.ID)
             return
         # The future may already be cancelled if the per-query timeout fired
         # before this late response arrived; ignore that race rather than
@@ -1619,10 +1629,9 @@ class RecursiveResolver(Resolver):
         ns_record = DnsRecord(entry.zone, DnsRType.NS, DnsRClass.IN, 0, rdata=entry.ns)
 
         for address in list(entry.addresses):
-            if hasattr(address, "packed"):
-                packed = address.packed
-            else:
-                packed = bytes(address)
+            # Addresses arrive either as ipaddress objects (glue, root hints) or
+            # as raw packed octets (a caller that seeded the belt by hand).
+            packed = address.packed if hasattr(address, "packed") else bytes(address)
             if len(packed) not in (4, 16):
                 continue
 

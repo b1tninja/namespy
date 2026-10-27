@@ -9,9 +9,18 @@ import sys
 import time
 import traceback
 
-from .enums import DnsQType, DnsRClass, DnsRType
+from .enums import (
+    DnsOpCode,
+    DnsQClass,
+    DnsQR,
+    DnsQType,
+    DnsRClass,
+    DnsResponseCode,
+    DnsRType,
+)
 from .names import DomainName
 from .packet import DnsPacket, DnsQuestion, Query
+from .rdata import generic_presentation, type_name_of
 from .resolver import RecursiveResolver
 from .server import DnsServer
 
@@ -98,7 +107,7 @@ def _parse_qtype(token):
     try:
         return DnsQType(int(s))
     except (ValueError, KeyError):
-        raise argparse.ArgumentTypeError("unknown record type: %s" % token) from None
+        raise argparse.ArgumentTypeError(f"unknown record type: {token}") from None
 
 
 def _parse_qclass(token):
@@ -110,45 +119,61 @@ def _parse_qclass(token):
     try:
         return DnsRClass(int(s))
     except (ValueError, KeyError):
-        raise argparse.ArgumentTypeError("unknown record class: %s" % token) from None
+        raise argparse.ArgumentTypeError(f"unknown record class: {token}") from None
 
 
 def _format_rdata(record):
+    """Render one record's RDATA for the dig-style answer.
+
+    Goes through the codec's :meth:`~aiodns.rdata.RData.to_presentation` so that
+    every type renders the way the wire format describes it: an address as an
+    address, a name absolutely qualified, and an unknown type as RFC 3597
+    section 5 ``\\# <len> <hex>`` rather than as bytes optimistically decoded as
+    ASCII, which used to turn a binary RDATA into mojibake on the terminal.
+    """
     rdata = record.rdata
-    rtype = record.rtype
+    if hasattr(rdata, "to_presentation"):
+        return rdata.to_presentation()
     if hasattr(rdata, "ip"):
         return rdata.ip.compressed
     if isinstance(rdata, (bytes, bytearray)):
-        b = bytes(rdata)
-        if rtype == DnsRType.A and len(b) == 4:
-            return ipaddress.IPv4Address(b).compressed
-        if rtype == DnsRType.AAAA and len(b) == 16:
-            return ipaddress.IPv6Address(b).compressed
-        try:
-            return b.decode("ascii")
-        except UnicodeDecodeError:
-            return b.hex()
+        blob = bytes(rdata)
+        if int(record.rtype) == int(DnsRType.A) and len(blob) == 4:
+            return ipaddress.IPv4Address(blob).compressed
+        if int(record.rtype) == int(DnsRType.AAAA) and len(blob) == 16:
+            return ipaddress.IPv6Address(blob).compressed
+        return generic_presentation(blob)
     return str(rdata)
 
 
 def _format_record_row(r):
-    rclass = r.rclass.name if hasattr(r.rclass, "name") else str(r.rclass)
-    rtype = r.rtype.name if hasattr(r.rtype, "name") else str(r.rtype)
-    return "%s\t%d\t%s\t%s\t%s" % (r.name, r.ttl, rclass, rtype, _format_rdata(r))
+    # Class and type are separate constant spaces: 1 means A in one and IN in
+    # the other, so each must be resolved through its own enum -- otherwise the
+    # class column silently prints a record-type mnemonic.
+    class_col = DnsRClass.mnemonic(r.rclass)
+    return f"{r.name}\t{r.ttl}\t{class_col}\t{type_name_of(r.rtype)}\t{_format_rdata(r)}"
 
 
 def _format_response(response, args, elapsed_ms):
-    """Render `Response` as a dig-style answer."""
+    """Render *response* as a dig-style answer.
+
+    Follows dig's section layout so existing muscle memory and log scrapers
+    still work, with two deliberate additions: the EDNS(0) pseudo-section, since
+    an OPT record is otherwise invisible while being exactly what determines the
+    effective RCODE (RFC 6891 sections 6.1.2-6.1.3); and ``ad``/``cd`` flags,
+    which live only in OPT and are the first thing an operator wants to see when
+    comparing against a validating resolver.
+    """
     lines = []
-    qtype_name = args.type.name if hasattr(args.type, "name") else str(args.type)
-    qclass_name = args.qclass.name if hasattr(args.qclass, "name") else str(args.qclass)
-    lines.append("; <<>> aiodns <<>> %s %s %s" % (args.name, qtype_name, qclass_name))
+    lines.append(
+        f"; <<>> dnspy <<>> {args.name} {type_name_of(args.type)} {DnsQClass.mnemonic(args.qclass)}"
+    )
     if response is None:
         lines.append(";; no response")
         return "\n".join(lines)
 
     flags = []
-    if response.QR == 1:
+    if DnsQR.response == response.QR:
         flags.append("qr")
     if response.AA:
         flags.append("aa")
@@ -158,34 +183,36 @@ def _format_response(response, args, elapsed_ms):
         flags.append("rd")
     if response.RA:
         flags.append("ra")
+    if response.ad:
+        flags.append("ad")
+    if response.cd:
+        flags.append("cd")
 
     lines.append(";; Got answer:")
     lines.append(
-        ";; ->>HEADER<<- opcode: %s, status: %s, id: %d"
-        % (
-            response.OPCODE.name,
-            response.RCODE.name,
-            response.ID,
-        )
+        f";; ->>HEADER<<- opcode: {DnsOpCode.mnemonic(response.OPCODE)}, "
+        f"status: {DnsResponseCode.mnemonic(response.extended_rcode)}, "
+        f"id: {response.ID}"
     )
     lines.append(
-        ";; flags: %s; QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d"
-        % (
-            " ".join(flags),
-            response.QDCOUNT,
-            response.ANCOUNT,
-            response.NSCOUNT,
-            response.ARCOUNT,
-        )
+        f";; flags: {' '.join(flags)}; QUERY: {response.QDCOUNT}, "
+        f"ANSWER: {len(response.answers)}, AUTHORITY: {len(response.nameservers)}, "
+        f"ADDITIONAL: {len(response.additional_records)}"
     )
     lines.append("")
+
+    if response.opt() is not None:
+        record = response.opt()
+        lines.append(";; OPT PSEUDOSECTION:")
+        lines.append(
+            f"; EDNS: version: 0, flags: {'; '.join(_opt_flags(response))}; udpsize: {int(record.rclass)}"
+        )
+        lines.append("")
 
     if response.questions:
         lines.append(";; QUESTION SECTION:")
         for q in response.questions:
-            qclass = q.qclass.name if hasattr(q.qclass, "name") else str(q.qclass)
-            qtype = q.qtype.name if hasattr(q.qtype, "name") else str(q.qtype)
-            lines.append(";%s\t\t%s\t%s" % (q.name, qclass, qtype))
+            lines.append(f";{q.name}\t\t{DnsQClass.mnemonic(q.qclass)}\t{type_name_of(q.qtype)}")
         lines.append("")
 
     for label, section in (
@@ -194,14 +221,24 @@ def _format_response(response, args, elapsed_ms):
         ("ADDITIONAL", response.additional_records),
     ):
         if section:
-            lines.append(";; %s SECTION:" % label)
+            lines.append(f";; {label} SECTION:")
             for r in section:
                 lines.append(_format_record_row(r))
             lines.append("")
 
-    lines.append(";; Query time: %d msec" % int(elapsed_ms))
-    lines.append(";; MSG SIZE  rcvd: %d" % len(bytes(response)))
+    lines.append(f";; Query time: {int(elapsed_ms)} msec")
+    lines.append(f";; MSG SIZE  rcvd: {len(bytes(response))}")
     return "\n".join(lines)
+
+
+def _opt_flags(response):
+    """The EDNS(0) flag mnemonics set in a response, in dig's order."""
+    out = []
+    if response.ad:
+        out.append("ad")
+    if response.cd:
+        out.append("cd")
+    return out
 
 
 def _format_short(response):
@@ -222,15 +259,19 @@ def _normalize_dig_plus_args(argv):
 
 
 def build_parser():
+    # prog is dnspy, matching the console-script name, because that is what a
+    # user actually typed when they see this text; the import name stays aiodns
+    # for compatibility, so the examples show both entry points.
     p = argparse.ArgumentParser(
-        prog="aiodns",
+        prog="dnspy",
         description="DNSpy: a dig-style CLI for the recursive resolver, plus a demo server mode.",
         epilog="Examples:\n"
-        "  python -m aiodns example.com\n"
-        "  python -m aiodns example.com MX\n"
-        "  python -m aiodns +short example.com\n"
-        "  python -m aiodns +trace example.com A\n"
-        "  python -m aiodns --serve",
+        "  dnspy example.com\n"
+        "  dnspy example.com MX\n"
+        "  dnspy +short example.com\n"
+        "  dnspy +trace example.com A\n"
+        "  dnspy --serve\n"
+        "  python -m aiodns example.com   (same thing, without installing)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("name", nargs="?", help="domain name to resolve (presentation form)")
@@ -269,8 +310,9 @@ def build_parser():
     )
     p.add_argument(
         "--root-hints",
-        default="named.root",
-        help="path to the root hints zone file (default: named.root)",
+        default=None,
+        help="path to a root hints zone file (default: the copy packaged "
+        "with DNSpy; refresh it with refresh_root_hints())",
     )
     p.add_argument(
         "--dns-suffix",
@@ -312,7 +354,7 @@ async def cli_query(args) -> int:
                 timeout=args.timeout,
             )
         except TimeoutError:
-            print(";; query timed out after %.1f s" % args.timeout, file=sys.stderr)
+            print(f";; query timed out after {args.timeout:.1f} s", file=sys.stderr)
             return 2
         elapsed_ms = (time.monotonic() - start) * 1000.0
 

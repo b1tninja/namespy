@@ -33,18 +33,25 @@ therefore fall back to the raw ``int`` rather than raising, which is why the
 member lookup in :class:`~aiodns.packet.DnsRecord` is guarded.
 """
 
-from enum import IntEnum
+from enum import IntEnum, nonmember
 
 
 class _TypeMixin:
     """Shared lookup helper for the protocol constant spaces.
 
-    Mixed in before :class:`IntEnum` so ``parse`` is a classmethod on the
-    concrete enum. An unknown value degrades to a plain ``int`` instead of
-    raising: RFC 3597 section 3 requires unknown types to be handled
-    transparently, and inventing an enum member at runtime is not possible
-    anyway. Rendering an unknown value wants ``getattr(value, "name", value)``.
+    Mixed in before :class:`IntEnum` so ``parse`` and ``mnemonic`` are
+    classmethods on the concrete enum. An unknown value degrades to a plain
+    ``int`` instead of raising: RFC 3597 section 3 requires unknown types to be
+    handled transparently, and inventing an enum member at runtime is not
+    possible anyway.
     """
+
+    #: Prefix used by :meth:`mnemonic` for values with no member, so ``TYPE65``
+    #: and ``CLASS65535`` stay distinguishable (RFC 3597 section 5). Declared via
+    #: :func:`enum.nonmember` in each enum body: an Enum turns *every* plain name
+    #: in the class body into a member attempt, and both ``_NAME`` and ``_NAME_``
+    #: are rejected outright on modern CPython (the latter as a reserved sunder).
+    _prefix = "TYPE"
 
     @classmethod
     def parse(cls, value: int):
@@ -53,6 +60,24 @@ class _TypeMixin:
             return cls(value)
         except ValueError:
             return int(value)
+
+    @classmethod
+    def mnemonic(cls, value) -> str:
+        """A stable, unambiguous label for ``value`` in *this* constant space.
+
+        Numbers alone are ambiguous across spaces: type 1 and class 1 are both
+        ``1`` but mean ``A`` and ``IN``. Unknown values therefore get the
+        RFC 3597 section 5 presentation (``TYPE<n>``/``CLASS<n>``) rather than a
+        bare number, which is also what makes a log line round-trippable.
+        """
+        if value is None:
+            return cls._prefix
+        if isinstance(value, cls):
+            return value.name
+        try:
+            return cls(int(value)).name
+        except (ValueError, TypeError):
+            return f"{cls._prefix}{int(value)}"
 
 
 class DnsResponseCode(_TypeMixin, IntEnum):
@@ -87,7 +112,7 @@ class DnsResponseCode(_TypeMixin, IntEnum):
     badcookie = 25  # RFC 7873; registry lists 25, the RFC's table said 23
 
     def __str__(self) -> str:
-        return self.name  # type: ignore[return-value]
+        return self.name
 
 
 class DnsOpCode(_TypeMixin, IntEnum):
@@ -117,6 +142,8 @@ class DnsQR(IntEnum):
 class DnsRClass(_TypeMixin, IntEnum):
     """RR CLASS for stored records (RFC 1035 section 3.2.4)."""
 
+    _prefix = nonmember("CLASS")
+
     IN = 1
     CS = 2  # CSNET -- historical
     CH = 3  # CHAOS
@@ -127,6 +154,8 @@ class DnsRClass(_TypeMixin, IntEnum):
 
 class DnsQClass(_TypeMixin, IntEnum):
     """QCLASS: every RR class plus the ``ANY`` wildcard (RFC 1035 section 3.2.3)."""
+
+    _prefix = nonmember("CLASS")
 
     IN = 1
     CS = 2

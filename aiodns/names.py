@@ -165,14 +165,17 @@ class DomainName:
     """
 
     def __init__(self, name, buffer: bytes | None = None, offset: int | None = None):
+        text: str
         if isinstance(name, DomainName):
-            name = name.name
-        if isinstance(name, bytes):
+            text = name.name
+        elif isinstance(name, bytes):
             # Raw octets: treat as a single label rather than guessing at dots.
-            name = escape_label(name)
-        if not isinstance(name, str):
+            text = escape_label(name)
+        elif not isinstance(name, str):
             raise TypeError(f"DomainName requires str, got {type(name).__name__}")
-        self.name = name
+        else:
+            text = name
+        self.name = text
         self.buffer = buffer
         self.offset = offset
 
@@ -264,7 +267,7 @@ class DomainName:
         labels = self._labels()
         return bool(labels) and labels[0] == b"*"
 
-    def hierarchy(self) -> list["DomainName"]:
+    def hierarchy(self) -> list[DomainName]:
         """This name and each of its ancestors, root first, shortest next.
 
         ``"a.b.example.com."`` yields ``[".", "com.", "example.com.",
@@ -284,7 +287,7 @@ class DomainName:
         return out
 
     @classmethod
-    def from_labels(cls, labels) -> "DomainName":
+    def from_labels(cls, labels) -> DomainName:
         """Build an absolute name from raw label octets.
 
         Composition is needed wherever a name is *derived* rather than written
@@ -317,7 +320,7 @@ class DomainName:
             return False
         return mine[len(mine) - len(theirs) :] == theirs
 
-    def qualify(self, dns_suffix=None) -> "DomainName":
+    def qualify(self, dns_suffix=None) -> DomainName:
         """Return an absolute :class:`DomainName`, applying a DNS suffix if needed.
 
         If this name is already absolute, ``self`` is returned unchanged -- the
@@ -382,12 +385,12 @@ class DomainName:
     # ----------------------------------------------------------------- decoding
 
     @classmethod
-    def root_label(cls) -> "DomainName":
+    def root_label(cls) -> DomainName:
         """The root domain: the empty, terminated name ``"."``."""
         return cls(".")
 
     @classmethod
-    def parse_from(cls, buffer: bytes, offset: int = 0) -> tuple["DomainName", int]:
+    def parse_from(cls, buffer: bytes, offset: int = 0) -> tuple[DomainName, int]:
         r"""Read a wire-format name; return ``(name, octet after the name)``.
 
         The second element is where the *enclosing record* continues. When the

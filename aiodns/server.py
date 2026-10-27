@@ -63,7 +63,10 @@ class DnsServer(asyncio.Protocol):
         self.transport = transport
         enable_path_mtu_discovery(transport, self.log)
 
-    def connection_lost(self, exc):
+    def connection_lost(self, _exc):
+        # The task references matter as much as the cancellation: a task that is
+        # merely cancelled can still be referenced forever, and every datagram
+        # after a reconnect would add another.
         for task in list(self._tasks):
             task.cancel()
         self._tasks.clear()
@@ -107,7 +110,7 @@ class DnsServer(asyncio.Protocol):
         )
 
     async def respond_to_packet(self, dns_packet, addr):
-        if dns_packet.QR != DnsQR.query:
+        if DnsQR.query != dns_packet.QR:
             self.log.debug("server_not_query(src=%s id=%#06x)", addr[0], dns_packet.ID)
             return
 
@@ -117,7 +120,7 @@ class DnsServer(asyncio.Protocol):
             self._error(dns_packet, addr, DnsResponseCode.format_error)
             return
 
-        if dns_packet.OPCODE != DnsOpCode.query:
+        if DnsOpCode.query != dns_packet.OPCODE:
             self.log.debug(
                 "server_unsupported_opcode(src=%s opcode=%s)", addr[0], dns_packet.OPCODE
             )

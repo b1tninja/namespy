@@ -237,9 +237,7 @@ def test_resolve_steps_glueless_subresolution_walks_to_authoritative_ns():
     # generator would yield `NeedAddress`, sending us into an infinite
     # glueless loop instead of asking the authoritative server.
     step = next(gen)
-    assert isinstance(step, SendQuery), "expected SendQuery to a glued cloudflare NS, got %r" % (
-        step,
-    )
+    assert isinstance(step, SendQuery), f"expected SendQuery to a glued cloudflare NS, got {step!r}"
     assert step.entry.zone == DomainName("cloudflare.com.")
     assert step.entry.addresses, "glue should have been attached to the SLIST entry"
     assert step.entry.addresses[0] in (
@@ -359,7 +357,7 @@ def test_resolve_steps_cache_short_circuits_to_nxdomain():
     assert isinstance(step, Nxdomain)
     step = next(gen)
     assert isinstance(step, Done)
-    assert step.response.RCODE == DnsResponseCode.name_error
+    assert DnsResponseCode.name_error == step.response.RCODE
 
 
 def test_resolve_steps_populates_cache_after_authoritative_answer():
