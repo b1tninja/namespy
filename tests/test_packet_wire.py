@@ -146,7 +146,7 @@ def test_nxdomain_with_soa_round_trip() -> None:
         nameservers=[soa],
     )
     parsed, _ = DnsPacket.parse(bytes(response))
-    assert parsed.RCODE == DnsResponseCode.name_error
+    assert DnsResponseCode.name_error == parsed.RCODE
     assert parsed.nameservers[0].rdata.minimum == 300
 
 
@@ -302,7 +302,8 @@ def test_opt_ad_flag_and_payload_size() -> None:
     """RFC 6891 section 6.1.2: FLAGS live in OPT's TTL, CLASS carries the size."""
     parsed, _ = DnsPacket.parse(_with_opt(ttl=1 << 15))
     assert parsed.opt() is not None
-    assert parsed.ad and not parsed.cd
+    assert parsed.ad
+    assert not parsed.cd
     assert parsed.requestor_payload_size == 1232
 
 
@@ -362,13 +363,32 @@ def test_rdlength_overrun_is_rejected() -> None:
         DnsPacket.parse(message(answers=[raw]))
 
 
-def test_qdcount_above_one_is_rejected() -> None:
-    """RFC 1035 section 4.1.1: QDCOUNT is zero or one in current use.
+def test_multi_question_message_decodes_although_no_server_accepts_it() -> None:
+    """Decoding is not accepting (RFC 8906 section 5.2).
 
-    Rejected up front so an absurd count cannot drive a loop over the datagram.
+    Every current server answers a two-question query with FORMERR, and
+    :mod:`aiodns.server` is one of them -- but the refusal is policy, not syntax.
+    A decoder that refused here could not inspect the odd message it is named for,
+    and would be unable to read the very FORMERR reply this library sends back.
+    """
+    two = DnsQuestion(NAME, 1, 1).__bytes__() + DnsQuestion(NAME, 28, 1).__bytes__()
+    header = struct.pack("!HBBHHHH", 1, 0, 0, 2, 0, 0, 0)
+    packet, consumed = DnsPacket.parse(header + two)
+
+    assert packet.QDCOUNT == 2
+    assert len(packet.questions) == 2
+    assert consumed == len(header + two)
+
+
+def test_absurd_qdcount_cannot_spin() -> None:
+    """A hostile count is bounded by the datagram, not by a special-case ceiling.
+
+    Each question consumes at least three octets, so the read fails on the first
+    missing octet rather than looping; the message is still rejected, which is what
+    the old up-front ``QDCOUNT > 1`` check was really protecting.
     """
     header = struct.pack("!HBBHHHH", 1, 0, 0, 65535, 0, 0, 0)
-    with pytest.raises(DnsPacketParseError, match="QDCOUNT"):
+    with pytest.raises(DnsPacketParseError):
         DnsPacket.parse(header)
 
 

@@ -20,7 +20,7 @@ import pathlib
 
 import pytest
 
-from aiodns.names import DomainName, escape_label, unescape_label
+from aiodns.names import DomainName, DomainNameError, escape_label, unescape_label
 from aiodns.wire import MAX_NAME_OCTETS, DnsNameParseError
 
 # A response-shaped message: 12-octet header, QNAME at 12, QTYPE/QCLASS at 25,
@@ -150,9 +150,9 @@ def test_hostile_input_raises_structured_error(label, wire, offset) -> None:
     """
     with pytest.raises(DnsNameParseError) as excinfo:
         DomainName.parse_from(wire, offset)
-    assert isinstance(excinfo.value, ValueError)
-    assert excinfo.value.data == wire
-    assert excinfo.value.wire_hex() == wire.hex()
+    assert isinstance(excinfo.value, ValueError), label
+    assert excinfo.value.data == wire, label
+    assert excinfo.value.wire_hex() == wire.hex(), label
 
 
 def test_pointer_chain_work_is_bounded() -> None:
@@ -221,9 +221,9 @@ def test_parser_has_no_bare_assert() -> None:
 
 
 def test_encoder_rejects_what_the_wire_cannot_carry() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(DomainNameError, match="63-octet"):
         bytes(DomainName("a" * 64 + ".example.com."))
-    with pytest.raises(ValueError):
+    with pytest.raises(DomainNameError, match="255-octet"):
         bytes(DomainName(".".join(["l" * 60] * 6) + "."))
     assert bytes(DomainName(".")) == b"\x00"
     assert bytes(DomainName("example.com.")) == b"\x07example\x03com\x00"

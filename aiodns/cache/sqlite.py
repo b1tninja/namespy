@@ -4,17 +4,30 @@ A single ``rrset_cache`` table keyed on ``(name, qtype, qclass)`` with an
 ``expires_at`` column for TTL eviction. Records are stored length-prefixed
 (``!H`` + bytes from :meth:`DnsRecord.__bytes__`); negative entries store
 just the SOA's wire form (or empty bytes if the response carried none).
+
+Because :meth:`DnsRecord.__bytes__` emits pointer-free RDATA, a stored row can be
+re-parsed in isolation: a record whose name arrived by compression pointer in the
+original datagram is written with full labels, so the offset it once pointed to
+does not have to exist for the row to decode.
+
+Use it as a context manager, or call :meth:`close`; the connection is also
+released on garbage collection, but only a deterministic close returns the file
+descriptor when a long-running resolver drops a cache on reload.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import struct
 
 from ..enums import DnsResponseCode
 from ..names import DomainName
 from ..packet import DnsRecord
+from ..wire import DnsPacketParseError
 from . import DnsCache, NegativeEntry, PositiveEntry
+
+LOGGER = logging.getLogger(__name__)
 
 _KIND_POSITIVE = 0
 _KIND_NXDOMAIN = 1
@@ -88,10 +101,37 @@ class SqliteDnsCache(DnsCache):
         self._conn.commit()
 
     def close(self):
+        """Close the connection, tolerating one that is already gone.
+
+        Narrowed to :class:`sqlite3.Error` rather than bare :class:`Exception`:
+        a double close is ordinary (an explicit call plus garbage collection),
+        but an :class:`AttributeError` here is a bug and should not be hidden by
+        a best-effort cleanup.
+        """
         try:
             self._conn.close()
-        except Exception:
+        except sqlite3.Error as exc:
+            LOGGER.debug("sqlite_close_failed(err=%s)", exc)
+        except AttributeError:
+            # __init__ never finished, so there is nothing to close. Reached from
+            # __del__ on an instance whose sqlite3.connect() call raised; raising
+            # from a finalizer would only print "Exception ignored in __del__".
             pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def __del__(self):
+        # A cache outliving its owner should still release the file handle:
+        # sqlite3 only complains with a ResourceWarning at shutdown, which in a
+        # long-running resolver means a descriptor leak that never surfaces as
+        # an error. Callers that care about ordering should use the cache as a
+        # context manager; this is the safety net for those that do not.
+        self.close()
 
     def get(self, name, qtype, qclass):
         key_name = _name_text(name)
@@ -126,7 +166,11 @@ class SqliteDnsCache(DnsCache):
         if payload:
             try:
                 soa, _ = DnsRecord.parse(bytes(payload), 0)
-            except Exception:
+            except (DnsPacketParseError, struct.error, IndexError) as exc:
+                # A row this parser cannot read means a truncated write or a DB
+                # from an older build. Degrade to "negative entry without SOA",
+                # which costs a re-query, rather than failing the lookup outright.
+                LOGGER.debug("cache_soa_undecodable(err=%s)", exc)
                 soa = None
         return NegativeEntry(name, qtype, qclass, rcode, soa, expires_at)
 

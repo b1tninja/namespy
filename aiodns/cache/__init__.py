@@ -69,11 +69,9 @@ class PositiveEntry(CacheEntry):
         self.authoritative = bool(authoritative)
 
     def __repr__(self):
-        return "<PositiveEntry %s/%s n=%d aa=%s>" % (
-            self.name,
-            self.qtype,
-            len(self.records),
-            self.authoritative,
+        return (
+            f"<PositiveEntry {self.name}/{self.qtype} "
+            f"n={len(self.records)} aa={self.authoritative}>"
         )
 
 
@@ -97,7 +95,7 @@ class NegativeEntry(CacheEntry):
         self.soa = soa
 
     def __repr__(self):
-        return "<NegativeEntry %s/%s rcode=%s>" % (self.name, self.qtype, self.rcode)
+        return f"<NegativeEntry {self.name}/{self.qtype} rcode={self.rcode}>"
 
 
 class DnsCache(ABC):

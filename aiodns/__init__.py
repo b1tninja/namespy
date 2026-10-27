@@ -90,6 +90,6 @@ __all__ = [
     "IP_MTU_DISCOVER",
     "IP_PMTUDISC_DO",
     "PMTUD_SUPPORTED",
-    "console",
     "__version__",
+    "console",
 ]

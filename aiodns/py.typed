@@ -1,0 +1,3 @@
+# Marker file for PEP 561: this package ships inline type hints and third-party
+# type checkers should use them. Declared as a build artifact in pyproject.toml
+# because hatchling's default excludes come from .gitignore.

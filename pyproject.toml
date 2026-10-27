@@ -1,17 +1,67 @@
+[build-system]
+# Declared explicitly rather than relying on pip's legacy setuptools fallback:
+# without a build-system table, pip injects an unpinned setuptools+wheel
+# environment, so builds are neither reproducible nor hermetic.
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
 [project]
 name = "aiodns-dnspy"
-version = "0.0.0"
-description = "asyncio DNS library (modernized from dnspy aiodns)"
+dynamic = ["version"]
+description = "Asyncio DNS library: iterative resolver, wire codec, and inspection CLI"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+keywords = ["dns", "asyncio", "resolver", "recursive", "dnssec-adjacent", "wire-format"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: Name Service (DNS)",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
 dependencies = []
 
 [project.optional-dependencies]
 dev = [
   "pytest",
   "pytest-asyncio",
+  "pytest-cov",
+  "hypothesis",
   "ruff",
+  "mypy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/b1tninja/DNSpy"
+Repository = "https://github.com/b1tninja/DNSpy"
+Issues = "https://github.com/b1tninja/DNSpy/issues"
+Changelog = "https://github.com/b1tninja/DNSpy/blob/master/CHANGELOG.md"
+
+[project.scripts]
+# The CLI is the reason most people find this repo; making it an entry point
+# means `pip install aiodns-dnspy` alone gives you `dnspy example.com`.
+dnspy = "aiodns.__main__:main"
+
+[tool.hatch.version]
+# Single source of truth: the distribution version is read from the package, so
+# a release bump is one edit rather than two that can drift apart.
+path = "aiodns/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aiodns"]
+
+[tool.hatch.build]
+# Root hints are data, not code, and are read via importlib.resources. Named
+# explicitly because hatchling's default excludes come from .gitignore, which
+# ignores a *working-tree* named.root -- without this the wheel would ship a
+# resolver with no starting point.
+artifacts = ["aiodns/named.root", "aiodns/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -19,17 +69,69 @@ testpaths = ["tests"]
 # async test cannot be silently skipped the way an unmarked one would be.
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["aiodns"]
+branch = true
+
+[tool.coverage.report]
+# A floor, not a target: it exists so CI notices a module losing its tests,
+# which is the failure mode a parser-heavy library has to watch for.
+#
+# Set just under the measured total (69.7%) rather than at a round aspirational
+# number, because a gate that fails on arrival gets ignored, and an ignored gate
+# protects nothing. server.py and __main__.py are at 0% and are what has to rise
+# before this can move up; ratchet it in step with tests, never ahead of them.
+fail_under = 68
+show_missing = true
+exclude_lines = [
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "pragma: no cover",
+]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B"]
+select = ["E", "W", "F", "I", "B", "N", "UP", "SIM", "C4", "PT", "RUF", "S", "RET", "ARG"]
 ignore = [
   "E501", # line length handled by formatter / pragmatic
+  "S101", # asserts belong in tests, and this repo has a deliberate policy on them
+  "S104", # the bundled test server is documented loopback-only; binding is the operator's choice
+  "SIM105", # contextlib.suppress would hide which exception is being ignored in hot paths
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# S101: the repo's policy is that assert belongs in tests and nowhere on a wire
+# path. S311: a seeded random.Random is a deterministic test generator, not a
+# token. ARG001/ARG002: a test double has to implement the real signature, so an
+# unused parameter in a fake transport is the fake being correct, not dead code.
+# SIM300: tests state "actual == expected" on purpose, because that is how the
+# failure reads when it fires; ruff reads an enum member as a constant and wants
+# it on the left, which would invert every assertion in the suite for style.
+"tests/*" = ["S101", "S106", "S311", "ARG001", "ARG002", "SIM300"]
+# The message and RDATA codecs mirror the wire format's own vocabulary: the
+# header fields are ID/QR/OPCODE/AA/TC/RD/RA/Z/RCODE/QDCOUNT... and the RR
+# classes are named after the mnemonics in the registry (RData_SOA, RData_AAAA).
+# Renaming them to satisfy PEP 8 would break the one-to-one correspondence with
+# RFC 1035 section 4.1.1 and RFC 3597 section 5 that makes this code auditable
+# against the spec, so the naming exception is scoped to exactly these modules.
+"aiodns/packet.py" = ["N801", "N802", "N803", "N806"]
+"aiodns/rdata.py" = ["N801", "N802", "N806"]
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# Advisory for now: the modules gained type hints unevenly, so failing CI on
+# this would block unrelated work. Tighten to strict per-module as they clear.
+ignore_missing_imports = true
+
