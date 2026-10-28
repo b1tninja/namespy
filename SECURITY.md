@@ -8,9 +8,11 @@ must survive.
 
 ## Reporting a vulnerability
 
-Email the maintainer, or open a [private security advisory][advisory] on GitHub
-rather than a public issue. There is no NDA and no embargo period imposed — the
-expectation is simply that a fix exists before details are public.
+Open a [private security advisory][advisory] on GitHub rather than a public
+issue; that is the only contact route this repository actually guarantees,
+since no address is published here. There is no NDA and no embargo period
+imposed — the expectation is simply that a fix exists before details are
+public.
 
 [advisory]: https://github.com/b1tninja/DNSpy/security/advisories/new
 

@@ -1,0 +1,73 @@
+name: Bug report
+description: A crash, a wrong answer, or a divergence from a DNS specification
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        DNS bugs are usually invisible without the bytes. If something parsed
+        wrong, crashed, or produced an unexpected answer, **include the packet**
+        as a hex string — that single thing decides whether the report is
+        actionable.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - Wire parsing (a crash or a wrong decode)
+        - Resolver behaviour (referrals, caching, aliases, glue)
+        - Server (`--serve`)
+        - CLI output
+        - Packaging / install
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: >
+        For a parsing bug, paste the datagram as hex (`data.hex()`), plus the
+        offset in the error if one was raised. For a resolver bug, `dnspy
+        --trace NAME` and the resulting `last_resolution.md` are usually enough
+        on their own.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Shortest reproduction
+      description: >
+        A few lines that show it, run against a clean checkout. Please prefer
+        `pip install -e ".[dev]"` at the commit you tested over a released
+        version, since this repository is not on PyPI.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Specification
+      description: >
+        If you know which section this violates, cite it — e.g. "RFC 9267
+        section 5: RDLENGTH must be checked before the RDATA is read". If you do
+        not know, leave this empty and say so; guessing is still useful.
+      placeholder: RFC nnnn section n.n
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and whether you ran with `-O` / `PYTHONOPTIMIZE`
+      placeholder: Windows 11, Python 3.12.7, no -O
+    validations:
+      required: true
+  - type: checkboxes
+    id: gates
+    attributes:
+      label: Checked the local gates?
+      description: These are the exact commands CI runs, so failing them here saves a round trip.
+      options:
+        - label: "`pytest -q` passes on a clean checkout"
+        - label: "`python -O -m pytest -q` also passes (assertions stripped)"
+        - label: "`ruff check .` and `mypy aiodns` are clean"

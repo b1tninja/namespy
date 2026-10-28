@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security issue
+    url: https://github.com/b1tninja/DNSpy/security/advisories/new
+    about: >
+      Parser and resolver bugs are often remotely reachable from one malformed
+      datagram. Please use a private advisory, not a public issue — see
+      SECURITY.md.
+  - name: Spec and design questions
+    url: https://github.com/b1tninja/DNSpy/discussions
+    about: >
+      "Should this reject or tolerate that label?" and similar questions are
+      about which RFC reading we adopt. docs/rfc-map.md records the current
+      reading; a discussion is the right place to argue with it.
