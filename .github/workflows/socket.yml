@@ -1,0 +1,37 @@
+name: Socket
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: socket-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firewall:
+    name: Screen dependency installs (Socket Firewall)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # setup-python deliberately comes *before* Socket (per Socket's own
+      # ordering guidance) and the pip step deliberately does not use
+      # actions/setup-python's cache: a cached wheel install never talks to
+      # the index, so nothing gets screened and the job would green-light a
+      # compromised release.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      # Pinned to the immutable tag Socket's own docs recommend; Dependabot
+      # (github-actions ecosystem) keeps it current.
+      - uses: SocketDev/action@v1.3.2
+        with:
+          mode: firewall-free
+      # The point of the job: every dev dependency crosses the firewall on
+      # its way in. The library has no runtime dependencies to screen; the
+      # dev extra is the real attack surface.
+      - run: sfw pip install -e ".[dev]"
