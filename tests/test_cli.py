@@ -221,9 +221,9 @@ def test_record_row_uses_class_mnemonic_for_unknown_classes():
 
 
 def _response_with_opt():
-    # OPT's TTL is EXTENDED-RCODE (8) | FLAGS (16) | reserved (8), so this says
-    # "extended rcode 1" (BADVERS) with AD set -- a response no 4-bit header
-    # could express on its own.
+    # OPT's TTL is EXTENDED-RCODE | VERSION over FLAGS | Z, so this says
+    # "extended rcode 1" (BADVERS), version 0, with AD set -- a response no
+    # 4-bit header could express on its own.
     opt = DnsRecord(
         DomainName.root_label(),
         DnsRType.OPT,

@@ -55,7 +55,15 @@ from . import enable_path_mtu_discovery
 from .cache import MemoryDnsCache, NegativeEntry, PositiveEntry
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
-from .packet import DnsPacket, DnsPacketParseError, DnsQuestion, DnsRecord, Query, Response
+from .packet import (
+    OPT_RTYPE,
+    DnsPacket,
+    DnsPacketParseError,
+    DnsQuestion,
+    DnsRecord,
+    Query,
+    Response,
+)
 from .rdata import RData_A, RData_AAAA, type_name_of
 from .trace import Trace
 
@@ -86,6 +94,15 @@ MAX_ALIAS_HOPS = 16
 # caller's outer timeout fires. BIND uses 1.5--5 s initially; we pick 5 s.
 QUERY_TIMEOUT_S = 5.0
 
+#: EDNS(0) payload advertised on outbound queries (RFC 6891 section 6.2.3).
+#: The document calls "between 1280 and 1410 bytes for IP (v4 or v6) over
+#: Ethernet" reasonable; 1232 is 1280 -- IPv6's guaranteed minimum link MTU
+#: (RFC 8200 section 5) -- minus the 40-octet IPv6 header and the 8-octet
+#: UDP header, so an answer at the full advertised size fragments on
+#: neither stack. 0 disables EDNS and returns every answer to the 512-octet
+#: ceiling of RFC 1035 section 4.2.1.
+EDNS_PAYLOAD_SIZE = 1232
+
 
 class Resolver(asyncio.Protocol):
     """Send queries to authoritative servers and match the answers.
@@ -110,6 +127,10 @@ class Resolver(asyncio.Protocol):
     max_hops = MAX_HOPS
     max_alias_hops = MAX_ALIAS_HOPS
     max_depth = MAX_DEPTH
+
+    #: UDP payload advertised by the EDNS(0) OPT record on every outbound
+    #: query (RFC 6891 section 6.2.3); ``0`` or ``None`` sends no OPT at all.
+    edns_payload_size = EDNS_PAYLOAD_SIZE
 
     #: Optional DNS suffix the resolver assumes for *relative* names — those
     #: whose presentation form does not end in the root terminator (``.``).
@@ -138,6 +159,13 @@ class Resolver(asyncio.Protocol):
                 f"{len(bytes(address_record.rdata))} octet(s)"
             )
         dns_packet = Query(questions=questions, **kwargs)
+        if self.edns_payload_size:
+            # RFC 6891 and the practice behind DNS Flag Day: an EDNS-aware
+            # requestor advertises OPT on *every* query rather than probing
+            # selectively, so the responder never has to guess and the
+            # 512-octet truncation regime becomes the fallback rather than
+            # the default.
+            dns_packet.add_edns(self.edns_payload_size)
         # RFC 7766 section 6 / RFC 5936: AXFR is a TCP-only operation, and a UDP
         # attempt would be answered with a truncated or refused reply rather
         # than a zone transfer.
@@ -170,19 +198,65 @@ class Resolver(asyncio.Protocol):
             if transport_v6 is None or queue_v6 is None:
                 future.cancel()
                 return None
-
-            queue_v6[key] = (dns_packet, future)
             # On Windows, IPv6 sendto expects the full 4-tuple (host, port, flowinfo, scopeid).
-            transport_v6.sendto(bytes(dns_packet), (ip.exploded, 53, 0, 0))
-            return await self._await_udp(future, key, dns_packet, ip, queue=queue_v6)
-
-        if not isinstance(ip, ipaddress.IPv4Address):
+            transport, queue, sendto_addr = transport_v6, queue_v6, (ip.exploded, 53, 0, 0)
+        elif isinstance(ip, ipaddress.IPv4Address):
+            transport, queue, sendto_addr = self.transport, self.queue, (ip.exploded, 53)
+        else:
             future.cancel()
             return None
 
-        self.queue[key] = (dns_packet, future)
-        self.transport.sendto(bytes(dns_packet), (ip.exploded, 53))
-        return await self._await_udp(future, key, dns_packet, ip)
+        # Two attempts at most. The second exists only for the RFC 6891
+        # section 6.2.2 fallback -- "If a requestor detects that the remote
+        # end does not support EDNS(0), it MAY issue queries without an OPT
+        # record" -- and is taken only when the first answer actually said so
+        # (see _edns_rejected). The pending key cannot shift between
+        # attempts: it is built from the transaction ID and the question,
+        # and dropping the OPT record alters neither.
+        for attempt in (1, 2):
+            if attempt == 2:
+                future = asyncio.get_running_loop().create_future()
+                self.log.debug("resolver_edns_fallback(dst=%s id=%s)", ip.exploded, dns_packet.ID)
+            queue[key] = (dns_packet, future)
+            transport.sendto(bytes(dns_packet), sendto_addr)
+            response = await self._await_udp(future, key, dns_packet, ip, queue=queue)
+            if response is None or attempt == 2 or not self._edns_rejected(dns_packet, response):
+                return response
+            dns_packet.remove_edns()
+        # Unreachable: attempt 2 always returns above, so the loop is
+        # exhaustive by construction. Spelled out so the invariant survives a
+        # future edit that might otherwise let a fall-through return a future
+        # that was never resolved.
+        return None
+
+    @staticmethod
+    def _edns_rejected(dns_packet, response) -> bool:
+        """True when *response* says the OPT sent in *dns_packet* was not honored.
+
+        RFC 6891 section 7 gives a non-EDNS responder exactly one legal way
+        to say so: "Responders that choose not to implement the protocol
+        extensions defined in this document MUST respond with a return code
+        (RCODE) of FORMERR to messages containing an OPT record in the
+        additional section and MUST NOT include an OPT record in the
+        response." A FORMERR that *does* carry an OPT is the other event
+        section 7 defines -- "a problem with processing the OPT record
+        itself ... the response MUST include an OPT record" -- and since the
+        OPT built here is empty and machine-generated, treating that as
+        non-support would paper over a real protocol event instead of
+        reporting it.
+
+        BADVERS (section 6.1.3) rejects the EDNS VERSION rather than the
+        mechanism, and NOTIMP is what ossified middleboxes answer an OPT
+        query with; both also force the unextended retry, which is the only
+        remedy section 6.2.2 offers and is harmless when the answer was
+        about something else -- the re-ask gets the same RCODE without EDNS.
+        """
+        if dns_packet.opt() is None:
+            return False
+        rcode = int(response.extended_rcode)
+        if rcode in (int(DnsResponseCode.BADVERS), int(DnsResponseCode.NOT_IMPLEMENTED)):
+            return True
+        return rcode == int(DnsResponseCode.FORMAT_ERROR) and response.opt() is None
 
     async def _await_udp(self, future, key, dns_packet, ip, *, queue=None):
         """Await one UDP response, retrying over TCP when UDP could not carry it.
@@ -193,10 +267,11 @@ class Resolver(asyncio.Protocol):
           section 4.2.2 makes TCP the fallback transport for exactly that case.
         * **``TC`` set.** RFC 1123 section 6.1.3.2: "If the Answer section of the
           response is truncated and if the requester supports TCP, it SHOULD try
-          the query again using TCP."  Truncation is routine rather than exotic
-          here, because this library does not yet advertise EDNS(0) and is
-          therefore confined to 512-octet replies (RFC 1035 section 4.2.1) -- a
-          root ``.`` NS answer with glue is already bigger than that.
+          the query again using TCP."  Outbound queries advertise EDNS(0), so
+          the 512-octet regime of RFC 1035 section 4.2.1 is no longer the
+          default -- but truncation stays reachable: servers that ignore
+          EDNS, middleboxes that strip OPT, and answers genuinely bigger than
+          the advertised payload all still set the bit.
 
         A truncated response is never returned, even when the TCP retry also
         fails.  RFC 1123 section 6.1.3.2 forbids it outright -- "Truncated
@@ -1251,7 +1326,11 @@ def _write_cache(cache, sname, terminal_event, response):
         return
     now = cache.time_fn()
     if isinstance(terminal_event, Answer):
-        records = list(terminal_event.records)
+        # RFC 6891 section 6.2.1: "The OPT record MUST NOT be cached, and
+        # MUST NOT be treated as a normal RRset while caching." This resolver
+        # never asks QTYPE=OPT, but resolve_steps is public and a diagnostic
+        # caller can; the cache is where that has to bounce.
+        records = [r for r in terminal_event.records if int(r.rtype) != OPT_RTYPE]
         if not records:
             return
         ttl = min(int(getattr(r, "ttl", 0) or 0) for r in records)
@@ -1441,6 +1520,7 @@ class RecursiveResolver(Resolver):
         max_depth: int = MAX_DEPTH,
         max_alias_hops: int = MAX_ALIAS_HOPS,
         query_timeout: float = QUERY_TIMEOUT_S,
+        edns_payload_size: int | None = EDNS_PAYLOAD_SIZE,
     ):
         """Build a resolver without touching the network.
 
@@ -1451,6 +1531,12 @@ class RecursiveResolver(Resolver):
             error rather than a licence to fetch: silently downloading during
             ``__init__`` also wrote a file into the current working directory.
         :param query_timeout: seconds per UDP attempt (and per TCP phase).
+        :param edns_payload_size: UDP payload advertised by the EDNS(0) OPT
+            record on every outbound query (RFC 6891 section 6.2.3). ``0`` or
+            ``None`` sends no OPT at all -- the pre-EDNS behaviour, still
+            occasionally wanted against ossified infrastructure, though the
+            section 6.2.2 fallback already handles the servers that would
+            otherwise need it.
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
         """
         self.queue: dict[tuple, tuple] = {}
@@ -1462,6 +1548,7 @@ class RecursiveResolver(Resolver):
         self.max_depth = max(1, int(max_depth))
         self.max_alias_hops = max(1, int(max_alias_hops))
         self.query_timeout = max(0.05, float(query_timeout))
+        self.edns_payload_size = 0 if edns_payload_size is None else max(0, int(edns_payload_size))
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None

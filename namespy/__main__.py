@@ -19,7 +19,7 @@ from .enums import (
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsQuestion, Query
 from .rdata import generic_presentation, type_name_of
-from .resolver import RecursiveResolver
+from .resolver import EDNS_PAYLOAD_SIZE, RecursiveResolver
 from .server import DnsServer
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
@@ -358,6 +358,12 @@ def build_parser():
         default=LOOKUP_TIMEOUT_S,
         help="overall lookup timeout in seconds (default: %(default)s)",
     )
+    p.add_argument(
+        "--no-edns",
+        action="store_true",
+        help="do not advertise EDNS(0) on outbound queries; caps answers at "
+        "512 octets and forces TCP for anything larger (RFC 6891)",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="enable INFO-level logging")
     p.add_argument("--debug", action="store_true", help="enable DEBUG-level logging")
     return p
@@ -371,6 +377,7 @@ async def cli_query(args) -> int:
         lambda: RecursiveResolver(
             root_hints_path=args.root_hints,
             dns_suffix=args.dns_suffix,
+            edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -412,6 +419,7 @@ async def serve(args) -> int:
             lambda: RecursiveResolver(
                 root_hints_path=args.root_hints,
                 dns_suffix=args.dns_suffix,
+                edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
             ),
             local_addr=("0.0.0.0", 0),
         )

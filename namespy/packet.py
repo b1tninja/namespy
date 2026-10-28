@@ -392,17 +392,34 @@ class DnsPacket:
         if record is None:
             return int(self.RCODE)
         extended = (int(record.ttl) >> 24) & 0xFF
-        return (extended << 4) | (int(self.RCODE) & 0xF)
+        if (header := int(self.RCODE)) > 0xF:
+            # An in-memory packet can hold the effective code directly in
+            # RCODE -- __bytes__ splits it across header and OPT on the way
+            # out. Folding would mask the upper nibble away and report the
+            # wrong code for an object that was never serialized.
+            return header
+        return (extended << 4) | (header & 0xF)
 
     @property
     def ad(self) -> bool:
-        """Authentic Data -- EDNS(0) FLAGS bit 15 (RFC 6891 section 6.1.2)."""
+        """Authentic Data (DO) -- OPT FLAGS bit 15 (RFC 6891 sections 6.1.3-6.1.4).
+
+        OPT's TTL reads as EXTENDED-RCODE (bits 24-31) | VERSION (bits 16-23)
+        | FLAGS (bits 0-15); DO is the flags field's own bit 15. (The section
+        6.1.3 drawing shows octet 2 as ``DO|Z`` -- octet 2 *begins* with DO
+        and Z fills the rest, so DO lands on TTL bit 15, which is also what
+        ``dig +dnssec`` puts in its QUERY MESSAGE OPT hdrlen field.)
+        """
         record = self.opt()
         return record is not None and bool(int(record.ttl) & (1 << 15))
 
     @property
     def cd(self) -> bool:
-        """Checking Disabled -- EDNS(0) FLAGS bit 14 (RFC 6891 section 6.1.2)."""
+        """Checking Disabled -- OPT FLAGS bit 14 (RFC 6891 section 6.1.3, RFC 6955 section 4).
+
+        Same FLAGS-in-low-16-bits layout as :attr:`ad`; CD is the flags
+        field's bit 14.
+        """
         record = self.opt()
         return record is not None and bool(int(record.ttl) & (1 << 14))
 
@@ -411,6 +428,70 @@ class DnsPacket:
         """OPT's CLASS field: the sender's UDP payload size in octets."""
         record = self.opt()
         return None if record is None else int(record.rclass)
+
+    @property
+    def edns_version(self) -> int | None:
+        """OPT's VERSION octet (RFC 6891 section 6.1.3), or ``None``.
+
+        "the VERSION of each response SHOULD be the highest implementation
+        level of the responder" — so this teaches a requestor what the far
+        end supports on every response, not only alongside ``BADVERS``.
+        """
+        record = self.opt()
+        return None if record is None else (int(record.ttl) >> 16) & 0xFF
+
+    #: RFC 6891 section 6.2.3: "Values lower than 512 MUST be treated as
+    #: equal to 512."
+    EDNS_MINIMUM_PAYLOAD = 512
+
+    def add_edns(self, payload_size: int = 1232, *, version: int = 0, flags: int = 0):
+        """Attach an EDNS(0) OPT record, replacing any previous one.
+
+        The pseudo-record (RFC 6891 section 6.1.2) is deliberately minimal:
+        NAME the root, TYPE 41, CLASS the requestor's UDP payload size, and a
+        TTL laid out per section 6.1.3 as EXTENDED-RCODE (bits 24-31) |
+        VERSION (bits 16-23) | FLAGS (bits 0-15, DO = bit 15, section 6.1.4)
+        -- with empty RDATA
+        because no EDNS option is signalled. That is eleven octets on the
+        wire, the whole price of lifting the 512-octet answer ceiling of RFC
+        1035 section 4.2.1.
+
+        *payload_size* is clamped up to 512 per section 6.2.3; the caller —
+        not this method — owns the opposite duty, not to advertise more than
+        its stack can actually reassemble.
+
+        Returns ``self`` so a caller can write ``Query(...)
+        .add_edns(1232)``; mutating rather than copying because the message
+        is already being built in place by ``Query``'s caller.
+        """
+        payload_size = max(self.EDNS_MINIMUM_PAYLOAD, int(payload_size))
+        ttl = ((int(version) & 0xFF) << 16) | (int(flags) & 0xFFFF)
+        # Rebuild rather than mutate the list in place: the constructor may
+        # have been handed a list the caller still holds.
+        self.additional_records = [
+            record for record in self.additional_records if int(record.rtype) != OPT_RTYPE
+        ]
+        self.additional_records.append(DnsRecord(DomainName("."), OPT_RTYPE, payload_size, ttl))
+        self.ARCOUNT = len(self.additional_records)
+        return self
+
+    def remove_edns(self) -> bool:
+        """Drop any OPT record; ``True`` when one was present.
+
+        This is the mechanical half of the RFC 6891 section 6.2.2 fallback:
+        once a requestor "detects that the remote end does not support
+        EDNS(0), it MAY issue queries without an OPT record". Section 7 makes
+        the absence meaningful in the other direction too — a message with
+        no OPT tells the responder "the requestor does not implement any
+        part of this specification", which is exactly what a re-ask to a
+        server that just rejected EDNS needs to say.
+        """
+        kept = [record for record in self.additional_records if int(record.rtype) != OPT_RTYPE]
+        removed = len(kept) != len(self.additional_records)
+        if removed:
+            self.additional_records = kept
+            self.ARCOUNT = len(kept)
+        return removed
 
     # ---------------------------------------------------------------- output
 

@@ -299,7 +299,7 @@ def _with_opt(*records, ttl: int, rcode: int = 0) -> bytes:
 
 
 def test_opt_ad_flag_and_payload_size() -> None:
-    """RFC 6891 section 6.1.2: FLAGS live in OPT's TTL, CLASS carries the size."""
+    """RFC 6891 sections 6.1.3-6.1.4: FLAGS live in OPT's TTL low half, CLASS carries the size."""
     parsed, _ = DnsPacket.parse(_with_opt(ttl=1 << 15))
     assert parsed.opt() is not None
     assert parsed.ad

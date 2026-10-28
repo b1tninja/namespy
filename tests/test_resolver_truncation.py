@@ -14,9 +14,12 @@ not cache a possibly partial set of RRs."  Once stored, a partial RRset is
 indistinguishable from a complete one, so a single truncated answer would be
 served to every later client as though it were the whole RRset.
 
-Truncation is not a corner case for this library.  It does not yet advertise
-EDNS(0), so replies are confined to 512 octets (RFC 1035 section 4.2.1) and a
-root ``.`` NS answer carrying glue is already larger than that.
+Truncation was the routine case while this library sent no EDNS(0): replies
+were confined to 512 octets (RFC 1035 section 4.2.1) and a root ``.`` NS answer
+carrying glue is already larger than that.  Outbound queries now advertise
+EDNS(0), so the bit marks the servers that ignore EDNS, the middleboxes that
+strip OPT, and answers genuinely larger than the advertised payload -- all
+still reachable, none still the default.
 
 These tests drive :meth:`Resolver.query` with a recording transport and a stubbed
 :meth:`Resolver._query_tcp`, because what is under test is the decision between
@@ -111,13 +114,16 @@ class TcpStub:
 @pytest.mark.asyncio
 async def test_truncated_udp_answer_is_retried_over_tcp():
     resolver = make_resolver()
-    tcp = TcpStub("tcp-answer")
+    # TcpStub replaces _query_tcp, whose contract is "the parsed Response that
+    # TCP delivered" -- so the stand-in must be one, not a string marker.
+    tcp_answer = Response(ID=0, QR=DnsQR.RESPONSE, RA=True)
+    tcp = TcpStub(tcp_answer)
     resolver._query_tcp = tcp
 
     task, sent_query, future = await start_query(resolver)
     future.set_result(answer_for(sent_query, tc=True))
 
-    assert await task == "tcp-answer"
+    assert await task is tcp_answer
     assert [host for host, _wire, _pkt in tcp.calls] == [NS_IP.exploded]
 
 
@@ -129,7 +135,7 @@ async def test_tcp_retry_asks_the_same_question():
     would quietly answer a different question than the one that was asked.
     """
     resolver = make_resolver()
-    tcp = TcpStub("tcp-answer")
+    tcp = TcpStub(Response(ID=0, QR=DnsQR.RESPONSE, RA=True))
     resolver._query_tcp = tcp
 
     task, sent_query, future = await start_query(resolver)
@@ -176,7 +182,8 @@ async def test_truncated_answer_is_not_returned_when_tcp_fails():
 async def test_udp_timeout_falls_back_to_tcp():
     resolver = make_resolver()
     resolver.query_timeout = 0.01
-    tcp = TcpStub("tcp-answer")
+    tcp_answer = Response(ID=0, QR=DnsQR.RESPONSE, RA=True)
+    tcp = TcpStub(tcp_answer)
     resolver._query_tcp = tcp
 
     task = asyncio.get_running_loop().create_task(
@@ -184,7 +191,7 @@ async def test_udp_timeout_falls_back_to_tcp():
     )
     await asyncio.sleep(0)
 
-    assert await task == "tcp-answer"
+    assert await task is tcp_answer
     assert tcp.calls, "a UDP timeout must try TCP (RFC 1035 section 4.2.2)"
 
 

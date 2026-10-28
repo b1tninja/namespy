@@ -20,7 +20,8 @@ registry lists it at 25, and that is what is used here.
 **QTYPE is a superset of RTYPE.** ``AXFR``, ``MAILB``, ``MAILA`` and ``ANY``
 (252-255) are query-only pseudo-types (RFC 1035 sections 3.2.3 and 6). ``OPT``
 (41) is different in kind: IANA lists it in the RR TYPEs registry, so a receiver
-must be able to decode it, but RFC 6891 section 6.3 forbids storing it -- the
+must be able to decode it, but RFC 6891 section 6.2.1 forbids storing it ("The
+OPT record MUST NOT be cached") -- the
 restriction is on the cache and answer path, not on the type space. Both enums
 are written out explicitly rather than derived from one another so type
 checkers can resolve ``DnsRType.SOA``; ``test_enums.py`` asserts the
