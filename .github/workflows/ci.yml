@@ -24,7 +24,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
@@ -61,7 +61,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -81,7 +81,7 @@ jobs:
       - name: pytest under -O (assertions stripped)
         run: python -O -m pytest -q -p no:cacheprovider
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: pytest-${{ matrix.os }}-py${{ matrix.python-version }}
@@ -94,7 +94,7 @@ jobs:
     name: Build and audit distributions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
@@ -115,7 +115,7 @@ jobs:
           /tmp/verify/bin/python -m pip install --no-deps dist/*.whl
           cd /
           /tmp/verify/bin/python -c "import namespy, importlib.resources as r; print(len(r.files('namespy').joinpath('named.root').read_text().splitlines()), 'root hint lines')"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
