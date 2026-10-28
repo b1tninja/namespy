@@ -402,40 +402,6 @@ class Resolver(asyncio.Protocol):
                 # close) must not turn a good response into an error.
                 self.log.debug("resolver_tcp_close_failed(err=%s)", type(exc).__name__)
 
-    @staticmethod
-    def enumerate_nameserver_addresses(nameserver_records, additional_records):
-        """Yield (NS record, address record) pairs, shuffled.
-
-        The shuffle is not cosmetic. RFC 8106 section 2 and RFC 1034 section 5.3.3
-        both assume a resolver will try *several* servers rather than the first one
-        listed; without the shuffle, every resolver using this library hammers the
-        same root server -- ``a.root-servers.net`` is first in ``named.root`` --
-        which is both a self-inflicted denial-of-service risk and a way to make
-        one server's outage look like global DNS failure.
-
-        Non-NS nameserver records and non-address glue are skipped rather than
-        raising: a response carries the additional section as a convenience, so it
-        legitimately contains RRs that are not glue.
-        """
-        nameserver_records = list(nameserver_records)
-        additional_records = list(additional_records)
-        random.shuffle(nameserver_records)
-        random.shuffle(additional_records)
-
-        for nameserver_record in nameserver_records:
-            if not isinstance(nameserver_record, DnsRecord):
-                continue
-            if nameserver_record.rtype != DnsRType.NS:
-                continue
-            for address_record in additional_records:
-                if not isinstance(address_record, DnsRecord):
-                    continue
-                if address_record.name == nameserver_record.rdata and address_record.rtype in (
-                    DnsRType.A,
-                    DnsRType.AAAA,
-                ):
-                    yield (nameserver_record, address_record)
-
 
 # RFC 1034 §5.3.2 resolver state.
 #

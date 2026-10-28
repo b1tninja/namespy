@@ -185,6 +185,14 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Removed
 
+- `RecursiveResolver.enumerate_nameserver_addresses()`, an undocumented public
+  static helper with no callers and no tests. It paired every NS in a referral
+  with any address record in the additional section that shared its name, with
+  no zone context and therefore no way to apply the bailiwick rule above -- in
+  other words, a ready-made way to reintroduce the bug that was just fixed.
+  `classify()` is where a referral is consumed and it performs the check; a
+  caller that needs the shuffled-server behaviour is served by `Slist`, which
+  already shuffles its candidates (RFC 8106 section 2).
 - `namespy/dns.py` (empty), `Forwarder` (a constructor that did nothing), the
   unreachable `self.resolver.db` references, and the committed `dns.sql` /
   `database.png` scratch — legacy SQL notes moved to `docs/legacy/`.
@@ -204,5 +212,3 @@ Tracked honestly rather than as a promise — full list with reasons in
 - No DNSSEC validation, no serve-stale (RFC 8767), no IDN/punycode
   (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 / RFC 8484). QNAME
   minimisation (RFC 9156) ships opt-in — see *Added*.
-- No bailiwick filtering of glue and additional-section records (RFC 5625
-  section 2.5).
