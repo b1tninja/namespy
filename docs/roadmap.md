@@ -65,7 +65,10 @@ Shipped at `HEAD`; every row below is driven by `tests/test_edns.py`.
 | OPT replaces rather than stacks; removable; whole feature disableable (constructor knob + `--no-edns`) | design | ✅ | `test_add_edns_replaces_rather_than_stacks`, `test_edns_can_be_disabled_whole` |
 | EDNS **options** (option-code/length TLVs): NSID (5001), COOKIE (7873), Padding (7830) | §6.1.2, 5001, 7873, 7830 | ⬜ | roadmap P1 — OPT RDATA is written empty and read opaquely |
 | Per-server payload adaptation to the responder's advertised CLASS | §6.2.3 (SHOULD) | ⬜ | roadmap P1 — advertised size is static today |
-| Responder-side duties: OPT in every response of an EDNS-aware server | §6.2.4 | ⬜ | roadmap P1 — the demo server ignores OPT; loopback-only, see §8 |
+| Extended RCODE on the way out: an effective code above 15 is split — low nibble in the header, upper eight stamped into the OPT TTL | §6.1.3 | ✅ | `test_an_extended_rcode_is_stamped_into_the_opt_that_carries_it` (the hand-stamped wire case stays pinned by `test_badvers_round_trips`) |
+| Responder-side duties: OPT in the response to an OPT query, carrying *this* server's payload size | §6.1.1, §6.2.4 | ✅ | `test_opt_in_the_query_buys_an_opt_of_our_own_in_the_reply`, `test_an_upstream_opt_is_never_forwarded_as_our_own` (`test_server.py`) |
+| No OPT for a requestor that did not ask; an extended RCODE it cannot be shown becomes SERVFAIL | §7 | ✅ | `test_unextended_query_is_answered_without_an_opt`, `test_an_upstream_opt_does_not_extend_an_unextended_client`, `test_an_extended_rcode_for_an_unextended_client_becomes_servfail` |
+| More than one OPT in a query → FORMERR before any resolution; a VERSION we do not implement → BADVERS with version 0 | §6.1.1, §6.1.3 | ✅ | `test_a_query_with_two_opt_records_is_formerr_before_any_work`, `test_an_unimplemented_edns_version_answers_badvers` |
 
 ## 4. Resolution — RFC 1034 §5.3.3
 
@@ -123,7 +126,8 @@ takes on are the ones that keep it from becoming a weapon.
 | Malformed datagrams dropped at `DEBUG`, never logged louder | 5358 §4.2 rationale | ✅ | `test_review_fixes.py` |
 | Concurrent lookups and task creation bounded; excess dropped silently | 5358 §4 (the bound itself is a design decision) | ✅ | `test_server.py`, `test_review_fixes.py` |
 | QDCOUNT ≠ 1 → FORMERR; unsupported OPCODE → NOTIMP, question echoed | 1035 §4.1, 5452 §9.1 | ✅ | `test_server.py` |
-| OPT echoed in responses; EDNS-aware responder | 6891 §6.2.4 | ⬜ | roadmap P1 — pairs with the §3 responder row |
+| OPT echoed in responses; EDNS-aware responder | 6891 §6.1.1, §6.2.4, §7 | ✅ | `test_server.py` (the EDNS section) — see §3 for the four obligations it pins |
+| Extended RCODE above 15 with no OPT to carry it becomes SERVFAIL rather than a masked code | 6891 §6.1.3, §7 | ✅ | `test_an_extended_rcode_for_an_unextended_client_becomes_servfail` |
 | Rate limiting, RRL, cache sharing | 5358 §3, 9085 §4 | ▫️ | non-goal — it is a test fixture, not a service; `SECURITY.md` says so |
 
 ## 9. Packaging and process
@@ -146,7 +150,7 @@ of code built on namespy, not by implementation cost.
 |---|---|---|---|---|
 | ~~P1~~ | ~~Bailiwick filter for out-of-zone glue~~ shipped | 5452 §6 | ✅ `classify` now accepts glue only for a name inside the answering zone or the zone it delegates | — |
 | **P1** | EDNS options TLV parse/emit, then per-server payload adaptation | 6891 §6.1.2/§6.2.3, 5001 | unlocks NSID for debugging; shrinks the truncation/TCP detour that dominates big answers | small–medium |
-| **P1** | Server echoes OPT; EDNS-aware responses | 6891 §6.2.4 | makes the demo server honest about what it claims on the wire | small |
+| ~~P1~~ | ~~Server echoes OPT; EDNS-aware responses~~ shipped | 6891 §6.1.1/§6.2.4/§7 | ✅ the demo server now answers extended queries with its own OPT, refuses a second OPT with FORMERR, answers an unknown VERSION with BADVERS, and keeps §7 silence for unextended requestors | — |
 | **P2** | ~~QNAME minimisation~~ shipped opt-in | 9156 | ✅ probe walk + descent integration; flipping the default is a field-behaviour decision, not a code one | — |
 | **P2** | IDNA/punycode | 5891/3492 | correctness for internationalised names; currently the caller's job | medium |
 | **P2** | Wildcard synthesis | 4592 | needed before results can claim RFC-identical semantics for `*.example` zones | medium |
@@ -156,6 +160,6 @@ of code built on namespy, not by implementation cost.
 | **P4** | DoT / DoH / DoQ | 7858/8484/9250 | transport security matters, but each is a new subsystem with its own failure modes | large |
 | — | Rate limiting / RRL for the server | 5358/9085 | ▫️ non-goal: loopback fixture, not a service | — |
 
-The three P1 items are small, self-contained, and each closes an obligation
-the surrounding code already cites — which makes them the natural next
-release.
+Two of the three original P1 items have shipped. What remains is the EDNS
+options TLV work — small and self-contained, and it closes an obligation the
+surrounding code already cites, which makes it the natural next release.

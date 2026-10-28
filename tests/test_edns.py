@@ -258,6 +258,20 @@ def test_badvers_round_trips() -> None:
     assert 0 == parsed.edns_version
 
 
+def test_an_extended_rcode_is_stamped_into_the_opt_that_carries_it() -> None:
+    # The mirror of test_badvers_round_trips, where the OPT was stamped by hand.
+    # Here nothing was: a packet holding the effective code in RCODE is what an
+    # error assembled in memory looks like, and serialising it has to move the
+    # upper eight bits into the OPT record -- otherwise only the header's low
+    # nibble reaches the wire and RCODE 23 (EXPIRED) reads as 7 (FORMERR).
+    response = Response(ID=1, QR=DnsQR.RESPONSE, RA=True, RCODE=23).add_edns(1232)
+    parsed, _ = DnsPacket.parse(bytes(response))
+    assert 23 == parsed.extended_rcode
+    assert 7 == int(parsed.RCODE), "the header field keeps only the low nibble"
+    assert 1232 == parsed.requestor_payload_size
+    assert 0 == parsed.edns_version, "stamping must not disturb VERSION"
+
+
 # --------------------------------------------------------------- cache safety
 
 

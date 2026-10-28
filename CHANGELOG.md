@@ -8,6 +8,25 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- The demo server is now an EDNS(0) responder (RFC 6891 §6.1.1, §6.1.3, §6.2.4,
+  §7). A query that carried an OPT gets one back carrying *this* server's
+  payload size — never the one the recursive walk collected, since §6.1.1
+  forbids forwarding OPT and its CLASS and FLAGS describe somebody else's
+  stack; a query that carried none gets none, which is what §7 requires of a
+  responder talking to a requestor that announced no EDNS at all. A query with
+  two OPT records is answered FORMERR before the resolver is touched, and a
+  VERSION this server does not implement is answered BADVERS with `version=0`
+  in the OPT — the number that tells the requestor how far down to go. Pinned
+  by the EDNS section of `tests/test_server.py`.
+- Serialising an effective RCODE above 15 now puts the upper eight bits in the
+  OPT record that carries them. A `Response` built in memory holds the whole
+  code in `RCODE`, and the wire writer shifted it by 4 — the shift in the
+  *effective*-RCODE formula, a different quantity — so it landed in VERSION
+  instead of EXTENDED-RCODE and `RCODE=23` (EXPIRED) reached the wire as 7
+  (FORMERR). `test_an_extended_rcode_is_stamped_into_the_opt_that_carries_it`
+  pins it; the hand-stamped wire-in direction was already pinned by
+  `test_badvers_round_trips`.
+
 - QNAME minimisation (RFC 9156), opt-in: `RecursiveResolver(qname_min=True)`
   or `namespy --qname-min`. Servers not known to be authoritative for the
   full name receive progressively deeper children — the section 2.3 probe

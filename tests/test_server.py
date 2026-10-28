@@ -20,6 +20,10 @@ the server is not tested against a mock of itself.
 * RFC 5625 section 6.2 (do not listen where you do not control the clients) and
   section 6.3 (malformed traffic may be dropped); the bound on concurrent
   upstream work is a design decision, not a specification number
+* RFC 6891 sections 6.1.1, 6.1.3, 6.2.4 and 7 (a response to an OPT query must
+  carry an OPT of the responder's own; one OPT per message, and never a
+  forwarded one; BADVERS for an unimplemented VERSION; no OPT for a requestor
+  that did not ask)
 """
 
 import asyncio
@@ -38,10 +42,10 @@ from namespy.enums import (
     DnsRType,
 )
 from namespy.names import DomainName
-from namespy.packet import DnsPacket, DnsQuestion, DnsRecord, Query, Response
+from namespy.packet import OPT_RTYPE, DnsPacket, DnsQuestion, DnsRecord, Query, Response
 from namespy.rdata import RData_A
 from namespy.resolver import RecursiveResolver
-from namespy.server import DnsServer
+from namespy.server import EDNS_VERSION_SUPPORTED, RESPONDER_PAYLOAD_SIZE, DnsServer
 
 HOST = DomainName("www.example.com.")
 HOST_IP = ipaddress.IPv4Address("93.184.216.34")
@@ -277,6 +281,163 @@ async def test_recursive_walk_result_is_relayed_end_to_end():
     # in the datagram that went out.
     assert resolver.last_trace is not None
     assert resolver.last_trace.events
+
+
+# ------------------------------------------------------- EDNS(0) on the way out
+#
+# RFC 6891 section 6.1.1 obliges a responder to answer an OPT-bearing query
+# with an OPT record of its own, section 7 forbids one for a query that had
+# none, section 6.1.1 also says OPT "MUST NOT be cached, forwarded", section
+# 6.1.1 demands FORMERR for a query carrying more than one, and section 6.1.3
+# demands BADVERS for a VERSION the responder does not implement. Each of those
+# sentences is a test below, plus the one case none of them covers: an extended
+# RCODE that the client cannot be shown.
+
+
+def opt_record(payload_size=1232, version=0, flags=0):
+    """A bare OPT pseudo-record to stitch into a stub resolver's reply."""
+    ttl = ((version & 0xFF) << 16) | (flags & 0xFFFF)
+    return DnsRecord(DomainName("."), OPT_RTYPE, payload_size, ttl)
+
+
+def stub_reply(packet, *, rcode=None, additional=()):
+    """A relay-shaped answer, optionally carrying an upstream server's OPT."""
+    return Response(
+        ID=packet.ID,
+        QR=DnsQR.RESPONSE,
+        RA=True,
+        RCODE=int(DnsResponseCode.NO_ERROR if rcode is None else rcode),
+        questions=list(packet.questions),
+        additional_records=list(additional),
+    )
+
+
+async def answer_with(resolver, reply_factory):
+    async def stub(packet):
+        return reply_factory(packet)
+
+    resolver.resolve = stub
+
+
+async def test_opt_in_the_query_buys_an_opt_of_our_own_in_the_reply() -> None:
+    """Section 6.1.1's MUST, and the OPT is *ours*: 4096 was the client's
+    number, the reply carries this host's reassembly limit (section 6.2.4)."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    query = query_packet().add_edns(4096)
+    server.datagram_received(bytes(query), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert reply.opt() is not None, "an extended requestor must get an OPT back"
+    assert RESPONDER_PAYLOAD_SIZE == reply.requestor_payload_size
+    assert EDNS_VERSION_SUPPORTED == reply.edns_version
+    assert 1 == sum(1 for r in reply.additional_records if int(r.rtype) == OPT_RTYPE)
+    assert reply.questions[0].name == HOST  # the question is still first, section 6.1.1
+
+
+async def test_unextended_query_is_answered_without_an_opt() -> None:
+    """Section 7: no OPT in the request means the requestor "does not implement
+    any part of this specification and ... the responder MUST NOT include an OPT
+    record in its response"."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(query_packet()), ADDR)
+    await drain(server)
+
+    assert transport.replies[0].opt() is None
+
+
+async def test_an_upstream_opt_is_never_forwarded_as_our_own() -> None:
+    """The recursive walk hands back the authoritative server's message, OPT and
+    all. Section 6.1.1: "OPT RRs MUST NOT be cached, forwarded" -- and its 512
+    and its DO bit describe that server, not this one."""
+    server, resolver, transport = make_server()
+    upstream = opt_record(512, flags=0x8000)  # small stack, DO set
+    await answer_with(resolver, lambda p: stub_reply(p, additional=[upstream]))
+
+    server.datagram_received(bytes(query_packet().add_edns(1232)), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert RESPONDER_PAYLOAD_SIZE == reply.requestor_payload_size, "the 512 was theirs"
+    assert not reply.ad, "a DO bit borrowed from an upstream answer claims nothing"
+    assert 1 == sum(1 for r in reply.additional_records if int(r.rtype) == OPT_RTYPE)
+
+
+async def test_a_query_with_two_opt_records_is_formerr_before_any_work() -> None:
+    # Section 6.1.1: an OPT RR MUST be the only one in the message, and a query
+    # with more than one MUST be answered FORMERR. Refused before the resolver
+    # is consulted, so a hostile datagram cannot purchase a recursive walk.
+    server, resolver, transport = make_server()
+    looked_up = []
+
+    async def stub(packet):
+        looked_up.append(packet)
+        return stub_reply(packet)
+
+    resolver.resolve = stub
+
+    # Both records go in through the constructor: `additional_records` hands
+    # back a copy, so appending to it would emit octets ARCOUNT does not count.
+    query = Query(
+        ID=0xABCD,
+        questions=[DnsQuestion(HOST, DnsQType.A, DnsQClass.IN)],
+        additional_records=[opt_record(1232), opt_record(512)],
+    )
+    server.datagram_received(bytes(query), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.FORMAT_ERROR) == int(reply.RCODE)
+    assert [] == looked_up
+    # The request was extended, so section 6.1.1's MUST still covers the error.
+    assert reply.opt() is not None
+
+
+async def test_an_unimplemented_edns_version_answers_badvers() -> None:
+    # Section 6.1.3: a responder that does not implement the requested VERSION
+    # MUST answer BADVERS, while the response OPT carries the highest level the
+    # responder does implement -- which is the whole point of the exchange.
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(query_packet().add_edns(1232, version=1)), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.BADVERS) == int(reply.extended_rcode)
+    assert EDNS_VERSION_SUPPORTED == reply.edns_version
+    assert 0 == int(reply.RCODE) & 0xF, "BADVERS is 16, so the header nibble stays clear"
+
+
+async def test_an_extended_rcode_reaches_an_extended_client() -> None:
+    # The upper eight bits only travel if the responder supplies the OPT that
+    # holds them (section 6.1.3's EXTENDED-RCODE field).
+    server, resolver, transport = make_server()
+    await answer_with(resolver, lambda p: stub_reply(p, rcode=23))
+
+    server.datagram_received(bytes(query_packet().add_edns(1232)), ADDR)
+    await drain(server)
+
+    assert 23 == int(transport.replies[0].extended_rcode)
+
+
+async def test_an_extended_rcode_for_an_unextended_client_becomes_servfail() -> None:
+    # No carrier, no message: section 7 forbids the OPT this client would need,
+    # and masking 23 down to its low nibble would report FORMERR for an answer
+    # that failed for an unrelated reason. SERVFAIL is the honest remainder.
+    server, resolver, transport = make_server()
+    await answer_with(resolver, lambda p: stub_reply(p, rcode=23, additional=[opt_record(4096)]))
+
+    server.datagram_received(bytes(query_packet()), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.SERVER_FAILURE) == int(reply.RCODE)
+    assert reply.opt() is None
 
 
 # ------------------------------------------------------- amplification defence

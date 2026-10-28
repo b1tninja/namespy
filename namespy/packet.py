@@ -543,12 +543,38 @@ class DnsPacket:
             self.ARCOUNT & 0xFFFF,
         )
 
+    def _extended_opt(self, record):
+        """A copy of *record* whose TTL carries this packet's extended RCODE.
+
+        RFC 6891 section 6.1.3 splits an RCODE above 15 in two: the header keeps
+        the low nibble (see :meth:`_header_bytes`) and OPT's TTL top octet takes
+        the upper eight. An in-memory packet holds the effective code directly
+        in ``RCODE``, so the record has to be re-stamped on the way out --
+        otherwise serialising RCODE 23 emits 7 and a client that never saw the
+        upper bits reads FORMERR for a query that merely expired. Returns
+        ``None`` when there is nothing to stamp, which is the ordinary case.
+        """
+        rcode = int(self.RCODE)
+        if rcode <= 0xF:
+            return None
+        if rcode > 4095:
+            raise ValueError(
+                f"RCODE {rcode} does not fit the 12-bit extended field (RFC 6891 section 6.1.3)"
+            )
+        ttl = (int(record.ttl) & 0x00FFFFFF) | (rcode >> 4) << 24
+        return DnsRecord(record.name, record.rtype, record.rclass, ttl, rdata=record.rdata)
+
     def __bytes__(self) -> bytes:
         out = bytearray(self._header_bytes())
         for question in self.questions:
             out += bytes(question)
         for section in (self.answers, self.nameservers, self.additional_records):
             for record in section:
+                if int(record.rtype) == OPT_RTYPE:
+                    stamped = self._extended_opt(record)
+                    if stamped is not None:
+                        out += bytes(stamped)
+                        continue
                 out += bytes(record)
         out += self.suffix
         return bytes(out)

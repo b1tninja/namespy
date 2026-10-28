@@ -136,10 +136,11 @@ them change the security properties of anything built on top.
   1232-octet UDP payload (RFC 6891 §6.1.2, disable with `--no-edns` or the
   constructor knob), arriving OPT records yield `extended_rcode`, `ad`, `cd`
   and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer triggers
-  the §6.2.2 unextended re-ask. What is missing is *options*: no NSID,
-  COOKIE or per-server payload adaptation yet, and the demo server does not
-  echo OPT in its own responses (roadmap P1). Truncation is fully handled:
-  a `TC` answer is re-asked over TCP instead of being believed
+  the §6.2.2 unextended re-ask. The demo server answers an extended query with
+  an OPT of its own — never a forwarded one, always its own payload size — and
+  keeps §7's silence for a query that had none. What is missing is *options*:
+  no NSID, COOKIE or per-server payload adaptation yet. Truncation is fully
+  handled: a `TC` answer is re-asked over TCP instead of being believed
   (RFC 1123 §6.1.3.2).
 - **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
   §11 requires of a implementation, but it means RFC 5890 A-labels must be
