@@ -1,97 +1,160 @@
-# aiodns (DNSpy)
+# DNSpy
 
-An **asyncio-based DNS library and example server** from the DNSpy project: packet encode/decode, `DomainName` handling, and a work-in-progress recursive resolver wired through UDP `asyncio` protocols.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+![CI](https://github.com/b1tninja/DNSpy/workflows/CI/badge.svg)
 
-- **Python:** 3.12+ (see [`pyproject.toml`](pyproject.toml))
-- **Style:** Ruff (lint + format), pytest for tests
-- **Status:** experimental; the recursive resolver path is still rough, but the core parsing and the demo server are useful for learning and local experimentation
+An asyncio DNS library: a wire codec that survives malformed input, an iterative
+resolver that follows RFC 1034 section 5.3.3 literally, and a `dig`-flavoured
+inspector. No runtime dependencies.
 
-## References
-
-- [RFC 1034](https://www.ietf.org/rfc/rfc1034.txt) — Domain names: concepts and facilities  
-- [RFC 1035](https://www.ietf.org/rfc/rfc1035.txt) — Domain names: implementation and specification
-
-## What’s in the box
-
-| Area | Notes |
-|------|--------|
-| `aiodns/packet.py` | DNS message layout: questions, resource records, `Query` / `Response` |
-| `aiodns/names.py` | `DomainName` wire encoding and parsing |
-| `aiodns/resolver.py` | `RecursiveResolver` and related resolver logic (WIP) |
-| `aiodns/server.py` | `DnsServer` datagram handler that forwards to the resolver |
-| `aiodns/__main__.py` | Example: bind resolver + listener, run until Ctrl+C |
-
-**Not supported (yet):** IDN / Punycode (`xn--` labels), full EDNS(0) behavior, and production-grade error handling. Treat this as a **lab** codebase, not a public resolver you expose to the internet.
+- **Python:** 3.12+ · **Imports as:** `aiodns` · **Installs as:** `aiodns-dnspy`
+  (the distribution name avoids colliding with the unrelated, established
+  [`aiodns`](https://pypi.org/project/aiodns/) on PyPI; the import name has not
+  changed)
+- **Status:** the codec, resolver and CLI are tested and usable; there is no
+  DNSSEC validation and no EDNS(0) on the wire yet — see
+  [What it does not do](#what-it-does-not-do)
+- **Spec anchors:** [`docs/rfc-map.md`](docs/rfc-map.md) maps every protocol
+  obligation in this code to the document and section that requires it, and to
+  the test that covers it
 
 ## Install
 
-From the repository root, using a virtual environment is recommended:
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 ```
 
-The package metadata name is `aiodns-dnspy` (see `pyproject.toml`) to avoid clashing with other projects named `aiodns` on PyPI. The import name remains `aiodns`.
+Not published to PyPI yet, so install from the repository.
 
-## Run the example server
+## Try it
 
-The example binds:
-
-- a **recursive resolver** UDP socket on `0.0.0.0:0` (ephemeral port), and  
-- a **DNS listener** on `127.0.0.1:53`.
-
-**Port 53** is a privileged port on many systems. On Windows you may need an elevated shell, or change the listen address/port in `aiodns/__main__.py` for local dev (e.g. `127.0.0.1`, high port like `5353`).
-
-```powershell
-python -m aiodns
+```bash
+dnspy example.com                  # dig-style answer
+dnspy example.com AAAA
+dnspy --short example.com MX       # or: dnspy +short example.com MX
+dnspy example.com --trace          # write the resolution walk to last_resolution.md
+dnspy --serve                      # demo server on 127.0.0.1:53
 ```
 
-On success you should see a log line about startup; the process then **runs until you press Ctrl+C**.
+`python -m aiodns` does the same without installing the console script, and
+`dnspy --help` lists the rest (`--root-hints`, `--dns-suffix`, `--timeout`,
+`--trace-file`, `-v`, `--debug`).
 
-Root hints come from `named.root` **shipped inside the package** and loaded with
-`importlib.resources`, so a fresh install resolves from the root servers with no
-setup and no network fetch at construction time. To use your own copy, pass
-`root_hints_path=` to `RecursiveResolver`; to pull a current version from
-[Internic](https://www.internic.net/domain/named.root), `await
-resolver.refresh_root_hints()`. Nothing reaches the network unless you await
-that call — an earlier revision called `urlretrieve` inside `__init__`, with no
-timeout, which made constructing a resolver an unbounded blocking operation.
+`--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
+useful for seeing exactly where a zone cut was crossed and which NS forced a
+glueless sub-resolution.
 
-## Tracing
+`--serve` binds loopback on purpose. It is a codec exercise, not a name server;
+exposing a recursive resolver to a network you do not control turns it into an
+amplification instrument (RFC 5358, RFC 9085). See [`SECURITY.md`](SECURITY.md).
 
-`RecursiveResolver` records every iterative-resolution step into a `Trace`
-(see [`aiodns/trace.py`](aiodns/trace.py)). The trace is exposed both on the
-resolver (`resolver.last_trace`) and on the response object
-(`response.trace`). Render any trace as a Mermaid `sequenceDiagram` with
-`Trace.to_mermaid()`.
+Root hints ship inside the package and load through `importlib.resources`, so a
+fresh checkout resolves from the root servers with no setup and no network access
+at construction time. `await resolver.refresh_root_hints()` fetches a current
+copy from [Internic](https://www.internic.net/domain/named.root) if you want one;
+nothing else in the library contacts that URL.
 
-When you run `python -m aiodns` and the demo lookup completes, the most
-recent trace is written to `last_resolution.md` in the current working
-directory — open it in any Mermaid-aware viewer to see the zone-cut walk
-and any glueless sub-resolutions.
+## Use it as a library
 
-For the RFC 1034 mapping that drives the resolver code, see
-[`resolution.MD`](resolution.MD).
+`RecursiveResolver` is an `asyncio.Protocol`: it owns a datagram endpoint and you
+await `resolve()`.
 
-## Develop
+```python
+import asyncio
+from aiodns import DnsQType, DnsQuestion, DomainName, Query, RecursiveResolver
 
-```powershell
-python -m ruff check .
-python -m ruff format .
-python -m pytest
-python -m compileall aiodns
+
+async def main():
+    loop = asyncio.get_running_loop()
+    transport, resolver = await loop.create_datagram_endpoint(
+        RecursiveResolver,
+        local_addr=("0.0.0.0", 0),  # ephemeral source port, RFC 5452 section 5
+    )
+    try:
+        query = Query(questions=[DnsQuestion(DomainName("example.com."), DnsQType.A)])
+        response = await asyncio.wait_for(resolver.resolve(query), timeout=10)
+        for record in response.answers:
+            print(record.name, record.rtype, record.ttl, record.rdata)
+        print(resolver.last_trace.to_mermaid())
+    finally:
+        transport.close()
+
+
+asyncio.run(main())
 ```
 
-## Layout
+The pieces are useful apart from the resolver. Decoding a capture needs neither a
+resolver nor an event loop:
 
+```python
+from aiodns import DnsPacket
+from aiodns.rdata import RData_SOA
+
+packet, consumed = DnsPacket.parse(raw_datagram)
+print(packet.ID, packet.RCODE, packet.extended_rcode, packet.TC, len(packet.answers))
+
+soa = RData_SOA("ns1.example.com", "hostmaster.example.com", 2026102701, 7200, 3600, 1209600, 3600)
+bytes(soa)  # pointer-free, so it is storable anywhere
+RData_SOA.serial_ahead(1, 0xFFFFFFFF)  # True — RFC 1982 serial arithmetic
 ```
-aiodns/          # Library package
-tests/           # Pytest
-pyproject.toml   # Project metadata, Ruff, pytest
+
+Anything the codec does not know about stays readable rather than raising: an
+`HTTPS` (65) or `ZONEMD` (63) record decodes to an opaque `RData` and renders in
+RFC 3597 section 5 form, `\# 24 00046400...`, which is what RFC 3597 section 3
+asks a receiver to do with a type it has never heard of.
+
+## What it does not do
+
+Listing these is more useful than a promise of completeness, because three of
+them change the security properties of anything built on top.
+
+- **No DNSSEC validation.** The `AD` bit is read and exposed, but nothing
+  verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
+  are unauthenticated: anyone who can deliver a well-formed response that matches
+  the question — same source address, same ID, echoed question — is believed.
+- **EDNS(0) is decoded but not sent.** An arriving OPT record yields
+  `extended_rcode`, `ad`, `cd` and `requestor_payload_size`; outbound queries
+  carry none. So the UDP payload ceiling stays 512 octets and RCODEs stay 4-bit
+  (RFC 6891 §6.1.2, §6.2.3). The consequence of that ceiling, truncation, *is*
+  handled: a `TC` answer is re-asked over TCP instead of being believed
+  (RFC 1123 §6.1.3.2).
+- **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
+  §11 requires of a implementation, but it means RFC 5890 A-labels must be
+  encoded by the caller.
+- **No QNAME minimisation.** The full QNAME goes to every server on the way down,
+  so this resolver leaks the whole name to the root and TLD servers
+  (RFC 9156 §4.1).
+- **Partial bailiwick enforcement.** A referral whose NS names are *inside* the
+  new zone but arrive without glue is refused as lame (RFC 5625 §2.5); the reverse
+  case — NS names outside the zone with no glue — is not checked yet.
+- **Not a name server.** No zone storage, no serving of a zone, no AXFR/IXFR. The
+  bundled `DnsServer` answers from the resolver for loopback testing.
+- **UDP, with TCP only for truncation.** No DNS over TLS (RFC 7858), HTTPS
+  (RFC 8484) or QUIC (RFC 9250), and no mDNS/DNS-SD (RFC 6762, RFC 6763).
+
+The first two are the ones worth re-reading before you depend on this for
+anything that needs authenticity or a large answer.
+
+## Development
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). The short version — all four must pass.
+The two pytest runs happen on Linux and Windows alike, because a socket option
+that exists only on Linux is exactly the kind of bug a Linux-only CI never sees;
+lint, typing and the distribution checks run once on Linux.
+
+```bash
+pytest -q                              # coverage floor enforced by pyproject
+python -O -m pytest -q                 # assertions stripped
+ruff check . && ruff format --check .
+mypy aiodns
 ```
 
-## History
+The second line is the one that matters most here: `python -O` strips `assert`,
+and a parser whose bounds checks were `assert` stops being a parser under
+production flags. Suite and policy details are in `SECURITY.md`.
 
-This tree started as early Python 3 + asyncio code and was **modernized** (event-loop usage, packaging, tests, and bug fixes) while keeping the same general module layout. Older “WIP / master branch” notes in the previous README are superseded by the process above: check `git` history and this file for the current state.
+## License
+
+Apache-2.0 — see [`LICENSE`](LICENSE).
