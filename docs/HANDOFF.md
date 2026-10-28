@@ -48,7 +48,11 @@ the project:
 
 Rehearsal without PyPI: `gh workflow run release.yml -f version=0.1.0` runs
 build+attest+audit only (publish will fail on the missing trusted publisher,
-which is the correct failure). TestPyPI has no trusted publishing; a dry run
+which is the correct failure). **Done 2026-10-28, run 40640446010: build job
+green (version gate, build, dist audit, SLSA attest, digest, artifact),
+publish failed with PyPI's textbook `invalid-publisher: valid token, but no
+corresponding publisher` — proof the OIDC half works and only the python.org
+form above is missing.** TestPyPI has no trusted publishing; a dry run
 there needs an API token in a separate environment — only worth it if step 1
 is somehow blocked.
 
