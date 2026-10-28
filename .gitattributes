@@ -1,0 +1,27 @@
+# Line endings are a correctness issue here, not a style one: CI runs the same
+# suite on Ubuntu and Windows, and a checkout that rewrites bytes per platform
+# means the formatter, the tests and the reviewer are looking at different
+# files. The index stores LF; core.autocrlf is a per-machine setting that cannot
+# be relied on to agree, so the policy is declared in the repository instead.
+* text=auto eol=lf
+
+# Shell must stay LF or it will not execute when checked out on Windows and
+# copied into a Linux container.
+*.sh text eol=lf
+
+# Windows files that must keep CRLF to be useful as-is.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never run end-of-line conversion or diff over these.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.sqlite binary
+*.db binary
+*.pdf binary
+
+# The root hints file is data with an exact on-the-wire meaning per RFC 1035
+# section 5; keep its LF and treat edits to it as substantive.
+aiodns/named.root text eol=lf
