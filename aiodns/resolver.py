@@ -638,18 +638,19 @@ class Fail:
 def _answer_address(record):
     """The address in an ``A``/``AAAA`` answer, or ``None`` for anything else.
 
-    Goes through the RDATA codecs rather than reading raw octets, because a
-    record may hold an :class:`~aiodns.rdata.RData_A` (parsed) or plain bytes
-    (hand-built by the root-hints loader), and because a malformed address must
-    yield "no address" here rather than raise inside a resolution loop.
+    Re-runs the codec over the record's wire octets rather than trusting
+    ``record.rdata`` to already be an :class:`~aiodns.rdata.RData_A`, because a
+    caller may have built the record by hand with a bare :class:`bytes` or a
+    :class:`~aiodns.names.DomainName`. A malformed address yields "no address"
+    here instead of raising inside a resolution loop: one bad glue record must
+    not abort the lookup that happened to receive it.
     """
     rtype = int(record.rtype)
     if rtype not in (int(DnsRType.A), int(DnsRType.AAAA)):
         return None
     try:
         codec = RData_A if rtype == int(DnsRType.A) else RData_AAAA
-        wire = record.rdata if isinstance(record.rdata, bytes) else bytes(record.rdata)
-        return codec(wire).ip
+        return codec(bytes(record.rdata)).ip
     except (DnsPacketParseError, ValueError):
         return None
 

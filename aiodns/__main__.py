@@ -3,7 +3,6 @@
 
 import argparse
 import asyncio
-import ipaddress
 import logging
 import sys
 import time
@@ -16,7 +15,6 @@ from .enums import (
     DnsQType,
     DnsRClass,
     DnsResponseCode,
-    DnsRType,
 )
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsQuestion, Query
@@ -154,27 +152,23 @@ def _parse_field(text, token, enum, label):
 
 
 def _format_rdata(record):
-    """Render one record's RDATA for the dig-style answer.
+    r"""Render one record's RDATA for the dig-style answer.
 
     Goes through the codec's :meth:`~aiodns.rdata.RData.to_presentation` so that
     every type renders the way the wire format describes it: an address as an
     address, a name absolutely qualified, and an unknown type as RFC 3597
-    section 5 ``\\# <len> <hex>`` rather than as bytes optimistically decoded as
-    ASCII, which used to turn a binary RDATA into mojibake on the terminal.
+    section 5 ``\# <len> <hex>``. The alternative was decoding bytes as ASCII,
+    which turned a binary RDATA into mojibake on the terminal -- and which a
+    `ZONEMD` or `CSYNC` record hits routinely now that unknown types parse.
+
+    ``record.rdata`` is always an :class:`~aiodns.rdata.RData`, so there is no
+    raw-bytes case to special-case here; the fallback exists only because
+    ``__slots__`` lets a caller assign one in after construction.
     """
     rdata = record.rdata
     if hasattr(rdata, "to_presentation"):
         return rdata.to_presentation()
-    if hasattr(rdata, "ip"):
-        return rdata.ip.compressed
-    if isinstance(rdata, (bytes, bytearray)):
-        blob = bytes(rdata)
-        if int(record.rtype) == int(DnsRType.A) and len(blob) == 4:
-            return ipaddress.IPv4Address(blob).compressed
-        if int(record.rtype) == int(DnsRType.AAAA) and len(blob) == 16:
-            return ipaddress.IPv6Address(blob).compressed
-        return generic_presentation(blob)
-    return str(rdata)
+    return generic_presentation(bytes(rdata))
 
 
 def _format_record_row(r):

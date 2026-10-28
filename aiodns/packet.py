@@ -133,6 +133,30 @@ class DnsQuestion:
 RECORD_HEADER_OCTETS = struct.calcsize(_RECORD_FMT)
 
 
+def _wrap_rdata(rtype, blob: bytes) -> RData:
+    """Hold raw RDATA octets as an ``RData``, decoded if a codec agrees to.
+
+    Used by :meth:`DnsRecord.__init__` when a caller supplies plain ``bytes``.
+    The codec is *offered* the octets, not assumed: if they do not decode -- an
+    ``A`` record built with two octets, an ``SOA`` built with ``b""`` as a
+    placeholder by the cache tests -- the opaque form is returned instead of
+    raising. That keeps the constructor as permissive as it has always been
+    while still making ``record.rdata`` a single, spec-shaped kind of object.
+
+    Decoding is safe to attempt because :mod:`aiodns.rdata` codecs never read
+    outside the length they are given, and every one of them re-encodes to the
+    octets it was handed, so a successful decode cannot alter the wire form.
+    """
+    codec = rdata_class_for(rtype)
+    if codec is None:
+        return RData(blob)
+    try:
+        return codec.parse_from(blob, 0, len(blob))
+    except DnsPacketParseError:
+        LOGGER.debug("%s octets do not decode; keeping them opaque", type_name_of(rtype))
+        return RData(blob)
+
+
 class DnsRecord:
     """One resource record (RFC 1035 section 4.1.3).
 
@@ -142,10 +166,18 @@ class DnsRecord:
     mode that made a single ``HTTPS`` record (RFC 9460) fatal, because the code
     reached for ``rtype.value`` on what was already an int.
 
-    :param rdata: an :class:`~aiodns.rdata.RData`, or raw ``bytes`` to be held
-        opaquely. Tests and the root-hints loader build records with
-        ``rdata=b""`` or a bare :class:`~aiodns.names.DomainName`, so the
-        constructor accepts those as given; :meth:`parse` is the strict path.
+    :param rdata: an :class:`~aiodns.rdata.RData`, or raw ``bytes``, which are
+        wrapped in the opaque :class:`~aiodns.rdata.RData`. No codec is *run*
+        here: tests and the root-hints loader build records with ``rdata=b""``
+        or a bare :class:`~aiodns.names.DomainName`, and parsing those as an
+        SOA or an address would reject input the caller knowingly supplied.
+        :meth:`parse` is the strict path.
+
+    Wrapping rather than storing raw bytes is what keeps ``record.rdata`` one
+    kind of thing. Hand-built records used to hold ``bytes`` while parsed ones
+    held an ``RData``, which forced ``isinstance`` checks in the resolver and
+    made ``print(record.rdata)`` show a Python bytes literal on one path and
+    RFC 3597 section 5 form on the other.
     """
 
     __slots__ = ("name", "rclass", "rdata", "rdlength", "rtype", "ttl")
@@ -159,6 +191,8 @@ class DnsRecord:
         self.ttl = int(ttl) & 0xFFFFFFFF
         if isinstance(rdata, str):
             rdata = rdata.encode("ascii", "surrogateescape")
+        if isinstance(rdata, (bytes, bytearray, memoryview)):
+            rdata = _wrap_rdata(rtype, bytes(rdata))
         self.rdata = rdata
         self.rdlength = len(bytes(rdata)) if rdlength is None else int(rdlength)
 
