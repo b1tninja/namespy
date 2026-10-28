@@ -31,7 +31,8 @@ hints from the network is now the explicit, awaited
 * RFC 6672 section 5.1 (DNAME plus CNAME makes alias loops easier to build)
 * RFC 7766 section 6 (TCP for truncation and for AXFR)
 * RFC 8106 section 2 (root hints: an initial address set is required)
-* RFC 9156 (QNAME minimisation -- not implemented; see the note in resolve_steps)
+* RFC 9156 (QNAME minimisation -- opt-in via ``qname_min``; see
+  :mod:`namespy.minimis` for the probe schedule)
 """
 
 import asyncio
@@ -54,6 +55,7 @@ from typing import NamedTuple
 from . import enable_path_mtu_discovery
 from .cache import MemoryDnsCache, NegativeEntry, PositiveEntry
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from .minimis import QnameMinimiser
 from .names import DomainName
 from .packet import (
     OPT_RTYPE,
@@ -618,6 +620,10 @@ class SendQuery:
 
     entry: SlistEntry
     questions: list
+    #: True when *questions* is a QNAME-minimisation probe rather than the
+    #: real question (RFC 9156 section 3 step 2). Trace rendering marks these
+    #: so a reader can tell a probe from a resolution step.
+    probe: bool = False
 
 
 @dataclass(frozen=True)
@@ -1165,6 +1171,7 @@ def resolve_steps(
     cache=None,
     max_hops: int = MAX_HOPS,
     max_alias_hops: int = MAX_ALIAS_HOPS,
+    qname_min: bool = False,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1177,6 +1184,12 @@ def resolve_steps(
     ``Answer``/``Done`` or ``Nxdomain``/``Nodata``/``Done`` on a hit. After
     a real authoritative response classifies as a terminal event, the
     result is written back to the cache.
+
+    ``qname_min`` enables QNAME minimisation (RFC 9156): servers not known
+    to be authoritative for the full QNAME are probed with progressively
+    deeper children -- see :mod:`namespy.minimis` for the schedule. The
+    default ``False`` is deliberate: it changes the questions every
+    downline server sees, and it earns its default in the field.
     """
     # Alias state lives here, not in classify: a CNAME in one response can point
     # at a name that another response aliases again, so only the loop spanning
@@ -1185,6 +1198,7 @@ def resolve_steps(
     # full budget.
     alias_hops = 0
     seen_names = {sname.qname}
+    minimiser = QnameMinimiser(sname.qname) if qname_min else None
 
     for _ in range(max_hops):
         if cache is not None:
@@ -1210,10 +1224,33 @@ def resolve_steps(
                 continue
             entry.addresses.extend(addrs)
             continue
-        response = yield SendQuery(entry, sname.questions)
+        probe = minimiser.probe(sname.match_count(entry.zone)) if minimiser is not None else None
+        if probe is not None:
+            # RFC 9156 section 3 step 2: the probe is a QTYPE=A query for
+            # CHILD, which keeps any referral in the exact shape classify()
+            # already parses. The original QTYPE travels only when the
+            # minimiser returns None -- CHILD has reached QNAME, the zone
+            # server is in hand, or the probe budget is spent (section 3
+            # step 3: "resolve the original query as normal").
+            questions = [DnsQuestion(probe, DnsQType.A, sname.qclass)]
+        else:
+            questions = sname.questions
+        response = yield SendQuery(entry, questions, probe=probe is not None)
         terminal = False
         alias_target = None
         for step in classify(response, sname, slist, entry, max_alias_hops=max_alias_hops):
+            if probe is not None and not isinstance(step, (Demote, Referral)):
+                # A probe response is not a statement about the original
+                # QNAME: "com. has no A record" must never become the final
+                # NODATA for www.example.com. RFC 9156 section 3 step 4 is
+                # the instruction -- take the next name in Slist -- which in
+                # this codebase is a demote: the probed entry drops in rank,
+                # the response is discarded, and nothing about a probe may
+                # reach the cache keyed on the QNAME. Referrals (slist has
+                # already descended inside classify) fall through normally.
+                yield Demote(entry, f"probe {probe} returned no referral")
+                slist.demote(entry)
+                break
             # Write to cache *before* yielding the terminal event so callers
             # (including tests) can observe a populated cache the moment the
             # Answer/Nxdomain/Nodata is visible — the generator pauses at
@@ -1252,6 +1289,12 @@ def resolve_steps(
         seen_names.add(alias_target)
         alias_hops += 1
         sname.reanchor(alias_target)
+        if minimiser is not None:
+            # The QNAME changed, and RFC 9156 section 2's CHILD is defined
+            # against the QNAME -- so the schedule restarts for the target.
+            # A completed probe walk against the old name must not leave a
+            # spent budget narrowing probes against the new one.
+            minimiser = QnameMinimiser(sname.qname)
     yield Fail("max hops")
 
 
@@ -1521,6 +1564,7 @@ class RecursiveResolver(Resolver):
         max_alias_hops: int = MAX_ALIAS_HOPS,
         query_timeout: float = QUERY_TIMEOUT_S,
         edns_payload_size: int | None = EDNS_PAYLOAD_SIZE,
+        qname_min: bool = False,
     ):
         """Build a resolver without touching the network.
 
@@ -1537,6 +1581,11 @@ class RecursiveResolver(Resolver):
             occasionally wanted against ossified infrastructure, though the
             section 6.2.2 fallback already handles the servers that would
             otherwise need it.
+        :param qname_min: enable QNAME minimisation (RFC 9156): servers not
+            known to be authoritative for the full QNAME are probed with
+            progressively deeper children instead of being handed the whole
+            name. Default ``False`` is deliberate -- it changes the question
+            every downline server sees, so it earns its default in the field.
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
         """
         self.queue: dict[tuple, tuple] = {}
@@ -1549,6 +1598,7 @@ class RecursiveResolver(Resolver):
         self.max_alias_hops = max(1, int(max_alias_hops))
         self.query_timeout = max(0.05, float(query_timeout))
         self.edns_payload_size = 0 if edns_payload_size is None else max(0, int(edns_payload_size))
+        self.qname_min = bool(qname_min)
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
@@ -1859,6 +1909,10 @@ class RecursiveResolver(Resolver):
                     child_sname = Sname(step.ns_name, rtype, DnsRClass.IN)
                     child_slist = self.sbelt.copy_for(child_sname)
                     child_trace = trace.child(child_sname)
+                    # qname_min deliberately off here: the name being chased
+                    # is an NS server's address, not the user's QNAME, so the
+                    # privacy motivation of RFC 9156 section 1 does not apply
+                    # and the extra probes would only slow glue resolution.
                     sub_gen = resolve_steps(child_sname, child_slist, self.cache)
                     sub_response = await self._drive(sub_gen, child_trace, depth + 1)
                     if not isinstance(sub_response, Response):
@@ -1923,6 +1977,7 @@ class RecursiveResolver(Resolver):
             self.cache,
             max_hops=self.max_hops,
             max_alias_hops=self.max_alias_hops,
+            qname_min=self.qname_min,
         )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):

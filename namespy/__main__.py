@@ -364,6 +364,13 @@ def build_parser():
         help="do not advertise EDNS(0) on outbound queries; caps answers at "
         "512 octets and forces TCP for anything larger (RFC 6891)",
     )
+    p.add_argument(
+        "--qname-min",
+        action="store_true",
+        help="QNAME minimisation: downline servers get progressively deeper "
+        "children instead of the full name (RFC 9156); more queries, less "
+        "exposure -- --trace marks the probes",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="enable INFO-level logging")
     p.add_argument("--debug", action="store_true", help="enable DEBUG-level logging")
     return p
@@ -378,6 +385,7 @@ async def cli_query(args) -> int:
             root_hints_path=args.root_hints,
             dns_suffix=args.dns_suffix,
             edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+            qname_min=args.qname_min,
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -420,6 +428,7 @@ async def serve(args) -> int:
                 root_hints_path=args.root_hints,
                 dns_suffix=args.dns_suffix,
                 edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+                qname_min=args.qname_min,
             ),
             local_addr=("0.0.0.0", 0),
         )

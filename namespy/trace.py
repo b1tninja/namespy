@@ -71,7 +71,8 @@ class Trace:
                 qname = ev.questions[0].name if ev.questions else "?"
                 qtype = ev.questions[0].qtype if ev.questions else None
                 qtype_name = getattr(qtype, "name", str(qtype))
-                body.append(f"    C->>{pid}: {qname} {qtype_name}")
+                marker = " (probe)" if getattr(ev, "probe", False) else ""
+                body.append(f"    C->>{pid}: {qname} {qtype_name}{marker}")
                 last_zone_id[0] = pid
             elif cn == "Referral":
                 body.append(

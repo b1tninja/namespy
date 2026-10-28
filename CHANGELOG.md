@@ -8,6 +8,15 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- QNAME minimisation (RFC 9156), opt-in: `RecursiveResolver(qname_min=True)`
+  or `namespy --qname-min`. Servers not known to be authoritative for the
+  full name receive progressively deeper children — the section 2.3 probe
+  schedule is pinned by `test_minimis.py`, the descent integration by
+  `test_qname_min.py`. Terminal *probe* responses demote and continue
+  (section 3 step 4) instead of answering for the original QNAME; budget
+  exhaustion degrades to full-name queries; `--trace` marks probes. Off by
+  default because it changes wire behaviour toward every downline server;
+  CNAME chasing deliberately keeps full names.
 - Security CI (`.github/workflows/security.yml`): CodeQL with `security-extended`
   (weekly and on change), `dependency-review` on every pull request, and
   `pip-audit` over the resolved dev environment. `socket.yml` screens every
@@ -174,8 +183,8 @@ Tracked honestly rather than as a promise — full list with reasons in
   adaptation (RFC 6891 section 6.2.3), and the bundled server does not echo
   OPT in its responses (section 6.2.4). The core record, the 1232-octet
   advertisement and the section 6.2.2 fallback do ship.
-- No DNSSEC validation, no QNAME minimisation (RFC 9156), no serve-stale
-  (RFC 8767), no IDN/punycode (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 /
-  RFC 8484).
+- No DNSSEC validation, no serve-stale (RFC 8767), no IDN/punycode
+  (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 / RFC 8484). QNAME
+  minimisation (RFC 9156) ships opt-in — see *Added*.
 - No bailiwick filtering of glue and additional-section records (RFC 5625
   section 2.5).

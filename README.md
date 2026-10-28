@@ -140,9 +140,12 @@ them change the security properties of anything built on top.
 - **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
   §11 requires of a implementation, but it means RFC 5890 A-labels must be
   encoded by the caller.
-- **No QNAME minimisation.** The full QNAME goes to every server on the way down,
-  so this resolver leaks the whole name to the root and TLD servers
-  (RFC 9156 §4.1).
+- **QNAME minimisation is opt-in** (`--qname-min`, `qname_min=True`). By
+  default the full QNAME goes to every server on the way down, leaking the
+  whole name to the root and TLD servers (RFC 9156 §4.1); with it on, each
+  server sees only the labels the previous referral proved relevant, at the
+  cost of more queries. `--trace` marks the probe queries, and budget
+  exhaustion degrades back to full names rather than failing.
 - **Partial bailiwick enforcement.** A referral whose NS names are *inside* the
   new zone but arrive without glue is refused as lame (RFC 5625 §2.5); the reverse
   case — NS names outside the zone with no glue — is not checked yet.
