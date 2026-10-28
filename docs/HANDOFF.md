@@ -83,10 +83,14 @@ cd D:\code\namespy
   anything that writes stderr: `cmd /c "git push origin master > %TEMP%\o.txt
   2>&1"`, then read the file. Never conclude a git operation failed from
   PowerShell's output alone; verify with `git ls-remote origin refs/heads/master`.
-- **Chained git state changes must be one `cmd /c` line.** Separate
-  add/commit/push tool calls raced the index lock and once committed the
-  wrong file sets; run `reset && add && commit && push` as one chained
-  `cmd /c` invocation, then verify remote state separately.
+- **Never put a mutating git command and a git read in the same parallel
+  tool batch.** Concurrent invocations in one batch race each other: a
+  parallel `git status` refreshes the index (that is the phantom
+  `index.lock`), and a parallel `git log`/`ls-remote` reads a half-moved
+  HEAD and reports commits that just landed as still "modified" or absent.
+  The commits are fine — verify sequentially after the chain finishes.
+  Run `add && commit && push` as one chained `cmd /c` line and nothing
+  else in the same batch.
 - **Install with quotes**: `pip install -e ".[dev]"`. Unquoted, PowerShell
   eats the brackets.
 - **`Get-Content` misreads UTF-8; it is not corruption.** Windows PowerShell
@@ -125,11 +129,57 @@ cd D:\code\namespy
 
 ## Known gaps (deliberate, documented in README/CHANGELOG)
 
-- EDNS(0) on outbound queries (RFC 6891) — the natural next feature; it also
-  makes truncation rarer, which the TCP-retry path currently papers over.
-- QNAME minimisation (RFC 9156), serve-stale (RFC 8767), DNSSEC validation
-  (RFC 4033/4034/4035), IDN/punycode (RFC 5891), DoT/DoH (RFC 7858/8484).
-- Out-of-bailiwick glueless NS lame check (RFC 5625 section 2.5 — the
-  reverse case of the check that exists).
+- ~~EDNS(0) on outbound queries~~ — shipped (f15b751). Remaining EDNS work
+  is options TLV + per-server payload adaptation (roadmap P1).
+- QNAME minimisation: half-shipped — see **Next task** below. serve-stale
+  (RFC 8767), DNSSEC validation (RFC 4033/4034/4035), IDN/punycode
+  (RFC 5891), DoT/DoH (RFC 7858/8484) remain open.
+- Out-of-bailiwick glue filtering and the matching lame check (RFC 5625
+  section 2.5 — the reverse case of the check that exists). Roadmap P1,
+  the highest-priority open item.
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
+
+## Next task: QNAME minimisation integration (the half that touches the loop)
+
+`namespy/minimis.py` is done and tested in isolation (`test_minimis.py`,
+the RFC 9156 section 2.3 worked example pinned). What remains is wiring
+the probe walk into `resolve_steps`, the descent generator in `resolver.py`.
+
+Recon already done, so this can start cold:
+
+- The loop sends at `response = yield SendQuery(entry, sname.questions)`
+  inside `resolve_steps`. `entry` is a `SlistEntry` and carries `.zone`;
+  `Sname.match_count(zone)` already computes exactly what
+  `QnameMinimiser.probe()` wants — labels of the QNAME shared with the
+  zone, counted from the root. So `auth_labels = sname.match_count(entry.zone)`.
+- The hard part is not the query rewrite — it is response consumption.
+  A probe response is not an answer about the original QNAME, but
+  `classify()` treats NODATA/NXDOMAIN/Answer as terminal, so a naive
+  rewrite would let "com. has no A record" become the final NODATA for
+  `www.example.com`. Terminal events while a probe is outstanding must
+  convert to demote-and-continue (RFC 9156 section 3 step 4: take the
+  next name in Slist); only referral handling — the slist advancing
+  across a zone cut — proceeds normally.
+- Suggested shape: keep the default path byte-identical; add
+  `qname_min: bool = False` to `resolve_steps` and the resolver. When on,
+  run the probe as a nested mini-generator that consumes responses with a
+  probe-aware classifier until the slist moves, then `continue` the outer
+  loop. A probe's terminal classification must never short-circuit the
+  original question and must never reach the cache write for the QNAME.
+- CNAME re-anchoring (`sname.reanchor`) changes the QNAME — build a fresh
+  `QnameMinimiser` for the new name at that point.
+- Surface it: `RecursiveResolver(qname_min=...)` constructor argument,
+  default **off** — it changes wire behaviour toward every downline
+  server, so it earns its default in the field, not in a diff. CLI
+  `--qname-min`; `--trace` output should mark probe queries so a trace
+  reader can tell probes from real steps.
+- Tests to write first (patterns exist in `test_resolve_steps.py`):
+  fake-root descent where the root servers only ever see `com.`, the TLD
+  only `example.com.`, and the authoritative server the full name; a
+  NODATA probe response demotes rather than terminates; budget exhaustion
+  degrades to full-name queries and resolution still completes; the
+  default path produces byte-identical queries to today.
+- Definition of done for this task: the three new tests plus the full
+  suite green under `-O`; roadmap 9156 row flipped to ✅; README's
+  "No QNAME minimisation" bullet updated to name the flag.

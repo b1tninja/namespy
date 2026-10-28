@@ -83,7 +83,7 @@ is one row per obligation.
 | Negative answers cached at `min(SOA.MINIMUM, SOA TTL)` | 2308 §5 | ✅ | `test_cache.py`, `test_resolve_steps.py` |
 | CNAME-chain and alias-expansion bounds | 1034 §3.6.2 | ✅ | `test_resolver_alias.py` |
 | Wildcard matching and synthesis of the closest encloser | 4592 §2.1–§2.2 | ⬜ | roadmap P2 — names carry an `is_wildcard` flag; no synthesis |
-| QNAME minimisation | 9156 §4 | ⬜ | roadmap P2 — the full QNAME goes to every server today |
+| QNAME minimisation | 9156 §4 | ◐ | `namespy/minimis.py` lands the §2.3 schedule + probe walk (`test_minimis.py`); descent-loop integration is the remaining half — roadmap P2 |
 | Serve-stale on upstream failure | 8767 | ⬜ | roadmap P3 |
 
 ## 5. Cache poisoning resistance — RFC 5452, RFC 5625
@@ -147,7 +147,7 @@ of code built on namespy, not by implementation cost.
 | **P1** | Bailiwick filter for out-of-zone glue | 5625 §2.5 | a hostile delegation can still plant addresses above its zone cut — the *remaining half* of a defence the code already claims | small |
 | **P1** | EDNS options TLV parse/emit, then per-server payload adaptation | 6891 §6.1.2/§6.2.3, 5001 | unlocks NSID for debugging; shrinks the truncation/TCP detour that dominates big answers | small–medium |
 | **P1** | Server echoes OPT; EDNS-aware responses | 6891 §6.2.4 | makes the demo server honest about what it claims on the wire | small |
-| **P2** | QNAME minimisation | 9156 | privacy: today the full name leaks to root and TLD servers | medium |
+| **P2** | QNAME minimisation (integration) | 9156 | privacy: today the full name leaks to root and TLD servers; schedule module done, loop integration is the rest | medium |
 | **P2** | IDNA/punycode | 5891/3492 | correctness for internationalised names; currently the caller's job | medium |
 | **P2** | Wildcard synthesis | 4592 | needed before results can claim RFC-identical semantics for `*.example` zones | medium |
 | **P3** | DNSSEC validation (4033/4034/4035, 5155) | — | the largest trust gap and the largest project: trust anchors, crypto (a dependency decision against the zero-dependency promise), proof checking | large |
