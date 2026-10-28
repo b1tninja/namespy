@@ -26,7 +26,7 @@ jobs:
       digest: ${{ steps.hash.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
@@ -83,7 +83,7 @@ jobs:
         with:
           name: release-dist
           path: dist/
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade twine
