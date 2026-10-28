@@ -23,12 +23,14 @@ inspector. No runtime dependencies.
   — so installing this would have shadowed one of them. One string now covers the
   distribution, the import and the console script, which is the only arrangement
   that cannot surprise anyone.
-- **Status:** the codec, resolver and CLI are tested and usable; there is no
-  DNSSEC validation and no EDNS(0) on the wire yet — see
+- **Status:** the codec, resolver and CLI are tested and usable, EDNS(0)
+  included; there is no DNSSEC validation — see
   [What it does not do](#what-it-does-not-do)
-- **Spec anchors:** [`docs/rfc-map.md`](docs/rfc-map.md) maps every protocol
-  obligation in this code to the document and section that requires it, and to
-  the test that covers it
+- **Spec anchors:** [`docs/roadmap.md`](docs/roadmap.md) is the completeness
+  matrix — every protocol obligation this code could take on, with an honest
+  status and the test that pins it, and the roadmap the gaps consolidate
+  into. [`docs/rfc-map.md`](docs/rfc-map.md) is the deep RFC 1034 §5.3.3
+  walkthrough behind the resolver
 
 ## Install
 
@@ -51,8 +53,8 @@ namespy --serve                      # demo server on 127.0.0.1:53
 ```
 
 `python -m namespy` does the same without installing the console script, and
-`namespy --help` lists the rest (`--root-hints`, `--dns-suffix`, `--timeout`,
-`--trace-file`, `-v`, `--debug`).
+`namespy --help` lists the rest (`--no-edns`, `--root-hints`, `--dns-suffix`,
+`--timeout`, `--trace-file`, `-v`, `--debug`).
 
 `--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
 useful for seeing exactly where a zone cut was crossed and which NS forced a
@@ -126,11 +128,14 @@ them change the security properties of anything built on top.
   verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
   are unauthenticated: anyone who can deliver a well-formed response that matches
   the question — same source address, same ID, echoed question — is believed.
-- **EDNS(0) is decoded but not sent.** An arriving OPT record yields
-  `extended_rcode`, `ad`, `cd` and `requestor_payload_size`; outbound queries
-  carry none. So the UDP payload ceiling stays 512 octets and RCODEs stay 4-bit
-  (RFC 6891 §6.1.2, §6.2.3). The consequence of that ceiling, truncation, *is*
-  handled: a `TC` answer is re-asked over TCP instead of being believed
+- **EDNS(0) is sent and understood, minimally.** Outbound queries advertise a
+  1232-octet UDP payload (RFC 6891 §6.1.2, disable with `--no-edns` or the
+  constructor knob), arriving OPT records yield `extended_rcode`, `ad`, `cd`
+  and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer triggers
+  the §6.2.2 unextended re-ask. What is missing is *options*: no NSID,
+  COOKIE or per-server payload adaptation yet, and the demo server does not
+  echo OPT in its own responses (roadmap P1). Truncation is fully handled:
+  a `TC` answer is re-asked over TCP instead of being believed
   (RFC 1123 §6.1.3.2).
 - **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
   §11 requires of a implementation, but it means RFC 5890 A-labels must be
@@ -146,8 +151,10 @@ them change the security properties of anything built on top.
 - **UDP, with TCP only for truncation.** No DNS over TLS (RFC 7858), HTTPS
   (RFC 8484) or QUIC (RFC 9250), and no mDNS/DNS-SD (RFC 6762, RFC 6763).
 
-The first two are the ones worth re-reading before you depend on this for
-anything that needs authenticity or a large answer.
+Of these, the DNSSEC and EDNS entries are the ones worth re-reading before
+you depend on this for anything that needs authenticity. The full
+obligation-level picture, gap by gap, is
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## Development
 

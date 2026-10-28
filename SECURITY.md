@@ -79,9 +79,6 @@ section 5 and neither is optional.
   response to the right port still wins; nothing here checks an RRSIG.
 - **No response rate limiting.** This library is a client. If you embed it in
   something that answers on behalf of others, RFC 5358 becomes your obligation.
-- **No EDNS(0) on outbound queries** yet, so answers are capped at 512 octets and
-  extended RCODEs are not requested (RFC 6891). The decoder *can* read an OPT
-  record if one arrives.
 - **No bailiwick enforcement** on glue and extra-section records (RFC 5625
   section 2.5). Names below a zone cut can be filled in by the server that
   supplied them.

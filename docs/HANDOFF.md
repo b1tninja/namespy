@@ -19,8 +19,10 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 308 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Suite | 329 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
 | Coverage | floor 80 enforced in `pyproject.toml` |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable); `tests/test_edns.py` pins it |
+| Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
 | Release | `release.yml` wired end-to-end: tag → build → attest → trusted-publish to PyPI → GitHub Release. **One manual step away — see checklist below.** |

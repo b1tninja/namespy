@@ -55,6 +55,22 @@ nothing has been tagged or published yet, so `master` is the only version.
   datagram flood it previously minted one coroutine per packet before any
   semaphore; excess traffic is now dropped silently per RFC 5625 section 6.2.
 
+- EDNS(0) on the wire (RFC 6891, full implementation at `HEAD`): OPT on
+  every outbound query (§6.1.2) advertising a 1232-octet payload with the
+  512 floor enforced (§6.2.3), the EXTENDED-RCODE | VERSION | FLAGS TTL
+  layout and 12-bit RCODE reassembly (§6.1.3), the §7 FORMERR-without-OPT
+  signature plus BADVERS/NOTIMP driving exactly one unextended re-ask
+  (§6.2.2), and an OPT that is never cached (§6.2.1). `--no-edns` or
+  `edns_payload_size=0` opts out entirely. Remaining EDNS work (options
+  TLV, per-server payload adaptation, responder-side echo) is roadmap P1
+  in [`docs/roadmap.md`](docs/roadmap.md).
+- `docs/roadmap.md` — the specification-completeness matrix: every
+  obligation the code could take on, status, and the test that pins it,
+  consolidating into a prioritised roadmap. README links it as the
+  project's planning document.
+- `tests/test_edns.py` (17 tests) — the OPT on the wire, TTL bit layout
+  against RFC diagrams, fallback matrix, cache exclusion, knob plumbing.
+
 ### Added earlier in this effort
 
 - `LICENSE` — Apache-2.0. The repository previously had none, which meant
@@ -153,9 +169,11 @@ nothing has been tagged or published yet, so `master` is the only version.
 Tracked honestly rather than as a promise — full list with reasons in
 [`docs/HANDOFF.md`](docs/HANDOFF.md):
 
-- No EDNS(0) on outbound queries (RFC 6891), so answers are effectively capped at
-  512 octets — which is why truncation is routine rather than exotic. A truncated
-  answer now retries over TCP (RFC 7766 section 6) instead of being trusted.
+- EDNS(0) *options* are not implemented: OPT RDATA is written empty and read
+  opaquely, so no NSID (RFC 5001), COOKIE (RFC 7873) or per-server payload
+  adaptation (RFC 6891 section 6.2.3), and the bundled server does not echo
+  OPT in its responses (section 6.2.4). The core record, the 1232-octet
+  advertisement and the section 6.2.2 fallback do ship.
 - No DNSSEC validation, no QNAME minimisation (RFC 9156), no serve-stale
   (RFC 8767), no IDN/punycode (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 /
   RFC 8484).
