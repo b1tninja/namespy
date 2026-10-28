@@ -8,6 +8,55 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- Security CI (`.github/workflows/security.yml`): CodeQL with `security-extended`
+  (weekly and on change), `dependency-review` on every pull request, and
+  `pip-audit` over the resolved dev environment. `socket.yml` screens every
+  dependency install through the Socket.dev firewall. `master` is protected:
+  all checks must pass, strictly, before anything lands.
+- Release path completed (`.github/workflows/release.yml`): SLSA build
+  provenance via `actions/attest`, PyPI attestations via trusted publishing,
+  a `pypi` deployment environment scoping who can mint an upload credential,
+  a GitHub Release created only after PyPI accepted the artifacts, and a
+  `workflow_dispatch` rehearsal path that no longer trips its own tag check.
+- `tests/test_review_fixes.py` — locks every finding from the correctness
+  review (TTL clamp, trailing-RDATA refusal, empty-label refusal, cancellation
+  pending-slot release, log-level discipline, server spawn bound).
+
+### Changed
+
+- **Record TTLs are now clamped to 2147483647 (RFC 2181 section 8).** The
+  clamp existed as `clamp_ttl()` but was never called: a hostile or buggy
+  server offering `0xFFFFFFFF` produced a cache entry that never expired,
+  which is a poisoning half-win that lasts forever.
+- **NS/CNAME/PTR/DNAME RDATA with trailing octets is refused.** Only the
+  overrun direction was checked, so `RDLENGTH = name + garbage` half-parsed;
+  MX, SRV and SOA already failed closed, and RFC 9267 section 5 says the
+  whole declared length must be accounted for.
+- **TXT with an empty RDLENGTH is refused** (RFC 1035 section 3.3.14: one or
+  more `<character-string>`).
+- **Interior empty labels are no longer silently erased.** `DomainName("a..b")`
+  used to encode as `a.b`, collapsing two distinct names onto one wire form;
+  the encoder now refuses, which is honest because no wire form for an
+  interior empty label exists.
+- **Compression pointer octets no longer count against the 255-octet name
+  budget** — RFC 1035 section 3.1 bounds the expanded name, not the encoding;
+  the old accounting rejected valid wide names carried on pointers.
+- **Wire-parsed names carry their correct start offset** in `.offset` (it
+  held the post-pointer resume point, or `None`).
+- Non-ASCII digit-like characters in presentation names no longer raise
+  `ValueError` from the `\DDD` escape decoder.
+- Resolver IPv4 malformed-datagram logging dropped to `DEBUG`; the IPv6 path
+  and the server already stayed quiet, and a `WARNING` + hex dump per spoofed
+  datagram is a free log-flood primitive.
+- **Cancelling an awaited UDP query releases its pending slot.** The timeout
+  path popped it; cancellation — the common case on caller timeouts and
+  reconnects — did not, growing the pending dict for the resolver's lifetime.
+- **The server bounds task creation, not just concurrent lookups.** Under a
+  datagram flood it previously minted one coroutine per packet before any
+  semaphore; excess traffic is now dropped silently per RFC 5625 section 6.2.
+
+### Added earlier in this effort
+
 - `LICENSE` — Apache-2.0. The repository previously had none, which meant
   "all rights reserved" by default and no one could lawfully use the code.
 - GitHub Actions CI: lint, a 3.12/3.13 × Ubuntu/Windows test matrix, a run of the

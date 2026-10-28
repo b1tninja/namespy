@@ -2,6 +2,14 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![CI](https://github.com/b1tninja/namespy/actions/workflows/ci.yml/badge.svg)
+![Security](https://github.com/b1tninja/namespy/actions/workflows/security.yml/badge.svg)
+<!-- PyPI badges go live with the first release; publishing is wired and the
+     name is registered to this repo's trusted publisher at that moment. Until
+     then a shields.io pypi badge would render "no version" on the landing page.
+     Uncomment at the tag:
+[![PyPI - Version](https://img.shields.io/pypi/v/namespy.svg)](https://pypi.org/project/namespy/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/namespy.svg)](https://pypi.org/project/namespy/)
+-->
 
 An asyncio DNS library: a wire codec that survives malformed input, an iterative
 resolver that follows RFC 1034 section 5.3.3 literally, and a `dig`-flavoured

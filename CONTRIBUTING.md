@@ -82,11 +82,17 @@ presentation, so add the codec.
 
 ## Committing
 
-Direct commits to `master` are fine; this is a small repo and pull-request theatre
-would slow it down. Write the commit body the way `git log` is written here: the
-first line says *what* in the imperative, the body says *why* — including, for
-fixes, the symptom someone would have observed. A commit that only says "fix bug"
-is unsearchable the next time the same area needs work.
+`master` is branch-protected: every check in `ci.yml`, `security.yml` and
+`socket.yml` must be green, strictly, before a push or merge is accepted
+(`gh api repos/b1tninja/namespy/branches/master/protection` shows the exact
+list). Direct pushes to `master` are still the norm for this small repo --
+just push work that has already passed everything above locally. Outside
+contributions arrive as pull requests, which additionally get
+`dependency-review` and require conversation resolution. Write the commit
+body the way `git log` is written here: the first line says *what* in the
+imperative, the body says *why* -- including, for fixes, the symptom someone
+would have observed. A commit that only says "fix bug" is unsearchable the
+next time the same area needs work.
 
 `CHANGELOG.md` follows Keep a Changelog; add a line under `Unreleased` when a
 change is visible to a user of the library. Pure test or doc churn does not need
