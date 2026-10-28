@@ -42,7 +42,7 @@ Spec anchors: RFC 1035, RFC 2181, RFC 9267, RFC 3597, RFC 4343, RFC 3688.
 
 | Obligation | Spec | Status | Where |
 |---|---|---|---|
-| UDP query/response correlated by source + ID + echoed question | 5452 §5 | ✅ | `test_resolver_matching.py` |
+| UDP query/response correlated by source + ID + echoed question | 5452 §9.1 | ✅ | `test_resolver_matching.py` |
 | `TC=1` re-asked over TCP; a truncated answer is never returned and never cached | 1123 §6.1.3.2, 1035 §7.4, 7766 §6 | ✅ | `test_resolver_truncation.py` |
 | UDP timeout re-asks over TCP | 1035 §4.2.2, 7766 §6 | ✅ | `test_resolver_truncation.py` |
 | TCP framing: 2-octet length prefix, same query re-sent verbatim | 7766 §3.1, §6 | ✅ | `test_resolver_truncation.py` |
@@ -75,7 +75,7 @@ is one row per obligation.
 | Obligation | Spec | Status | Where |
 |---|---|---|---|
 | Iterate from the roots; never send RD=1 | §5.3.3, §4.3.1 | ✅ | `test_resolve_steps.py`, `test_resolver_e2e.py` |
-| SLIST selection, demotion on failure, retry without discarding the server | §5.3.3(d), 5625 §2.6 | ✅ | `test_resolve_steps.py` |
+| SLIST selection, demotion on failure, retry without discarding the server | §5.3.3(d) | ✅ | `test_resolve_steps.py` |
 | Referral following, including glueless NS sub-resolution | §3.6.3–§3.6.4 | ✅ | `test_resolve_steps.py` |
 | CNAME chasing with a hop bound | §5.3.3(c) | ✅ | `test_resolver_alias.py` |
 | DNAME substitution and restart at the zone cut — the non-CNAME alias | 6672 §5 | ✅ | `test_resolver_alias.py` |
@@ -90,11 +90,11 @@ is one row per obligation.
 
 | Obligation | Spec | Status | Where |
 |---|---|---|---|
-| Response accepted only on matching source address, transaction ID **and** echoed question | 5452 §5–§6 | ✅ | `test_resolver_matching.py` |
-| Randomised transaction IDs, ephemeral source port | 5452 §5 | ✅ | constructor path, `test_resolver_matching.py` |
+| Response accepted only on matching source address, transaction ID **and** echoed question | 5452 §4.2–§4.3, §9.1 | ✅ | `test_resolver_matching.py` |
+| Randomised transaction IDs, ephemeral source port | 5452 §9.2 | ✅ | constructor path, `test_resolver_matching.py` |
 | Refusal of a reply that omits the question section | 1035 §4.1 | ✅ | `test_resolver_matching.py` |
-| In-bailiwick glueless NS refused as lame | 5625 §2.5 | ✅ | `test_resolve_steps.py` |
-| Out-of-bailiwick glue and extra-section records filtered | 5625 §2.5 | ⬜ | roadmap P1 — the reverse case of the row above; a server can still plant address records above its zone cut |
+| In-bailiwick glueless NS refused as lame | §4.2.1 | ✅ | `test_resolve_steps.py` |
+| Out-of-bailiwick glue and extra-section records filtered | 5452 §6 | ✅ | `test_resolver_classify.py` — glue is accepted only for a name inside the answering zone or the zone it delegates; anything else is discarded and the server's address is obtained by sub-resolution instead |
 | 0x20 QNAME-case encoding as extra entropy | 6841 | ⬜ | roadmap P3 — marginal over port+ID+question without DNSSEC |
 
 ## 6. DNSSEC — RFC 4033/4034/4035
@@ -121,8 +121,8 @@ takes on are the ones that keep it from becoming a weapon.
 |---|---|---|---|
 | Loopback bind only; documented why an open resolver is an amplification instrument | 5358, 9085 | ✅ | `test_server.py`, `SECURITY.md` |
 | Malformed datagrams dropped at `DEBUG`, never logged louder | 5358 §4.2 rationale | ✅ | `test_review_fixes.py` |
-| Concurrent lookups and task creation bounded; excess dropped silently | 5625 §6.2 | ✅ | `test_server.py`, `test_review_fixes.py` |
-| QDCOUNT ≠ 1 → FORMERR; unsupported OPCODE → NOTIMP, question echoed | 1035 §4.1, 5452 §5 | ✅ | `test_server.py` |
+| Concurrent lookups and task creation bounded; excess dropped silently | 5358 §4 (the bound itself is a design decision) | ✅ | `test_server.py`, `test_review_fixes.py` |
+| QDCOUNT ≠ 1 → FORMERR; unsupported OPCODE → NOTIMP, question echoed | 1035 §4.1, 5452 §9.1 | ✅ | `test_server.py` |
 | OPT echoed in responses; EDNS-aware responder | 6891 §6.2.4 | ⬜ | roadmap P1 — pairs with the §3 responder row |
 | Rate limiting, RRL, cache sharing | 5358 §3, 9085 §4 | ▫️ | non-goal — it is a test fixture, not a service; `SECURITY.md` says so |
 
@@ -144,7 +144,7 @@ of code built on namespy, not by implementation cost.
 
 | # | Item | Spec | Why it ranks here | Cost |
 |---|---|---|---|---|
-| **P1** | Bailiwick filter for out-of-zone glue | 5625 §2.5 | a hostile delegation can still plant addresses above its zone cut — the *remaining half* of a defence the code already claims | small |
+| ~~P1~~ | ~~Bailiwick filter for out-of-zone glue~~ shipped | 5452 §6 | ✅ `classify` now accepts glue only for a name inside the answering zone or the zone it delegates | — |
 | **P1** | EDNS options TLV parse/emit, then per-server payload adaptation | 6891 §6.1.2/§6.2.3, 5001 | unlocks NSID for debugging; shrinks the truncation/TCP detour that dominates big answers | small–medium |
 | **P1** | Server echoes OPT; EDNS-aware responses | 6891 §6.2.4 | makes the demo server honest about what it claims on the wire | small |
 | **P2** | ~~QNAME minimisation~~ shipped opt-in | 9156 | ✅ probe walk + descent integration; flipping the default is a field-behaviour decision, not a code one | — |

@@ -39,7 +39,7 @@ labels. Use :func:`escape_label` / :func:`unescape_label` to convert.
 * RFC 1035 sections 3.1 (wire form), 3.5, 4.1.4 (compression), 5.1 (escaping)
 * RFC 2181 section 11 (name syntax -- no label restrictions)
 * RFC 8552 / BCP 222 (underscored, scoped node names)
-* RFC 9267 sections 2, 4 (pointer loops, name-buffer limits)
+* RFC 9267 sections 2, 3 (pointer loops, label and name length limits)
 """
 
 from __future__ import annotations
@@ -324,7 +324,7 @@ class DomainName:
 
         RFC 1034 section 3.1: "if Y is a domain and X is a label, then X.Y is a
         subdomain of Y", and every domain is a subdomain of itself. That reflexive
-        reading is what zone-cut and bailiwick tests want (RFC 5625 section 2.5);
+        reading is what zone-cut and bailiwick tests want (RFC 5452 section 6);
         a DNAME needs the strict form, because it redirects only names *below* its
         owner and never the owner itself (RFC 6672 section 2.1).
 

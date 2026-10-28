@@ -8,7 +8,7 @@ detail:
   with a pointer", reserved ``01``/``10`` label types
 * RFC 2181 section 11 -- no syntax restrictions on labels
 * RFC 4592 section 4 / BCP 222 -- wildcards and underscored node names
-* RFC 9267 sections 2 and 4 -- pointer loops, name-buffer limits
+* RFC 9267 sections 2 and 3 -- pointer loops, label and name length limits
 
 The corpus is deliberately built from raw octets rather than from this
 library's own encoder, so a bug in :meth:`DomainName.__bytes__` cannot hide a

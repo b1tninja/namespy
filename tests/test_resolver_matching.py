@@ -1,9 +1,11 @@
 """Response matching: which datagram is allowed to answer which question.
 
 A resolver's cache is only as trustworthy as the check that ties a response to
-the query it answers. RFC 5452 sections 5-6 is the normative text: a client must
-validate the transaction ID *and* the question section, because the ID is only 16
-bits and is otherwise the sole in-band discriminator. Keying on
+the query it answers. RFC 5452 section 9.1 is the normative text: a client must
+validate the source and destination address, the destination port, the
+transaction ID *and* the whole question section before trusting a reply, because
+the ID is only 16 bits and RFC 5452 sections 5 and 7 show how cheaply that space
+is searched. Keying on
 ``(server, ID)`` -- which is what this code used to do -- means any host that can
 send a UDP datagram to our source port with a guessed ID can install an answer,
 and RFC 1034 section 5.3.3's walk then follows wherever that answer points.
@@ -16,7 +18,7 @@ are exercised together.
 
 * RFC 1034 section 5.3.3 (the delegations a poisoned answer can steer)
 * RFC 1035 section 4.1, 4.1.1 (a response must carry the question section)
-* RFC 5452 sections 5, 6 (validate ID and question before accepting)
+* RFC 5452 sections 4.2-4.3 and 9.1 (validate ID and question before accepting)
 """
 
 import asyncio
@@ -213,7 +215,7 @@ async def test_v6_answer_arriving_in_compressed_form_is_matched(resolver):
 def test_generated_ids_are_well_spread():
     """``DnsPacket`` picks a fresh 16-bit ID per message, not a counter.
 
-    RFC 5452 section 5 counts on the identifier being hard to guess, and the
+    RFC 5452 sections 5 and 7 count on the identifier being hard to guess, and the
     constructor takes it from :func:`secrets.randbits`. Birthday maths means a
     few hundred draws must collide occasionally, so the bar here is "spread over
     the space", not "all distinct".

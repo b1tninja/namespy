@@ -84,7 +84,7 @@ async def main():
     loop = asyncio.get_running_loop()
     transport, resolver = await loop.create_datagram_endpoint(
         RecursiveResolver,
-        local_addr=("0.0.0.0", 0),  # ephemeral source port, RFC 5452 section 5
+        local_addr=("0.0.0.0", 0),  # ephemeral source port, RFC 5452 section 9.2
     )
     try:
         query = Query(questions=[DnsQuestion(DomainName("example.com."), DnsQType.A)])
@@ -146,9 +146,12 @@ them change the security properties of anything built on top.
   server sees only the labels the previous referral proved relevant, at the
   cost of more queries. `--trace` marks the probe queries, and budget
   exhaustion degrades back to full names rather than failing.
-- **Partial bailiwick enforcement.** A referral whose NS names are *inside* the
-  new zone but arrive without glue is refused as lame (RFC 5625 §2.5); the reverse
-  case — NS names outside the zone with no glue — is not checked yet.
+- **Bailiwick is enforced on glue only.** A referral's address records are accepted
+  for a nameserver name inside the answering zone or inside the zone it delegates
+  (RFC 5452 §6, RFC 1034 §4.2.1); anything else is discarded and that server's
+  address is resolved from its own authority instead. Answers and negative
+  assertions are stored for the queried name only — no other section is cached, so
+  there is nothing else for a referral to smuggle.
 - **Not a name server.** No zone storage, no serving of a zone, no AXFR/IXFR. The
   bundled `DnsServer` answers from the resolver for loopback testing.
 - **UDP, with TCP only for truncation.** No DNS over TLS (RFC 7858), HTTPS

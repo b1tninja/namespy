@@ -383,7 +383,7 @@ class DnsQType(_TypeMixin, IntEnum):
     TKEY = 249
     TSIG = 250
     IXFR = 251  # query-only: RFC 1995
-    AXFR = 252  # query-only: RFC 1035 section 6
+    AXFR = 252  # query-only: RFC 1035 section 3.2.3
     MAILB = 253  # query-only: MB-type wildcard (RFC 1035 section 3.2.3)
     MAILA = 254  # query-only: MB-type wildcard (RFC 1035 section 3.2.3)
     ANY = 255  # query-only wildcard (RFC 1035 section 3.2.3)

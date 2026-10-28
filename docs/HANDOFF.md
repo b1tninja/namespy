@@ -135,13 +135,16 @@ cd D:\code\namespy
   default-off is deliberate. serve-stale (RFC 8767), DNSSEC validation
   (RFC 4033/4034/4035), IDN/punycode (RFC 5891), DoT/DoH (RFC 7858/8484)
   remain open.
-- Out-of-bailiwick glue filtering and the matching lame check (RFC 5625
-  section 2.5 — the reverse case of the check that exists). Roadmap P1,
-  the highest-priority open item.
+- ~~Out-of-bailiwick glue filtering~~ — shipped: `classify` takes a referral's
+  address records only for a nameserver name inside the zone that answered or
+  inside the zone that referral delegates (RFC 5452 section 6 with RFC 1034
+  section 4.2.1); anything else is discarded and that server's address comes from
+  the `NeedAddress` sub-resolution instead. The lame check for an in-bailiwick NS
+  with no glue was already in place.
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Next task: out-of-bailiwick glue filtering (roadmap P1, highest priority)
+## Next task: EDNS option TLV + per-server payload adaptation (roadmap P1, highest priority)
 
 QNAME minimisation shipped opt-in this round: probe walk + descent
 integration (`resolve_steps` takes `qname_min`), probe-aware handling of
@@ -153,27 +156,27 @@ rest of this section: `test_qname_min.py` for fake-server descent tests.
 
 The remaining P1 items, in `docs/roadmap.md` order:
 
-1. **Bailiwick filter for out-of-zone glue** (RFC 5625 section 2.5) — the
-   reverse case of the lame check that already exists: a referral may carry
-   A/AAAA records for names *above* its zone cut and they are believed
-   today. Where: referral handling in `resolve_steps` consumes glue from
-   the additional section; the filter belongs where the slist gains an
-   address, so both cache-write and follow paths inherit it. A name is
-   in-bailiwick of the referral's zone iff it is the zone or a subdomain of
-   it (`DomainName.is_subdomain_of`); everything else is dropped silently
-   at DEBUG. Tests: pattern in `test_resolve_steps.py` — a fake TLD
-   returning `NS ns.evil.com` + `A ns.evil.com 127.0.0.1` must be lame
-   (exists), plus new: referral for `example.com.` carrying
-   `A www.example.com <wrong>` in additional — that address must never
-   reach the cache or the answer.
-2. **EDNS option TLV parse/emit + per-server payload adaptation** (RFC 6891
+1. **EDNS option TLV parse/emit + per-server payload adaptation** (RFC 6891
    sections 6.1.2/6.2.3, NSID RFC 5001), then server-side OPT echo
    (section 6.2.4) so `--serve` answers extended queries as an EDNS server
    would.
-3. **Wildcard synthesis** (RFC 4592 section 2.2) — names carry
+2. **Wildcard synthesis** (RFC 4592 section 2.2) — names carry
    `is_wildcard` already; the closest-encloser proof and synthesized-TTL
    rule are missing, and until then answers from `*.example` zones are not
    RFC-identical.
+
+Shipped since the last handoff: the bailiwick filter for out-of-zone glue
+(RFC 5452 section 6). A referral's address records now reach an `SlistEntry` only
+if their owner is the answering zone or a subdomain of it, or lies under the zone
+the referral delegates — RFC 1034 section 4.2.1 makes a parent responsible for
+below-cut glue and nothing else it volunteers is credible. Discarded glue leaves
+the nameserver as a name that still needs an address, which the `NeedAddress`
+sub-resolution obtains from the servers that are authoritative for it (RFC 1034
+section 4.2.2). The filter lives in `classify`, so every consumer of a referral
+inherits it. Tests: `test_resolver_classify.py` (discard / keep-below-cut /
+not-lame-without-glue / per-nameserver), and the two-hop descent in
+`test_resolve_steps.py` now walks the sub-resolution instead of believing the
+volunteered address.
 
 Definition of done for any of these: focused tests + full suite green under
 `-O`; roadmap row flipped in the same commit; README/CHANGELOG updated if

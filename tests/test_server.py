@@ -15,8 +15,11 @@ the server is not tested against a mock of itself.
 
 * RFC 1035 section 4.3 (server behaviour, including what to do with a bad query)
 * RFC 5358 section 4 (BCP 140: an open recursion service must not be the default)
-* RFC 5452 section 5 (a client matches a reply on ID *and* the question section)
-* RFC 5625 section 6.2 (rate-limit; cap concurrent upstream work)
+* RFC 5452 sections 4.2-4.3 and 9.1 (a client matches a reply on ID *and* the
+  question section)
+* RFC 5625 section 6.2 (do not listen where you do not control the clients) and
+  section 6.3 (malformed traffic may be dropped); the bound on concurrent
+  upstream work is a design decision, not a specification number
 """
 
 import asyncio
@@ -238,8 +241,8 @@ async def test_answer_is_forwarded_with_the_query_id_and_question():
     reply = DnsPacket.parse(data)[0]
     assert reply.QR == DnsQR.RESPONSE
     assert reply.RA is True
-    # RFC 5452 section 5: ID alone is 16 bits of matching; the echoed question is
-    # what lets a client reject a forged reply that happened to guess the ID.
+    # RFC 5452 section 9.1: ID alone is 16 bits of matching; the echoed question
+    # is what lets a client reject a forged reply that happened to guess the ID.
     assert reply.ID == 0xABCD
     assert reply.questions[0].name == HOST
     assert int(reply.questions[0].qtype) == int(DnsQType.A)

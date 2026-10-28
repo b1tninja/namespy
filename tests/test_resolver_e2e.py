@@ -136,7 +136,7 @@ async def test_full_iterative_walk(resolver):
     assert response.AA is True
     assert len(response.answers) == 1
     assert bytes(response.answers[0].rdata) == HOST_IP.packed
-    # RFC 5452 section 5: the reply must carry the query's identifier back.
+    # RFC 5452 section 9.1: the reply must carry the query's identifier back.
     assert response.ID == 0x1234
 
 
@@ -168,7 +168,9 @@ async def test_glueless_referral_resolves_the_target(resolver):
     """An out-of-bailiwick NS with no glue is worth a sub-resolution.
 
     ``dns-sys.example.org.`` sits outside ``example.com.``, so its address is
-    obtainable from elsewhere and RFC 5625 section 2.6 permits asking. The
+    obtainable from elsewhere: RFC 1034 section 4.2.2 says a delegated server may
+    legitimately be named outside the zone, and section 5.3.3 step 2 says to
+    start a resolver process for its address. The
     sub-resolution has no address yet, so it arrives with ``addresses`` empty and
     lands on the ``None`` key.
     """
@@ -209,7 +211,9 @@ async def test_glueless_referral_resolves_the_target(resolver):
 async def test_in_bailiwick_glueless_is_lame_not_recursed(resolver):
     """A nameserver inside its own zone with no glue is lame, not retryable.
 
-    RFC 1035 section 6: reaching it would require having reached it. Before this
+    RFC 1034 section 4.2.1: glue is only mandatory for a server below the zone
+    cut, and this one is below it, so reaching it would require having reached it.
+    Before this
     check the resolver sub-resolved the target, descended back into the same
     zone, and recursed -- two branches per level for A and AAAA -- instead of
     failing. The test would hang rather than merely fail if that regressed.
@@ -238,8 +242,10 @@ async def test_off_site_answer_is_not_used_as_glue(resolver):
     """A sub-resolution answer for the wrong name must not redirect the walk.
 
     Same shape as the glueless test, but the address returned belongs to
-    ``evil.example.`` -- if it were accepted, the next query would go to it.
-    RFC 5625 section 2.5 requires data to be used only for the name asked.
+    ``evil.example.`` -- if it were accepted, the next query would go to it. RFC
+    5452 section 6 accepts data only from an originator authoritative for the name
+    it describes, and the name asked about here is ``dns-sys.example.org.``, so an
+    address for some other owner is not an answer to this query at all.
     """
     out_of_bailiwick = DomainName("dns-sys.example.org.")
     glueless = Response(

@@ -74,6 +74,153 @@ def test_classify_referral_better_extends_slist():
     assert slist.match == 1
     assert slist.entries
     assert slist.entries[0].zone == DomainName("com")
+    # The root's own glue survives the bailiwick filter: `a.gtld-servers.net` is
+    # not under `com.`, but it is under `.` — the zone that answered — and
+    # discarding it would force a sub-resolution starting from the servers whose
+    # addresses were just thrown away.
+    assert slist.entries[0].addresses == [ipaddress.IPv4Address("192.5.6.30")]
+
+
+def test_classify_discards_out_of_bailiwick_glue():
+    """A delegation must not get to choose where the rest of the lookup goes.
+
+    RFC 5452 section 6 allows only data the responder is authoritative for:
+    "only accept data if it is known that the originator is authoritative for
+    the QNAME or a parent of the QNAME". `ns.evil.net` sits inside neither `com.`
+    (the zone that answered) nor `example.com.` (the zone it delegated), so the
+    address offered as glue is discarded and the entry is left for the
+    NeedAddress sub-resolution rather than aimed at an address the referral
+    invented.
+    """
+    sname = Sname(DomainName("www.example.com"), DnsQType.A)
+    slist = _seed_slist(
+        DomainName("com"),
+        DomainName("a.gtld-servers.net"),
+        ipaddress.IPv4Address("192.5.6.30"),
+        sname=sname,
+        match=1,
+    )
+    entry = slist.best()
+
+    referral = _make_referral(
+        DomainName("www.example.com"),
+        DomainName("example.com"),
+        [DomainName("ns.evil.net")],
+        glue=[(DomainName("ns.evil.net"), ipaddress.IPv4Address("203.0.113.66"))],
+    )
+
+    steps = list(classify(referral, sname, slist, entry))
+    assert [type(step) for step in steps] == [Referral]
+
+    (ns_entry,) = slist.entries
+    assert ns_entry.ns == DomainName("ns.evil.net")
+    assert ns_entry.addresses == []
+    assert ns_entry.history["bailiwick"] == "out-of-bailiwick glue discarded"
+    # The referral itself is still progress: the NS *name* is legitimate, only
+    # its self-reported address is not (RFC 1034 section 4.2.2).
+    assert not ns_entry.history.get("demoted")
+    assert "lame" not in ns_entry.history
+
+
+def test_classify_keeps_glue_below_the_zone_cut():
+    """RFC 1034 section 4.2.1 makes the parent responsible for below-cut glue.
+
+    `ns1.example.com` is under the zone being delegated, which is precisely the
+    one place a parent may be believed. Filtering this would break every ordinary
+    delegation, so the test exists to catch an over-broad fix.
+    """
+    sname = Sname(DomainName("www.example.com"), DnsQType.A)
+    slist = _seed_slist(
+        DomainName("com"),
+        DomainName("a.gtld-servers.net"),
+        ipaddress.IPv4Address("192.5.6.30"),
+        sname=sname,
+        match=1,
+    )
+    entry = slist.best()
+
+    referral = _make_referral(
+        DomainName("www.example.com"),
+        DomainName("example.com"),
+        [DomainName("ns1.example.com")],
+        glue=[(DomainName("ns1.example.com"), ipaddress.IPv4Address("198.51.100.53"))],
+    )
+
+    steps = list(classify(referral, sname, slist, entry))
+    assert [type(step) for step in steps] == [Referral]
+
+    (ns_entry,) = slist.entries
+    assert ns_entry.addresses == [ipaddress.IPv4Address("198.51.100.53")]
+    assert "bailiwick" not in ns_entry.history
+    assert "lame" not in ns_entry.history
+
+
+def test_classify_out_of_bailiwick_without_glue_is_not_lame():
+    """A glueless out-of-zone server is normal, not a broken delegation.
+
+    RFC 1034 section 4.2.1 requires glue only for a server "below" the cut, so an
+    out-of-bailiwick NS name that arrives with no address is simply a name that
+    needs resolving (section 4.2.2), and demoting it would retire half the
+    nameservers on the Internet.
+    """
+    sname = Sname(DomainName("www.example.com"), DnsQType.A)
+    slist = _seed_slist(
+        DomainName("com"),
+        DomainName("a.gtld-servers.net"),
+        ipaddress.IPv4Address("192.5.6.30"),
+        sname=sname,
+        match=1,
+    )
+    entry = slist.best()
+
+    referral = _make_referral(
+        DomainName("www.example.com"),
+        DomainName("example.com"),
+        [DomainName("ns1.example.org")],
+    )
+
+    steps = list(classify(referral, sname, slist, entry))
+    assert [type(step) for step in steps] == [Referral]
+
+    (ns_entry,) = slist.entries
+    assert ns_entry.addresses == []
+    assert not ns_entry.history.get("demoted")
+    assert "lame" not in ns_entry.history
+    # Nothing was offered, so nothing was discarded.
+    assert "bailiwick" not in ns_entry.history
+
+
+def test_classify_bailiwick_is_per_nameserver():
+    """One poisoned glue record must not discredit the whole delegation."""
+    sname = Sname(DomainName("www.example.com"), DnsQType.A)
+    slist = _seed_slist(
+        DomainName("com"),
+        DomainName("a.gtld-servers.net"),
+        ipaddress.IPv4Address("192.5.6.30"),
+        sname=sname,
+        match=1,
+    )
+    entry = slist.best()
+
+    referral = _make_referral(
+        DomainName("www.example.com"),
+        DomainName("example.com"),
+        [DomainName("ns1.example.com"), DomainName("ns.evil.net")],
+        glue=[
+            (DomainName("ns1.example.com"), ipaddress.IPv4Address("198.51.100.53")),
+            (DomainName("ns.evil.net"), ipaddress.IPv4Address("203.0.113.66")),
+        ],
+    )
+
+    steps = list(classify(referral, sname, slist, entry))
+    assert [type(step) for step in steps] == [Referral]
+
+    by_name = {e.ns: e for e in slist.entries}
+    assert by_name[DomainName("ns1.example.com")].addresses == [
+        ipaddress.IPv4Address("198.51.100.53")
+    ]
+    assert by_name[DomainName("ns.evil.net")].addresses == []
+    assert "bailiwick" in by_name[DomainName("ns.evil.net")].history
 
 
 def test_classify_referral_not_closer_demotes():

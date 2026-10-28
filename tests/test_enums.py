@@ -85,7 +85,8 @@ def test_query_only_members_are_exactly_the_mb_wildcards_and_transfers() -> None
     """Pin the whole query-only delta, so a new member cannot slip in silently.
 
     RFC 1035 section 3.2.3 assigns 253/254 to the obsolete MB/MF/MR wildcard and
-    255 to ``*``; RFC 1035 section 6 assigns ``AXFR``. ``IXFR`` (251, RFC 1995)
+    255 to ``*``; the same QTYPE table assigns ``AXFR`` (252, a request for a
+    transfer of an entire zone). ``IXFR`` (251, RFC 1995)
     is deliberately excluded because it is a transfer request that a server can
     also answer with, and appears in the RR space too.
     """

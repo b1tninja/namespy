@@ -33,6 +33,24 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Changed
 
+- **Out-of-bailiwick glue is no longer believed (RFC 5452 section 6).** A
+  referral's address records are accepted only for a nameserver name inside the
+  zone that answered, or inside the zone that referral delegated -- RFC 1034
+  section 4.2.1 makes a parent responsible for exactly that glue, and nothing
+  else it volunteers is credible. Before this, any A/AAAA in the additional
+  section was used, so a delegation could aim the rest of a lookup, and the
+  queries sent while performing it, at an address of its own choosing. A
+  discarded address leaves the nameserver as a name that needs resolving, which
+  the existing `NeedAddress` sub-resolution satisfies from the servers that are
+  authoritative for it (RFC 1034 section 4.2.2). Pinned by
+  `test_resolver_classify.py`; the two-hop descent in `test_resolve_steps.py`
+  now walks that sub-resolution instead of believing the volunteered address.
+- Every RFC citation in the tree was re-checked against the published texts.
+  The corrections were mostly to section numbers that do not exist or say
+  something else: response matching is RFC 5452 section 9.1 (not 5), ID and
+  source-port randomisation is section 9.2, in-domain acceptance is section 6,
+  and RFC 5625 -- DNS Proxy Implementation Guidelines -- has no section 2.5 at
+  all; its packet-filtering advice is section 6.3.
 - **Record TTLs are now clamped to 2147483647 (RFC 2181 section 8).** The
   clamp existed as `clamp_ttl()` but was never called: a hostile or buggy
   server offering `0xFFFFFFFF` produced a cache entry that never expired,

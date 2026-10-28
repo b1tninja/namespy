@@ -1,10 +1,10 @@
 # Security Policy
 
 This is a DNS **library**: a wire codec, an iterative resolver, and a demo
-server. Its threat model is therefore mostly the one described in RFC 5625
-(DNS Message Implementation Requirements) and RFC 9267 (DNS Transfer
-Compression Considered Harmful), which is unusually concrete about what a parser
-must survive.
+server. Its threat model is therefore mostly the one described in RFC 5452
+(forged answers) and RFC 5625 (DNS Proxy Implementation Guidelines), which is
+unusually concrete about what a parser must survive, plus RFC 9267 (DNS Transfer
+Compression Considered Harmful).
 
 ## Reporting a vulnerability
 
@@ -62,15 +62,27 @@ are enforced by the test suite, and `tools/` and CI keep them enforced:
 A reply is only credited to a query if it comes from **the same address we sent
 it to**, carries the **same transaction ID**, and **echoes the question section**
 (QNAME, QTYPE, QCLASS) faithfully — see `_pending_key` /
-`_is_expected_response` in `resolver.py`. That is RFC 5452 sections 5 and 6:
-the ID is 16 bits and brute-forceable alone, but a forger must also reproduce the
-name being resolved. A response with no question section never matches, which is
-deliberate — RFC 1035 section 4.1 makes the question section mandatory in
-responses.
+`_is_expected_response` in `resolver.py`. Those are exactly the attributes RFC
+5452 section 9.1 requires a resolver to match a response against before applying
+any trust rules, and "a mismatch and the response MUST be considered invalid" is
+what the code does with one. The ID alone is 16 bits and brute-forceable, but a
+forger must also reproduce the name being resolved. A response with no question
+section never matches, which is deliberate — RFC 1035 section 4.1.1 requires the
+question to be echoed in every response.
 
 Query IDs come from `random.getrandbits`, and outgoing sockets bind to port `0`
-so the OS chooses an ephemeral source port; both are required by RFC 5452
-section 5 and neither is optional.
+so the OS chooses an ephemeral source port; RFC 5452 section 9.2 requires both to
+be unpredictable, and neither is optional.
+
+Content is held to RFC 5452 section 6 as well: a resolver must take "care ... to
+only accept data if it is known that the originator is authoritative for the QNAME
+or a parent of the QNAME". In practice that means glue from a referral is accepted
+only for a nameserver name inside the zone that answered, or inside the zone that
+referral delegated — the one extra name space a parent is responsible for (RFC
+1034 section 4.2.1). Any other address is discarded and the nameserver's address
+is resolved from the servers that *are* authoritative for it. Without that filter,
+a delegation could steer the rest of a lookup, and the queries sent while
+performing it, to an address of the delegating server's choosing.
 
 **Not implemented, and you should know before relying on it:**
 
@@ -79,9 +91,9 @@ section 5 and neither is optional.
   response to the right port still wins; nothing here checks an RRSIG.
 - **No response rate limiting.** This library is a client. If you embed it in
   something that answers on behalf of others, RFC 5358 becomes your obligation.
-- **No bailiwick enforcement** on glue and extra-section records (RFC 5625
-  section 2.5). Names below a zone cut can be filled in by the server that
-  supplied them.
+- **No 0x20 query-name case randomisation** (RFC 6841), which would add entropy on
+  top of port and ID. It is deliberately absent: it breaks badly-behaved
+  upstreams more often than it helps.
 
 ### The bundled server and CLI demo
 

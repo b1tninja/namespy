@@ -19,8 +19,10 @@ consequences shape this module:
 .. rubric:: References
 
 * RFC 1035 section 4.1.1 (header), section 4.3 (server behaviour)
-* RFC 5358 section 4 (BCP 140: do not operate an open recursion service)
-* RFC 5625 section 6.2 (rate-limit, and cap concurrent work)
+* RFC 5358 section 3 (why a recursing server is an amplification instrument),
+  section 4 (BCP 140: give recursive service to intended clients only)
+* RFC 5625 section 6.2 (do not listen on interfaces you do not control), section
+  6.3 (intrinsically malformed traffic MAY be dropped rather than answered)
 """
 
 import asyncio
@@ -35,7 +37,8 @@ LOGGER = logging.getLogger(__name__)
 
 #: How many upstream lookups one server instance allows at once. Bounded on
 #: purpose: it is what makes this server's *egress* provably limited relative to
-#: its ingress, which is the property an amplification defence needs.
+#: its ingress, which is the property an amplification defence needs (RFC 5358
+#: section 3). No specification sets a number -- this one is a design decision.
 MAX_CONCURRENT_LOOKUPS = 32
 
 
@@ -93,10 +96,10 @@ class DnsServer(asyncio.Protocol):
         """Reply with *rcode*, echoing the question so the client can match it.
 
         A client correlates a response with its query by ID *and* the echoed
-        question (RFC 5452 section 5), so an error response with an empty
-        question section is one the client may discard. *dns_packet* is ``None``
-        when the datagram could not be parsed at all, and there is nothing to
-        echo.
+        question (RFC 5452 sections 4.2-4.3 and 9.1), so an error response with an
+        empty question section is one the client may discard. *dns_packet* is
+        ``None`` when the datagram could not be parsed at all, and there is
+        nothing to echo.
         """
         questions = list(dns_packet.questions) if dns_packet is not None else []
         self._reply(
@@ -175,9 +178,10 @@ class DnsServer(asyncio.Protocol):
             # minted a coroutine, so ingress -- not the operator -- sized the
             # task set. The 2x margin keeps the semaphore meaningful (a few
             # lookups may wait their turn) while the backlog stays bounded;
-            # past it, silent drop is RFC 5625 section 6.2's answer for
-            # overload: no response, no amplification, no log growth at
-            # default level.
+            # past it, silent drop is the design's answer for overload -- the
+            # same treatment RFC 5625 section 6.3 sanctions for intrinsically
+            # malformed traffic: no response, no amplification, no log growth
+            # at default level.
             self.log.debug("server_overload_drop(src=%s:%s)", host, port)
             return
         self._spawn(self.respond_to_packet(dns_packet, addr))

@@ -335,7 +335,8 @@ def test_a_referral_must_actually_get_closer():
     assert slist.zone == DomainName("sub.example.com")
     assert slist.match == 3
     assert slist.entries[0].ns == DomainName("ns1.sub.example.com")
-    # RFC 1035 section 6: ns1.sub.example.com is inside the zone it serves and
+    # RFC 1034 section 4.2.1 and RFC 1035 section 5.2 item 3:
+    # ns1.sub.example.com is inside the zone it serves and
     # arrived without glue, so it is unreachable by construction. Demoting it now
     # is what stops the resolver sub-resolving it and descending into the same
     # zone again -- a descent that branches (A and AAAA) at every level.
@@ -365,7 +366,11 @@ def test_in_bailiwick_nameserver_with_glue_is_not_demoted():
 
 
 def test_out_of_bailiwick_nameserver_without_glue_is_not_demoted():
-    """A target outside the delegated zone may be resolved elsewhere (RFC 5625 2.6)."""
+    """A target outside the delegated zone may be resolved elsewhere.
+
+    RFC 1034 section 4.2.2: a zone's nameservers need not have names inside it,
+    so a glueless target above the zone cut is legitimate, not lame.
+    """
     sname = Sname(DomainName("host.sub.example.com"), DnsQType.A)
     slist = _seed_slist(DomainName("example.com"), ROOT_NS, ROOT_IP, sname, match=2)
     authority = [_record(DomainName("sub.example.com"), DnsRType.NS, DomainName("ns1.other.net"))]
@@ -379,7 +384,8 @@ def test_out_of_bailiwick_nameserver_without_glue_is_not_demoted():
 
 
 def test_referral_glue_ignores_a_cname_at_the_target():
-    """RFC 1034 5.4.1 permits an address record to be a CNAME, which is not glue.
+    """RFC 1034 5.3.3 step 4 permits the address lookup to answer with a CNAME,
+    which is not an address RR and therefore not glue.
 
     Accepting it would put a name where an address belongs.
     """

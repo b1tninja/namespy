@@ -238,15 +238,20 @@ Deliberately unimplemented, each with the spec that would drive it:
   UDP payload ceiling at 512 octets (§6.2.3) and caps us at the 4-bit RCODEs.
   Truncation is a direct consequence of that ceiling, and is now handled: a
   `TC` answer is re-asked over TCP rather than believed (RFC 1123 §6.1.3.2).
-- **QNAME minimisation** (RFC 9156) is not done: the full QNAME goes to every
+- **QNAME minimisation** (RFC 9156) is available but not the default: pass
+  `qname_min=True` (or `--qname-min`) to send each server only the labels the
+  previous referral proved relevant. By default the full QNAME goes to every
   server on the way down. See the note in `resolve_steps`.
 - **No DNSSEC validation.** The `AD` bit is surfaced but not verified; nothing
   in `RDATA` speaks RRSIG/DNSKEY (RFC 4033/4034/4035), and there is no trust
   anchor.
-- **Out-of-bailiwick referral names.** `classify` already marks a referral lame
-  when an *in*-bailiwick NS arrives without glue (RFC 5625 §2.5); it does not
-  yet check the reverse case, where the authority section's NS names sit outside
-  the new zone and no glue was offered either.
+- **Bailiwick covers glue, and that is all a referral can carry.** `classify`
+  refuses an *in*-bailiwick NS that arrives without glue, because RFC 1034 §4.2.1
+  says a parent must supply it, and it discards glue for any name outside both the
+  answering zone and the zone being delegated (RFC 5452 §6). What it does not do
+  is cache anything else from a referral's extra sections — it stores no
+  non-authoritative section at all, so the usual out-of-bailiwick poisoning path
+  is closed by never being opened.
 - **No IDN/punycode.** Labels are octets, end to end (RFC 2181 §11). A caller
   wanting RFC 5890-style A-labels must encode before calling.
 

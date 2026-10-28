@@ -140,8 +140,18 @@ def test_resolve_steps_two_hops_root_to_com_to_example():
     assert isinstance(step, Referral)
     assert step.match_after == 2
 
+    # RFC 5452 section 6: `a.iana-servers.net` lies outside both `com.` (the zone
+    # that answered) and `example.com.` (the zone it delegated), so the address
+    # the referral volunteered is discarded and the driver has to obtain it from
+    # the servers that are authoritative for it.
     step = next(gen)
+    assert isinstance(step, NeedAddress)
+    assert step.ns_name == DomainName("a.iana-servers.net")
+
+    step = gen.send([ipaddress.IPv4Address("199.43.135.53")])
     assert isinstance(step, SendQuery)
+    assert step.entry.addresses == [ipaddress.IPv4Address("199.43.135.53")]
+
     final = _make_answer(DomainName("example.com"), ipaddress.IPv4Address("93.184.216.34"))
     step = gen.send(final)
     assert isinstance(step, Answer)

@@ -314,9 +314,12 @@ class DnsPacket:
         suffix=b"",
     ):
         if ID is None:
-            # RFC 5452 section 5 treats the transaction ID as the resolver's
-            # principal defence against off-path forgery, and section 6.1 asks
-            # for it to be hard to guess. secrets.randbits draws from the
+            # RFC 5452 sections 4.3 and 9.1 make the transaction ID one of the
+            # resolver's few defences against off-path forgery, section 9.2 asks
+            # for it to be randomised along with the source port, and RFC 5625
+            # section 6.1 restates that for proxies: "strongly RECOMMENDED that
+            # DNS proxies follow the relevant recommendations in [RFC5452],
+            # particularly those in Section 9.2". secrets.randbits draws from the
             # operating system's source of randomness; random.getrandbits is a
             # Mersenne Twister, whose state an attacker who observes enough IDs
             # can recover, which is precisely the property a spoofing-resilient

@@ -7,8 +7,10 @@ the same obligation the fix does:
 * RFC 9267 section 5 -- RDATA is fully accounted for, in both directions
 * RFC 1035 section 3.3.14 -- TXT carries at least one <character-string>
 * RFC 1035 section 3.1 -- no wire form exists for an interior empty label
-* RFC 5358 section 4.2 -- the attacker-controlled path stays quiet at default
-* RFC 5625 section 6.2 -- an overloaded server drops rather than accumulates
+* RFC 5625 section 6.3 -- intrinsically malformed traffic may be dropped, and the
+  attacker-controlled path stays quiet at the default level
+* Design decision, informed by RFC 5358 section 3 -- an overloaded server drops
+  rather than accumulates work
 """
 
 import asyncio

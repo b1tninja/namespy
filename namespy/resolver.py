@@ -24,10 +24,15 @@ hints from the network is now the explicit, awaited
 .. rubric:: References
 
 * RFC 1034 section 5.3.2 (resolver state: Sname/Slist/Sbelt), section 5.3.3
-  (the algorithm), section 3.6.2 (aliases must not loop)
-* RFC 1035 section 4.3 (server behaviour), section 5.4.1 (CNAME in the answer)
+  (the algorithm), section 3.6.2 (aliases must not loop), section 4.2.1 (glue
+  RRs: only necessary for servers below the cut), section 4.2.2 (a zone's
+  servers need not have names inside it)
+* RFC 1035 section 4.3 (server behaviour), section 5.2 item 3 (delegations
+  need their glue), RFC 1034 section 5.3.3 step 4c (CNAME in the answer)
 * RFC 2308 section 5 (negative caching from SOA.MINIMUM)
-* RFC 5452 sections 5-6 (matching responses to queries; source-port randomness)
+* RFC 5452 section 9.1 (query matching rules), sections 5 and 7 (why a 16-bit ID
+  alone is brute-forceable), section 9.2 (source-port randomness), section 6
+  (accept only records inside the domain that was asked about)
 * RFC 6672 section 5.1 (DNAME plus CNAME makes alias loops easier to build)
 * RFC 7766 section 6 (TCP for truncation and for AXFR)
 * RFC 8106 section 2 (root hints: an initial address set is required)
@@ -591,7 +596,10 @@ class Sbelt(Slist):
         ``demoted`` from a timeout, by contrast, is an observation about one
         attempt; propagating it would let a single dropped packet retire a root
         server for the lifetime of the resolver, which is why real resolvers use
-        backoff instead of permanent exclusion (RFC 1034 section 5.4.1).
+        backoff instead of permanent exclusion. RFC 1034 section 5.3.3 step 3
+        is the ancestor of that: "cycle around all of the addresses for all of
+        the servers with a timeout between each transmission", with SLIST
+        entries carrying the timeout state.
         """
         clone = SlistEntry(entry.zone, entry.ns, list(entry.addresses))
         lame = entry.history.get("lame")
@@ -631,7 +639,11 @@ class NeedAddress:
     """The driver must resolve *ns_name* to an address before it can be queried.
 
     Raised for a glueless NS -- one whose name appears in the authority section
-    but whose address did not (RFC 1034 section 3.6.4, RFC 5625 section 2.5).
+    but whose address did not. Glue is only mandatory for servers *below* the
+    cut (RFC 1034 section 4.2.1), and a server outside it is legitimate, not
+    lame (RFC 1034 section 4.2.2), so the address has to be chased elsewhere:
+    RFC 1034 section 5.3.3 step 2, "the best is to start parallel resolver
+    processes looking for the addresses while continuing onward".
     """
 
     ns_name: DomainName
@@ -701,9 +713,10 @@ class Cname:
 class Demote:
     """*entry* is being marked unusable, for *reason*.
 
-    RFC 5625 section 2.6 forbids discarding a server on a single failure, so a
-    demotion is a ranking change within the current Slist, not a deletion from
-    the name space.
+    A demotion is a ranking change within the current Slist, not a deletion
+    from the name space: RFC 1034 section 5.3.3 step 3 cycles "around all of
+    the addresses for all of the servers", and step 4d removes a server from
+    SLIST only for the current query, never from the cache.
     """
 
     entry: SlistEntry | None
@@ -769,20 +782,29 @@ def _pending_key(dst, packet):
     """The identity a response must match for us to accept it as *the* answer.
 
     Keyed on destination address, transaction ID, **and the question**, not just
-    address and ID. RFC 5452 sections 5 and 6 are the reason: the ID alone is 16
-    bits, which an off-path sender can brute-force, whereas a response must also
-    reproduce the QNAME, QTYPE and QCLASS we asked about before it can be taken
-    for an answer. That turns a 65k-guess problem into one that also requires
-    knowing the name being resolved, and it is the difference between a resolver
-    that can be poisoned by a stray or forged packet and one that cannot.
+    address and ID. RFC 5452 section 9.1 is the reason: it tells a client to
+    match a response against source address, destination address, destination
+    port, ID, QNAME, QCLASS and QTYPE before crediting it to a query. The ID on
+    its own is 16 bits, and sections 5 and 7 of that document are the birthday
+    arithmetic that makes it brute-forceable by an off-path sender, whereas a
+    response must also reproduce the QNAME, QTYPE and QCLASS we asked about
+    before it can be taken for an answer. That turns a 65k-guess problem into one
+    that also requires knowing the name being resolved, and it is the difference
+    between a resolver that can be poisoned by a stray or forged packet and one
+    that cannot.
+
+    The source and destination ports are not in the key because they are not free
+    to vary here: the response arrives on the socket the query left from, so the
+    transport already enforced RFC 5452 section 4.5 for us, and only the peer
+    address is ours to check.
 
     The key is derived from whichever packet it is handed, so the same function
     serves both sides: the outgoing query registers under it, and an incoming
     response is looked up by it. A response that omits the question section
     entirely therefore never matches -- which is the intended strictness. RFC 1035
     section 4.1 says the question section "MUST be present in any DNS query or
-    DNS response message", and RFC 5452 section 5 tells a client to verify it
-    rather than assume it.
+    DNS response message", and RFC 5452 sections 4.2 and 9.1 tell a client to
+    verify it rather than assume it.
     """
     question = packet.questions[0] if packet.questions else None
     address = _canonical_address(dst)
@@ -802,8 +824,8 @@ def _is_expected_response(query_packet, response_packet, dst) -> bool:
 
     Checks, in order of cost: the QR bit says this is a response and not some
     unrelated query that happens to share an ID; the question section is echoed
-    faithfully. Both are required by RFC 1035 section 4.1.1 and both are
-    explicitly named as client-side validation by RFC 5452 section 5.
+    faithfully. Both are required by RFC 1035 section 4.1.1 and both are named as
+    client-side matching rules by RFC 5452 sections 4.2-4.3 and 9.1.
     """
     if DnsQR.RESPONSE != response_packet.QR:
         return False
@@ -1109,11 +1131,41 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
 
         new_entries = []
         for ns_target in ns_targets:
+            # RFC 5452 section 6: a response "often contain[s] information that
+            # is not part of the zone for which we deem it authoritative", and
+            # the remedy it prescribes is to "only accept data if it is known
+            # that the originator is authoritative for the QNAME or a parent of
+            # the QNAME". Here the originator serves ``old_zone``. The one name
+            # space it may additionally speak for is ``new_zone``, because RFC
+            # 1034 section 4.2.1 makes a parent responsible for the glue of
+            # every nameserver below the cut.
+            in_bailiwick = ns_target.is_subdomain_of(old_zone) or ns_target.is_subdomain_of(
+                new_zone
+            )
             addresses = []
+            discarded_glue = False
             for ar in response.additional_records:
-                # Glue must be for *this* target; RFC 1034 §5.4.1 allows an
-                # address record to be a CNAME, which is not glue at all.
+                # Glue must be for *this* target: RFC 1034 section 5.3.3 step
+                # 4 caches "the NS delegation RRs and any address RRs *for the
+                # servers*", which excludes every other owner name the extra
+                # section may carry. An address lookup on an NS name can also
+                # surface a CNAME, and a CNAME is not an address RR.
                 if ar.name != ns_target:
+                    continue
+                if not in_bailiwick:
+                    # ... and it must be *credible*. Out-of-bailiwick glue is
+                    # discarded: the delegating server is not authoritative for
+                    # this name, so the address it volunteered is exactly the
+                    # "data from an untrusted source" RFC 5452 section 6 warns
+                    # about, and accepting it lets any delegation point the rest
+                    # of this lookup -- and the queries it will send -- at an
+                    # address of the delegating server's choosing. The target
+                    # name itself remains perfectly usable (RFC 1034 section
+                    # 4.2.2: a delegated server's name need not lie inside the
+                    # zone), so it is simply left without an address, which
+                    # sends resolve_steps into the NeedAddress sub-resolution
+                    # that asks the servers who *are* authoritative for it.
+                    discarded_glue = True
                     continue
                 ip = _answer_address(ar)
                 # _answer_address validates the family against the RR type, so a
@@ -1123,15 +1175,18 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
                     addresses.append(ip)
             entry = SlistEntry(new_zone, ns_target, addresses)
             new_entries.append(entry)
-            if not addresses and ns_target.is_subdomain_of(new_zone):
-                # RFC 1035 section 6 / RFC 1034 section 5.4.1: a nameserver
-                # inside the zone it is delegated to can only be reached via glue
-                # supplied by the parent, because asking it for its own address
-                # means already having reached it. Such a target is *lame*, so it
-                # is demoted immediately: sub-resolving it would descend into the
-                # very zone we are trying to reach, and with an A and an AAAA
-                # attempt per level that is a 2x branching blowup rather than a
-                # lookup that simply fails.
+            if discarded_glue:
+                entry.history["bailiwick"] = "out-of-bailiwick glue discarded"
+            if not addresses and in_bailiwick:
+                # RFC 1034 section 4.2.1: glue is "only necessary if the name
+                # server's name is 'below' the cut", and RFC 1035 section 5.2
+                # item 3 requires a zone to ship it. A below-cut target with
+                # no glue is therefore a broken delegation -- *lame* -- because
+                # reaching it would require having reached it. Demote it
+                # immediately: sub-resolving would descend into the very zone
+                # we are trying to reach, and with an A and an AAAA attempt per
+                # level that is a 2x branching blowup rather than a lookup that
+                # simply fails.
                 entry.history["demoted"] = True
                 entry.history["lame"] = "in-bailiwick without glue"
         random.shuffle(new_entries)
@@ -1898,12 +1953,13 @@ class RecursiveResolver(Resolver):
                 sent = await self._send_for_entry(step.entry, step.questions)
                 continue
             if isinstance(step, NeedAddress):
-                # RFC 1034 section 5.3.3 and RFC 5625 section 2.6: glue may be
-                # absent (a "glueless" referral), in which case the NS target has
-                # to be resolved in its own right. Ask for A *and* AAAA so a
-                # target reachable only over IPv6 is not silently skipped, and
-                # read the payloads through the RDATA codecs rather than assuming
-                # every answer is four octets.
+                # RFC 1034 section 5.3.3 step 2: glue may be absent (a
+                # "glueless" referral) for a server outside the new zone, which
+                # is legitimate per section 4.2.2, and "the best is to start
+                # parallel resolver processes looking for the addresses". Ask
+                # for A *and* AAAA so a target reachable only over IPv6 is not
+                # silently skipped, and read the payloads through the RDATA
+                # codecs rather than assuming every answer is four octets.
                 addrs = []
                 for rtype in (DnsQType.A, DnsQType.AAAA):
                     child_sname = Sname(step.ns_name, rtype, DnsRClass.IN)
@@ -1918,10 +1974,11 @@ class RecursiveResolver(Resolver):
                     if not isinstance(sub_response, Response):
                         continue
                     for record in sub_response.answers:
-                        # RFC 5625 section 2.5: only accept data for the name
-                        # actually asked about. A server (or an attacker) that
-                        # answers with some other name's address must not be able
-                        # to steer where we send the next query.
+                        # RFC 5452 section 6: only records in the domain that was
+                        # asked about may be accepted, so an answer section that
+                        # happens to carry some other name's address is refused
+                        # here -- a server (or an attacker) must not be able to
+                        # steer where the next query goes.
                         if record.name != step.ns_name:
                             continue
                         address = _answer_address(record)
