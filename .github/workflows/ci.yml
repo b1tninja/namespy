@@ -81,7 +81,7 @@ jobs:
       - name: pytest under -O (assertions stripped)
         run: python -O -m pytest -q -p no:cacheprovider
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: pytest-${{ matrix.os }}-py${{ matrix.python-version }}
@@ -115,7 +115,7 @@ jobs:
           /tmp/verify/bin/python -m pip install --no-deps dist/*.whl
           cd /
           /tmp/verify/bin/python -c "import namespy, importlib.resources as r; print(len(r.files('namespy').joinpath('named.root').read_text().splitlines()), 'root hint lines')"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
