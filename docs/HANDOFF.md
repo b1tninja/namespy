@@ -228,11 +228,7 @@ implements it — that file is the fastest way into this codebase.
    exhaust. Plus round-trip: `parse(bytes(record)) == record` for generated
    records.
 
-4. **TC → TCP retry.** Precisely described in `docs/rfc-map.md` §11 — the
-   transport already exists, the third trigger (retry the same server because the
-   answer came back truncated) does not. RFC 1035 §4.3.1, RFC 7766 §6.
-
-5. **EDNS(0) is decoded but never sent.** `DnsPacket` has `opt()`,
+4. **EDNS(0) is decoded but never sent.** `DnsPacket` has `opt()`,
    `extended_rcode`, `ad`, `cd`, `requestor_payload_size`, and the CLI renders the
    OPT pseudo-section the way `dig` does. Outbound queries carry no OPT, so the
    receive ceiling is still 512 octets and RCODEs are still 4-bit. Needs: an OPT

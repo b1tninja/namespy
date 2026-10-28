@@ -174,14 +174,7 @@ class Resolver(asyncio.Protocol):
             queue_v6[key] = (dns_packet, future)
             # On Windows, IPv6 sendto expects the full 4-tuple (host, port, flowinfo, scopeid).
             transport_v6.sendto(bytes(dns_packet), (ip.exploded, 53, 0, 0))
-            try:
-                return await asyncio.wait_for(future, timeout=self.query_timeout)
-            except TimeoutError:
-                queue_v6.pop(key, None)
-                self.log.debug(
-                    "resolver_timeout_udp(dst=%s id=%s ip_version=6)", ip.exploded, dns_packet.ID
-                )
-                return None
+            return await self._await_udp(future, key, dns_packet, ip, queue=queue_v6)
 
         if not isinstance(ip, ipaddress.IPv4Address):
             future.cancel()
@@ -189,28 +182,81 @@ class Resolver(asyncio.Protocol):
 
         self.queue[key] = (dns_packet, future)
         self.transport.sendto(bytes(dns_packet), (ip.exploded, 53))
+        return await self._await_udp(future, key, dns_packet, ip)
+
+    async def _await_udp(self, future, key, dns_packet, ip, *, queue=None):
+        """Await one UDP response, retrying over TCP when UDP could not carry it.
+
+        Two outcomes force a TCP retry, and neither is a matter of taste:
+
+        * **Timeout.** UDP may simply be blocked on the path, and RFC 1035
+          section 4.2.2 makes TCP the fallback transport for exactly that case.
+        * **``TC`` set.** RFC 1123 section 6.1.3.2: "If the Answer section of the
+          response is truncated and if the requester supports TCP, it SHOULD try
+          the query again using TCP."  Truncation is routine rather than exotic
+          here, because this library does not yet advertise EDNS(0) and is
+          therefore confined to 512-octet replies (RFC 1035 section 4.2.1) -- a
+          root ``.`` NS answer with glue is already bigger than that.
+
+        A truncated response is never returned, even when the TCP retry also
+        fails.  RFC 1123 section 6.1.3.2 forbids it outright -- "Truncated
+        responses MUST NOT be saved (cached) and later used in such a way that the
+        fact that they are truncated is lost" -- and RFC 1035 section 7.4 says a
+        resolver which "doesn't know whether it has a complete set ... should not
+        cache a possibly partial set of RRs".  Returning ``None`` makes the caller
+        demote this nameserver and consult another, which is the right failure
+        mode: a single partial answer would otherwise be cached and served to
+        every later client as though it were complete.
+
+        RFC 1035 section 4.3.1 does observe that a server should truncate "at the
+        end of the response and work forward in the datagram", so a truncated
+        response that still carries an authority section has a complete answer
+        section.  Acting on that means trusting the server to implement
+        truncation correctly in order to save one TCP exchange; the bit is taken
+        at face value instead.
+
+        The pending slot is released on timeout whether or not the retry then
+        succeeds, so a late datagram cannot fulfil an abandoned future and the
+        slot cannot leak.
+        """
+        pending = self.queue if queue is None else queue
+        version = 6 if isinstance(ip, ipaddress.IPv6Address) else 4
         try:
-            return await asyncio.wait_for(future, timeout=self.query_timeout)
+            response = await asyncio.wait_for(future, timeout=self.query_timeout)
         except TimeoutError:
-            # Drop the queue slot so a late response doesn't try to fulfil
-            # a cancelled future (and so the slot doesn't leak); the caller
-            # treats ``None`` as "no response" and demotes the entry.
-            self.queue.pop(key, None)
+            pending.pop(key, None)
             self.log.debug(
-                "resolver_timeout_udp(dst=%s id=%s ip_version=4)", ip.exploded, dns_packet.ID
+                "resolver_timeout_udp(dst=%s id=%s ip_version=%d)",
+                ip.exploded,
+                dns_packet.ID,
+                version,
             )
-            # UDP may be blocked; try TCP (RFC 1035 section 4.2.2).
             return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+
+        if response is not None and response.TC:
+            self.log.debug(
+                "resolver_truncated_udp(dst=%s id=%s ip_version=%d)",
+                ip.exploded,
+                dns_packet.ID,
+                version,
+            )
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+        return response
 
     async def _query_tcp(self, host, wire, query_packet):
         """Query over TCP, with the 2-octet length prefix RFC 1035 section 4.2.2.
 
-        TCP is the fallback for three distinct reasons, all reached from here:
-        the UDP attempt timed out, a response had ``TC`` set (handled by the
-        caller), and zone transfers, which are TCP-only. The timeouts are
-        per-phase rather than one budget for the whole exchange, so a server that
-        accepts the connection and then stalls cannot hold the lookup open for
-        three times the query timeout.
+        TCP is reached from three places: a UDP attempt that timed out, a UDP
+        response with ``TC`` set (see :meth:`_await_udp`), and zone transfers,
+        which are TCP-only (RFC 5936). The timeouts are per-phase rather than one
+        budget for the whole exchange, so a server that accepts the connection and
+        then stalls cannot hold the lookup open for three times the query timeout.
+
+        A response that arrives over TCP with ``TC`` still set is returned as it
+        came. RFC 7766 section 8 gives TCP a 65535-octet message field, so
+        truncation should not happen, but a server that sets the bit anyway is
+        answered honestly rather than silently; :func:`_write_cache` refuses to
+        cache it.
 
         The answer is checked against *query_packet* just as a UDP answer is.
         Point-to-point transport removes the off-path forgery threat that
@@ -1181,7 +1227,19 @@ def _write_cache(cache, sname, terminal_event, response):
     yielded for this response; ``response`` is the corresponding wire
     packet (used for the AA flag and to dig the SOA out of the authority
     section on NXDOMAIN).
+
+    A truncated response is never stored. RFC 1123 section 6.1.3.2 states it as
+    a prohibition -- "Truncated responses MUST NOT be saved (cached) and later
+    used in such a way that the fact that they are truncated is lost" -- and
+    RFC 1035 section 7.4 explains why: a partial RRset is indistinguishable from
+    a complete one once stored, so caching one lets a single truncated answer
+    masquerade as authority for the whole RRset. This is a second line of defence
+    behind the TCP retry in :meth:`RecursiveResolver.query`, because TCP can also
+    carry ``TC`` from a misbehaving server, and a caller that drives
+    :func:`resolve_steps` directly has no transport layer to protect it.
     """
+    if response is not None and getattr(response, "TC", False):
+        return
     now = cache.time_fn()
     if isinstance(terminal_event, Answer):
         records = list(terminal_event.records)
@@ -1484,7 +1542,7 @@ class RecursiveResolver(Resolver):
             )
             return
 
-        self.log.debug(f"resolver_datagram_recieved({dns_packet}, {addr})")
+        self.log.debug("resolver_datagram_received(packet=%s, addr=%s)", dns_packet, addr)
         host = addr[0]
         entry = self.queue.get(_pending_key(host, dns_packet))
         if entry is None:
