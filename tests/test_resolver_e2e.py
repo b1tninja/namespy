@@ -17,7 +17,7 @@ from namespy.cache import MemoryDnsCache
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Query, Response
 from namespy.rdata import RData_A, RData_AAAA, RData_NS, RData_SOA
-from namespy.resolver import Demote, RecursiveResolver
+from namespy.resolver import Demote, GluePolicy, RecursiveResolver, VolunteeredGlue
 
 GTLD = DomainName("a.gtld-servers.net.")
 GTLD_IP = ipaddress.IPv4Address("192.5.6.4")
@@ -28,6 +28,9 @@ HOST_IP = ipaddress.IPv4Address("93.184.216.34")
 #: Never a legitimate destination in any test here, so its appearance in the
 #: send log is unambiguous evidence that off-site data steered the walk.
 EVIL_IP = ipaddress.IPv4Address("203.0.113.66")
+#: A nameserver name outside both ``com.`` and ``example.com.``, so an address
+#: offered for it is out-of-bailiwick by construction.
+EVIL = DomainName("ns.evil.net.")
 
 A_T, NS_T, SOA_T, AAAA_T = 1, 2, 6, 28
 
@@ -278,6 +281,43 @@ async def test_off_site_answer_is_not_used_as_glue(resolver):
     await resolver.resolve(Query(questions=[DnsQuestion(HOST, A_T, 1)]))
     destinations = [address for _, address in network.sent]
     assert str(EVIL_IP) not in destinations
+
+
+async def test_volunteered_glue_moves_the_walk_only_when_believed():
+    """One flag, the same traffic, a different destination -- the whole point.
+
+    The ``.com`` servers here delegate ``example.com.`` to ``ns.evil.net.`` and
+    volunteer an address for it. Under the default policy nothing is ever sent to
+    that address: the walk cannot reach the zone and returns nothing, which is the
+    safe outcome and, until this event existed, an invisible one. Under
+    :class:`~namespy.resolver.GluePolicy.PERMISSIVE` the same address *is* the
+    next hop, the answer arrives from it, and the trace records that it was
+    believed. Reproducing that difference is the research use case, and it is why
+    the safe behaviour could not remain the only behaviour.
+    """
+    volunteered = _referral(DomainName("example.com."), EVIL, EVIL, EVIL_IP)
+    answers = {GTLD_IP: volunteered, EVIL_IP: authoritative()}
+
+    strict_network = FakeNetwork(answers, root_referral())
+    strict = _wire(RecursiveResolver(cache=MemoryDnsCache()), strict_network)
+    assert await strict.resolve(Query(questions=[DnsQuestion(HOST, A_T, 1)])) is None
+    assert str(EVIL_IP) not in [address for _, address in strict_network.sent]
+    assert any(
+        isinstance(event, VolunteeredGlue) and not event.used for event in strict.last_trace.events
+    )
+
+    lenient_network = FakeNetwork(answers, root_referral())
+    lenient = _wire(
+        RecursiveResolver(cache=MemoryDnsCache(), glue_policy=GluePolicy.PERMISSIVE),
+        lenient_network,
+    )
+    response = await lenient.resolve(Query(questions=[DnsQuestion(HOST, A_T, 1)]))
+
+    assert str(EVIL_IP) in [address for _, address in lenient_network.sent]
+    assert bytes(response.answers[0].rdata) == HOST_IP.packed
+    assert any(
+        isinstance(event, VolunteeredGlue) and event.used for event in lenient.last_trace.events
+    )
 
 
 async def test_trace_is_attached_and_renders(resolver):

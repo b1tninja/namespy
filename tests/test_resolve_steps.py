@@ -17,6 +17,7 @@ from namespy.resolver import (
     Slist,
     SlistEntry,
     Sname,
+    VolunteeredGlue,
     resolve_steps,
 )
 
@@ -144,6 +145,16 @@ def test_resolve_steps_two_hops_root_to_com_to_example():
     # that answered) and `example.com.` (the zone it delegated), so the address
     # the referral volunteered is discarded and the driver has to obtain it from
     # the servers that are authoritative for it.
+    #
+    # The refusal is announced on the way: what a delegation offered is a result
+    # in its own right, so it reaches the trace instead of being destroyed inside
+    # the classifier.
+    step = next(gen)
+    assert isinstance(step, VolunteeredGlue)
+    assert step.ns_name == DomainName("a.iana-servers.net")
+    assert step.addresses == (ipaddress.IPv4Address("199.43.135.53"),)
+    assert step.used is False
+
     step = next(gen)
     assert isinstance(step, NeedAddress)
     assert step.ns_name == DomainName("a.iana-servers.net")

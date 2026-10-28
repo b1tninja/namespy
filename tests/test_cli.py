@@ -34,7 +34,7 @@ from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Response
 from namespy.rdata import RData, RData_A, RData_NS, RData_TXT
-from namespy.resolver import Done, Sname
+from namespy.resolver import Done, GluePolicy, Sname
 from namespy.trace import Trace
 
 
@@ -347,6 +347,38 @@ async def test_cli_query_closes_the_transport_it_opened(monkeypatch):
     made = _stub_endpoints(monkeypatch, _answered)
     await cli.cli_query(_args(["example.com"]))
     assert made[0][0].closed is True
+
+
+def test_the_diagnostics_glue_flag_defaults_to_off():
+    """Nobody gets a resolver that believes volunteered glue by accident."""
+    assert _args(["example.com"]).allow_out_of_bailiwick_glue is False
+
+
+async def test_the_diagnostics_glue_flag_reaches_the_resolver(monkeypatch, capsys):
+    """Parsed is not the same as wired: the policy has to arrive on the resolver.
+
+    The flag's entire meaning is a resolver that adopts volunteered glue, so a
+    regression here would be a measurement run that filtered as usual and reported
+    exposure numbers it never measured. The banner is asserted in the same breath
+    because an answer printed beside no such warning is an answer somebody will
+    quote as though it were a normal lookup.
+    """
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["--allow-out-of-bailiwick-glue", "example.com"])) == 0
+
+    assert made[0][1].glue_policy is GluePolicy.PERMISSIVE
+    assert "BELIEVED" in capsys.readouterr().err
+
+
+async def test_a_plain_lookup_filters_glue_and_says_nothing_about_it(monkeypatch, capsys):
+    """The default run must stay byte-for-byte boring -- stdout included."""
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["example.com"])) == 0
+
+    assert made[0][1].glue_policy is GluePolicy.STRICT
+    assert "BELIEVED" not in capsys.readouterr().err
 
 
 async def test_cli_query_writes_the_trace_file(monkeypatch, tmp_path):

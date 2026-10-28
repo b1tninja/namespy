@@ -94,7 +94,7 @@ is one row per obligation.
 | Randomised transaction IDs, ephemeral source port | 5452 §9.2 | ✅ | constructor path, `test_resolver_matching.py` |
 | Refusal of a reply that omits the question section | 1035 §4.1 | ✅ | `test_resolver_matching.py` |
 | In-bailiwick glueless NS refused as lame | §4.2.1 | ✅ | `test_resolve_steps.py` |
-| Out-of-bailiwick glue and extra-section records filtered | 5452 §6 | ✅ | `test_resolver_classify.py` — glue is accepted only for a name inside the answering zone or the zone it delegates; anything else is discarded and the server's address is obtained by sub-resolution instead |
+| Out-of-bailiwick glue and extra-section records filtered | 5452 §6 | ✅ | `test_resolver_classify.py`, `test_glue_policy.py` — glue is accepted only for a name inside the answering zone or the zone it delegates; anything else is discarded and the server's address is obtained by sub-resolution instead. The discarded address is now a `VolunteeredGlue` trace event, and `GluePolicy.PERMISSIVE` lets it be believed so the exposure can be measured rather than only asserted |
 | 0x20 QNAME-case encoding as extra entropy | 6841 | ⬜ | roadmap P3 — marginal over port+ID+question without DNSSEC |
 
 ## 6. DNSSEC — RFC 4033/4034/4035

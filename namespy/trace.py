@@ -90,12 +90,19 @@ class Trace:
                 body.append(f"    Note over C: demote {ns} ({ev.reason})")
             elif cn == "NeedAddress":
                 body.append(f"    Note over C: glueless: resolve {ev.ns_name}")
+            elif cn == "VolunteeredGlue":
+                # One line per nameserver a responder volunteered an address for.
+                # Rendered under both policies on purpose: under the default the
+                # line says the address was refused, and a trace full of those
+                # lines is itself a measurement of who volunteers what.
+                offered = ", ".join(str(address) for address in ev.addresses) or "undecodable"
+                verdict = "believed" if ev.used else "discarded"
+                body.append(f"    Note over C: volunteered glue {ev.ns_name} ({offered}) {verdict}")
             elif cn == "Cname":
                 body.append(f"    Note over C: CNAME {ev.target}")
             elif cn == "Done":
                 body.append("    Note over C: done")
             elif cn == "Fail":
-                body.append(f"    Note over C: FAIL {ev.reason}")
                 body.append(f"    Note over C: FAIL {ev.reason}")
 
         lines = list(header)

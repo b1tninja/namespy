@@ -14,6 +14,7 @@ from namespy.resolver import (
     Slist,
     SlistEntry,
     Sname,
+    VolunteeredGlue,
     classify,
 )
 
@@ -110,7 +111,7 @@ def test_classify_discards_out_of_bailiwick_glue():
     )
 
     steps = list(classify(referral, sname, slist, entry))
-    assert [type(step) for step in steps] == [Referral]
+    assert [type(step) for step in steps] == [Referral, VolunteeredGlue]
 
     (ns_entry,) = slist.entries
     assert ns_entry.ns == DomainName("ns.evil.net")
@@ -120,6 +121,14 @@ def test_classify_discards_out_of_bailiwick_glue():
     # its self-reported address is not (RFC 1034 section 4.2.2).
     assert not ns_entry.history.get("demoted")
     assert "lame" not in ns_entry.history
+
+    # Discarding the address is the safe behaviour; recording that it existed is
+    # the research half. The event carries the offer and says plainly that it was
+    # not taken.
+    (glue,) = [step for step in steps if isinstance(step, VolunteeredGlue)]
+    assert glue.ns_name == DomainName("ns.evil.net")
+    assert glue.addresses == (ipaddress.IPv4Address("203.0.113.66"),)
+    assert glue.used is False
 
 
 def test_classify_keeps_glue_below_the_zone_cut():
@@ -213,7 +222,7 @@ def test_classify_bailiwick_is_per_nameserver():
     )
 
     steps = list(classify(referral, sname, slist, entry))
-    assert [type(step) for step in steps] == [Referral]
+    assert [type(step) for step in steps] == [Referral, VolunteeredGlue]
 
     by_name = {e.ns: e for e in slist.entries}
     assert by_name[DomainName("ns1.example.com")].addresses == [
@@ -221,6 +230,12 @@ def test_classify_bailiwick_is_per_nameserver():
     ]
     assert by_name[DomainName("ns.evil.net")].addresses == []
     assert "bailiwick" in by_name[DomainName("ns.evil.net")].history
+    # One note, for the poisoned nameserver only: glue a zone ships for its own
+    # server is unremarkable and records nothing, which is what makes a trace
+    # full of these events meaningful.
+    assert [step.ns_name for step in steps if isinstance(step, VolunteeredGlue)] == [
+        DomainName("ns.evil.net")
+    ]
 
 
 def test_classify_referral_not_closer_demotes():

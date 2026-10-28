@@ -17,6 +17,20 @@ nothing has been tagged or published yet, so `master` is the only version.
   exhaustion degrades to full-name queries; `--trace` marks probes. Off by
   default because it changes wire behaviour toward every downline server;
   CNAME chasing deliberately keeps full names.
+- Out-of-bailiwick glue is now a *policy* rather than only a behavior, so the
+  exposure it prevents can be measured. `GluePolicy` (`STRICT` default,
+  `PERMISSIVE`) is accepted by `RecursiveResolver`, `resolve_steps` and
+  `classify`; `namespy --allow-out-of-bailiwick-glue` reaches it from the CLI and
+  prints a warning on stderr, since an answer obtained this way may have been
+  steered by whoever delegated. Either way a referral's volunteered address is now
+  a `VolunteeredGlue` trace event — previously the address was discarded inside
+  `classify` and left no mark, so the interesting population (who volunteers glue
+  for someone else's nameservers, and what would happen if it were believed) was
+  exactly the part that could not be observed. `--trace` renders each one as
+  believed or discarded, and the policy is inherited by the glueless
+  sub-resolution so it cannot loosen halfway down a descent. Pinned by
+  `test_glue_policy.py`, with the end-to-end difference in destination shown by
+  `test_resolver_e2e.py`.
 - `RecursiveResolver.aclose()`, plus `async with` support, releases every socket
   a resolver owns: the endpoint transport asyncio attached, the private IPv6
   socket it opens for AAAA glue, and a bring-up task still in flight. Fails are
@@ -41,6 +55,9 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Changed
 
+- **`--trace` rendered every failure twice.** The `Fail` branch appended its note
+  twice, so a reader counted one dead end as two. Fixed as part of giving glue
+  observation somewhere to appear; `test_trace_mermaid.py` now pins the count.
 - **Out-of-bailiwick glue is no longer believed (RFC 5452 section 6).** A
   referral's address records are accepted only for a nameserver name inside the
   zone that answered, or inside the zone that referral delegated -- RFC 1034

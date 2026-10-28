@@ -32,7 +32,8 @@ hints from the network is now the explicit, awaited
 * RFC 2308 section 5 (negative caching from SOA.MINIMUM)
 * RFC 5452 section 9.1 (query matching rules), sections 5 and 7 (why a 16-bit ID
   alone is brute-forceable), section 9.2 (source-port randomness), section 6
-  (accept only records inside the domain that was asked about)
+  (accept only records inside the domain that was asked about -- the
+  :class:`GluePolicy` default, and what ``PERMISSIVE`` deliberately switches off)
 * RFC 6672 section 5.1 (DNAME plus CNAME makes alias loops easier to build)
 * RFC 7766 section 6 (TCP for truncation and for AXFR)
 * RFC 8106 section 2 (root hints: an initial address set is required)
@@ -41,6 +42,7 @@ hints from the network is now the explicit, awaited
 """
 
 import asyncio
+import enum
 import io
 import ipaddress
 import logging
@@ -111,6 +113,44 @@ QUERY_TIMEOUT_S = 5.0
 EDNS_PAYLOAD_SIZE = 1232
 
 
+class GluePolicy(enum.Enum):
+    """How much of a referral's volunteered address data may be believed.
+
+    RFC 5452 section 6 instructs a resolver to "take care to only accept data if
+    it is known that the originator is authoritative for the QNAME or a parent of
+    the QNAME", because a response "often contain[s] information that is not part
+    of the zone for which we deem it authoritative". :attr:`STRICT` is that
+    instruction executed: glue is believed only for a nameserver name inside the
+    zone that answered, or inside the zone that referral delegated -- RFC 1034
+    section 4.2.1 makes a parent responsible for exactly that glue, and for
+    nothing else it volunteers.
+
+    :attr:`PERMISSIVE` exists to measure the attack :attr:`STRICT` prevents. A
+    researcher reproducing a cache-poisoning vector, or auditing what a parent
+    zone actually volunteers about someone else's nameservers, needs the address
+    to be *used*: without that it is discarded inside the classifier and the
+    evidence never reaches a trace or a send log. It is a research instrument,
+    not a compatibility knob -- believing an out-of-zone address hands the rest of
+    the lookup, and the queries it sends, to the delegating server's choosing,
+    which is the capability RFC 5452 section 6 exists to deny.
+
+    Neither member relaxes three things, and each is a different reason:
+
+    * the **lame check** (a below-cut nameserver with no glue, RFC 1034 section
+      4.2.1) -- a reachability fact, not a trust judgement;
+    * **response matching** (RFC 5452 section 9.1) -- the defense against an
+      off-path forger, a different threat from a parent volunteering data;
+    * the **cache** -- glue is recorded nowhere in it, so a permissive descent
+      cannot persist a poisoning past the lookup that observed it.
+    """
+
+    #: RFC 5452 section 6 as written: in-bailiwick glue only. The default.
+    STRICT = "strict"
+
+    #: Believe any name-matching glue. Diagnostics only; see the class docstring.
+    PERMISSIVE = "permissive"
+
+
 class Resolver(asyncio.Protocol):
     """Send queries to authoritative servers and match the answers.
 
@@ -138,6 +178,11 @@ class Resolver(asyncio.Protocol):
     #: UDP payload advertised by the EDNS(0) OPT record on every outbound
     #: query (RFC 6891 section 6.2.3); ``0`` or ``None`` sends no OPT at all.
     edns_payload_size = EDNS_PAYLOAD_SIZE
+
+    #: Which volunteered glue the classifier believes; see :class:`GluePolicy`.
+    #: The safe member is also the class default, so a driver that never sets
+    #: it -- and a test that builds a bare ``Resolver()`` -- filters strictly.
+    glue_policy = GluePolicy.STRICT
 
     #: Optional DNS suffix the resolver assumes for *relative* names — those
     #: whose presentation form does not end in the root terminator (``.``).
@@ -690,6 +735,42 @@ class Demote:
 
 
 @dataclass(frozen=True)
+class VolunteeredGlue:
+    """A responder offered address RDATA for *ns_name*, and the policy decided it.
+
+    Emitted whenever a referral carries A/AAAA RDATA for a nameserver name the
+    answering zone is not authoritative for. Under :attr:`GluePolicy.STRICT` (the
+    default) it records what was **discarded**; under
+    :attr:`GluePolicy.PERMISSIVE`, what was **used**. This is the research
+    surface: the address a delegation volunteered is the datum a cache-poisoning
+    analysis is about, and before this event existed the evidence was destroyed
+    inside ``classify`` with only the bare fact of the discard left in
+    ``entry.history``.
+
+    Nothing is recorded here on clean traffic -- a zone that ships correct glue
+    for its own nameservers produces no event at all, so a trace full of these is
+    itself the measurement.
+
+    *records* is the evidence as it arrived (an RR that does not decode to an
+    address is still evidence that something was offered); *addresses* is what it
+    decodes to, which is exactly where the next query would be sent.
+    """
+
+    ns_name: DomainName
+    records: tuple
+    addresses: tuple
+    #: False when the policy refused the addresses, True when it believed them.
+    used: bool
+    reason: str
+
+    def __post_init__(self):
+        # Frozen like `Answer`: these are recorded in a Trace and read back long
+        # after the response that produced them is gone.
+        object.__setattr__(self, "records", tuple(self.records))
+        object.__setattr__(self, "addresses", tuple(self.addresses))
+
+
+@dataclass(frozen=True)
 class Done:
     """Resolution finished; *response* is the answer to hand back."""
 
@@ -995,13 +1076,26 @@ def _find_closer_delegation(response, sname, slist):
     return new_zone, ns_targets, match_after
 
 
-def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS):
+def classify(
+    response,
+    sname,
+    slist,
+    entry,
+    max_alias_hops: int = MAX_ALIAS_HOPS,
+    glue_policy: GluePolicy = GluePolicy.STRICT,
+):
     """Apply RFC 1034 §5.3.3 step 4 to a single response.
 
     Yields a sequence of trace events. Mutates `slist` for valid referrals
     (extends entries, advances zone/match). Each yielded `Demote` carries
     the entry the caller should mark demoted; each terminal `Done`
     completes the lookup.
+
+    ``glue_policy`` decides only the credibility of address RDATA that a referral
+    volunteers for a nameserver outside the answering zone -- see
+    :class:`GluePolicy`. Either way a :class:`VolunteeredGlue` event is yielded
+    after the `Referral`, because what a parent offered is worth recording even
+    when it is refused.
 
     A trailing `Cname` with no `Done` after it is **not** an error and not a
     conclusion: it means SNAME must be re-anchored at that target and the lookup
@@ -1096,6 +1190,7 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
         match_before = slist.match
 
         new_entries = []
+        glue_notes = []
         for ns_target in ns_targets:
             # RFC 5452 section 6: a response "often contain[s] information that
             # is not part of the zone for which we deem it authoritative", and
@@ -1109,7 +1204,7 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
                 new_zone
             )
             addresses = []
-            discarded_glue = False
+            volunteered = []
             for ar in response.additional_records:
                 # Glue must be for *this* target: RFC 1034 section 5.3.3 step
                 # 4 caches "the NS delegation RRs and any address RRs *for the
@@ -1118,31 +1213,59 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
                 # surface a CNAME, and a CNAME is not an address RR.
                 if ar.name != ns_target:
                     continue
-                if not in_bailiwick:
-                    # ... and it must be *credible*. Out-of-bailiwick glue is
-                    # discarded: the delegating server is not authoritative for
-                    # this name, so the address it volunteered is exactly the
-                    # "data from an untrusted source" RFC 5452 section 6 warns
-                    # about, and accepting it lets any delegation point the rest
-                    # of this lookup -- and the queries it will send -- at an
-                    # address of the delegating server's choosing. The target
-                    # name itself remains perfectly usable (RFC 1034 section
-                    # 4.2.2: a delegated server's name need not lie inside the
-                    # zone), so it is simply left without an address, which
-                    # sends resolve_steps into the NeedAddress sub-resolution
-                    # that asks the servers who *are* authoritative for it.
-                    discarded_glue = True
+                if in_bailiwick:
+                    ip = _answer_address(ar)
+                    # _answer_address validates the family against the RR type, so a
+                    # 16-octet "A" or a 4-octet "AAAA" contributes nothing rather
+                    # than raising out of the resolution loop.
+                    if ip is not None:
+                        addresses.append(ip)
                     continue
-                ip = _answer_address(ar)
-                # _answer_address validates the family against the RR type, so a
-                # 16-octet "A" or a 4-octet "AAAA" contributes nothing rather
-                # than raising out of the resolution loop.
-                if ip is not None:
-                    addresses.append(ip)
+                # ... and it must be *credible*, which is the question
+                # :class:`GluePolicy` answers. Out-of-bailiwick data is not
+                # believed by default: the delegating server is not authoritative
+                # for this name, so the address it volunteered is exactly the
+                # "data from an untrusted source" RFC 5452 section 6 warns about,
+                # and accepting it lets any delegation point the rest of this
+                # lookup -- and the queries it will send -- at an address of the
+                # delegating server's choosing. The target name itself remains
+                # perfectly usable (RFC 1034 section 4.2.2: a delegated server's
+                # name need not lie inside the zone), so it is simply left without
+                # an address, which sends resolve_steps into the NeedAddress
+                # sub-resolution that asks the servers who *are* authoritative.
+                #
+                # Refusing it is not a reason to forget it: the RRs a parent
+                # volunteers about someone else's nameservers are the measurement,
+                # and GluePolicy.PERMISSIVE is the switch that turns this same list
+                # into a next hop.
+                volunteered.append(ar)
             entry = SlistEntry(new_zone, ns_target, addresses)
             new_entries.append(entry)
-            if discarded_glue:
-                entry.history["bailiwick"] = "out-of-bailiwick glue discarded"
+            if volunteered:
+                believed = glue_policy is GluePolicy.PERMISSIVE
+                offered = [
+                    ip for ip in (_answer_address(ar) for ar in volunteered) if ip is not None
+                ]
+                if believed:
+                    entry.addresses.extend(offered)
+                entry.history["bailiwick"] = (
+                    "out-of-bailiwick glue accepted (unverified)"
+                    if believed
+                    else "out-of-bailiwick glue discarded"
+                )
+                glue_notes.append(
+                    VolunteeredGlue(
+                        ns_name=ns_target,
+                        records=tuple(volunteered),
+                        addresses=tuple(offered),
+                        used=believed,
+                        reason=(
+                            "believed under GluePolicy.PERMISSIVE"
+                            if believed
+                            else "not authoritative for this name (RFC 5452 section 6)"
+                        ),
+                    )
+                )
             if not addresses and in_bailiwick:
                 # RFC 1034 section 4.2.1: glue is "only necessary if the name
                 # server's name is 'below' the cut", and RFC 1035 section 5.2
@@ -1162,6 +1285,13 @@ def classify(response, sname, slist, entry, max_alias_hops: int = MAX_ALIAS_HOPS
         slist.match = match_after
 
         yield Referral(old_zone, new_zone, match_before, match_after)
+        # The glue notes come after the Referral, not before: the descent is the
+        # event a reader follows, and these are the footnotes explaining what the
+        # delegation volunteered on the way. resolve_steps lets them through even
+        # during a QNAME-minimisation probe, for the same reason -- they are an
+        # observation about a referral that was already accepted, never a
+        # statement about the probe that must not be mistaken for one.
+        yield from glue_notes
         for entry in new_entries:
             if entry.history.get("lame"):
                 yield Demote(entry, entry.history["lame"])
@@ -1193,6 +1323,7 @@ def resolve_steps(
     max_hops: int = MAX_HOPS,
     max_alias_hops: int = MAX_ALIAS_HOPS,
     qname_min: bool = False,
+    glue_policy: GluePolicy = GluePolicy.STRICT,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1211,6 +1342,13 @@ def resolve_steps(
     deeper children -- see :mod:`namespy.minimis` for the schedule. The
     default ``False`` is deliberate: it changes the questions every
     downline server sees, and it earns its default in the field.
+
+    ``glue_policy`` decides whether a referral's out-of-bailiwick address data
+    may be used as glue (see :class:`GluePolicy`). It is a parameter of this
+    function rather than ambient state because a single lookup can spawn
+    sub-resolutions, and a policy that failed to reach them would quietly stop
+    applying halfway down -- which in the permissive direction means the
+    measurement records an adoption that did not happen.
     """
     # Alias state lives here, not in classify: a CNAME in one response can point
     # at a name that another response aliases again, so only the loop spanning
@@ -1259,8 +1397,15 @@ def resolve_steps(
         response = yield SendQuery(entry, questions, probe=probe is not None)
         terminal = False
         alias_target = None
-        for step in classify(response, sname, slist, entry, max_alias_hops=max_alias_hops):
-            if probe is not None and not isinstance(step, (Demote, Referral)):
+        for step in classify(
+            response,
+            sname,
+            slist,
+            entry,
+            max_alias_hops=max_alias_hops,
+            glue_policy=glue_policy,
+        ):
+            if probe is not None and not isinstance(step, (Demote, Referral, VolunteeredGlue)):
                 # A probe response is not a statement about the original
                 # QNAME: "com. has no A record" must never become the final
                 # NODATA for www.example.com. RFC 9156 section 3 step 4 is
@@ -1268,7 +1413,8 @@ def resolve_steps(
                 # this codebase is a demote: the probed entry drops in rank,
                 # the response is discarded, and nothing about a probe may
                 # reach the cache keyed on the QNAME. Referrals (slist has
-                # already descended inside classify) fall through normally.
+                # already descended inside classify) and the volunteered-glue
+                # notes that annotate them fall through normally.
                 yield Demote(entry, f"probe {probe} returned no referral")
                 slist.demote(entry)
                 break
@@ -1586,6 +1732,7 @@ class RecursiveResolver(Resolver):
         query_timeout: float = QUERY_TIMEOUT_S,
         edns_payload_size: int | None = EDNS_PAYLOAD_SIZE,
         qname_min: bool = False,
+        glue_policy: GluePolicy = GluePolicy.STRICT,
     ):
         """Build a resolver without touching the network.
 
@@ -1607,6 +1754,18 @@ class RecursiveResolver(Resolver):
             progressively deeper children instead of being handed the whole
             name. Default ``False`` is deliberate -- it changes the question
             every downline server sees, so it earns its default in the field.
+        :param glue_policy: whether address data that a referral volunteers for
+            a nameserver outside the answering zone may be used as glue. The
+            default, :attr:`GluePolicy.STRICT`, is RFC 5452 section 6: only glue
+            inside the answering zone or below the cut it delegated is believed.
+            :attr:`GluePolicy.PERMISSIVE` believes any name-matching address; it
+            is a research instrument rather than a production setting, and
+            :class:`GluePolicy` says what accepting costs and what it does not.
+            Also accepted as the equivalent string, so a config file or CLI flag
+            can hand it over directly.
+        :raises ValueError: if *glue_policy* is not a :class:`GluePolicy` (or its
+            name/value) -- a policy that silently failed to apply would be worse
+            than one that was refused at the door.
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
         """
         self.queue: dict[tuple, tuple] = {}
@@ -1620,6 +1779,19 @@ class RecursiveResolver(Resolver):
         self.query_timeout = max(0.05, float(query_timeout))
         self.edns_payload_size = 0 if edns_payload_size is None else max(0, int(edns_payload_size))
         self.qname_min = bool(qname_min)
+        # Coerce here, at the door: GluePolicy("permissive") and
+        # GluePolicy.PERMISSIVE both arrive, and anything else raises now rather
+        # than leaving a resolver that believes it has a policy.
+        self.glue_policy = GluePolicy(glue_policy)
+        if self.glue_policy is not GluePolicy.STRICT:
+            # A warning, deliberately: this switch turns off a defense the RFC
+            # specifies, so the log of any run that measured with it should say
+            # so without anyone having to ask for -v.
+            self.log.warning(
+                "resolver_glue_policy=%s: out-of-bailiwick glue will be believed "
+                "(RFC 5452 section 6 filtering disabled) -- diagnostics only",
+                self.glue_policy.value,
+            )
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
@@ -2004,7 +2176,19 @@ class RecursiveResolver(Resolver):
                     # is an NS server's address, not the user's QNAME, so the
                     # privacy motivation of RFC 9156 section 1 does not apply
                     # and the extra probes would only slow glue resolution.
-                    sub_gen = resolve_steps(child_sname, child_slist, self.cache)
+                    #
+                    # glue_policy, by contrast, *is* inherited. This is where a
+                    # refused address goes to be looked up properly, and a policy
+                    # that stopped at the top of the descent would be a policy
+                    # that silently changes meaning halfway down -- in the
+                    # permissive direction, one that reports an adoption the
+                    # sub-resolution never performed.
+                    sub_gen = resolve_steps(
+                        child_sname,
+                        child_slist,
+                        self.cache,
+                        glue_policy=self.glue_policy,
+                    )
                     sub_response = await self._drive(sub_gen, child_trace, depth + 1)
                     if not isinstance(sub_response, Response):
                         continue
@@ -2070,6 +2254,7 @@ class RecursiveResolver(Resolver):
             max_hops=self.max_hops,
             max_alias_hops=self.max_alias_hops,
             qname_min=self.qname_min,
+            glue_policy=self.glue_policy,
         )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):

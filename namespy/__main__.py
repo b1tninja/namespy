@@ -19,7 +19,7 @@ from .enums import (
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsQuestion, Query
 from .rdata import generic_presentation, type_name_of
-from .resolver import EDNS_PAYLOAD_SIZE, RecursiveResolver
+from .resolver import EDNS_PAYLOAD_SIZE, GluePolicy, RecursiveResolver
 from .server import DnsServer
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
@@ -371,9 +371,39 @@ def build_parser():
         "children instead of the full name (RFC 9156); more queries, less "
         "exposure -- --trace marks the probes",
     )
+    p.add_argument(
+        "--allow-out-of-bailiwick-glue",
+        dest="allow_out_of_bailiwick_glue",
+        action="store_true",
+        help="DIAGNOSTICS ONLY: believe glue for a nameserver outside the zone "
+        "that referred us, instead of refusing it (RFC 5452 section 6 off). "
+        "Emits a warning at startup and a --trace line per address believed; "
+        "an answer obtained this way may have been steered by whoever "
+        "delegated. Never for a lookup you care about.",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="enable INFO-level logging")
     p.add_argument("--debug", action="store_true", help="enable DEBUG-level logging")
     return p
+
+
+def _glue_policy(args) -> GluePolicy:
+    """Translate the diagnostics flag into a policy -- and say so out loud.
+
+    The banner goes to stderr rather than only into the log because what this
+    switch produces is an answer that may have been steered by whoever delegated,
+    and an answer printed with no such warning beside it is an answer somebody
+    will quote. Stderr keeps that from disturbing a script parsing stdout: the
+    bytes on stdout are the same either way, and ``2>/dev/null`` is the deliberate
+    way to have it quiet.
+    """
+    if not getattr(args, "allow_out_of_bailiwick_glue", False):
+        return GluePolicy.STRICT
+    print(
+        "namespy: out-of-bailiwick glue will be BELIEVED (RFC 5452 section 6 "
+        "filtering off) -- diagnostics only, never for a lookup you rely on",
+        file=sys.stderr,
+    )
+    return GluePolicy.PERMISSIVE
 
 
 async def cli_query(args) -> int:
@@ -386,6 +416,7 @@ async def cli_query(args) -> int:
             dns_suffix=args.dns_suffix,
             edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
             qname_min=args.qname_min,
+            glue_policy=_glue_policy(args),
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -434,6 +465,7 @@ async def serve(args) -> int:
                 dns_suffix=args.dns_suffix,
                 edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
                 qname_min=args.qname_min,
+                glue_policy=_glue_policy(args),
             ),
             local_addr=("0.0.0.0", 0),
         )

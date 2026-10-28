@@ -84,6 +84,16 @@ is resolved from the servers that *are* authoritative for it. Without that filte
 a delegation could steer the rest of a lookup, and the queries sent while
 performing it, to an address of the delegating server's choosing.
 
+That filter is the default in every layer and there is no configuration file that
+changes it. `GluePolicy.PERMISSIVE` (`namespy --allow-out-of-bailiwick-glue`)
+exists so the exposure can be *measured*: it lets a volunteered address become the
+next hop, and prints a warning to stderr when a run starts with it on. Treat a run
+configured that way the way you would treat a packet captured in the clear — the
+answer it produces is data about an attack, not an answer. Under either policy the
+address a referral volunteered for an out-of-zone name is recorded as a
+`VolunteeredGlue` event in `--trace`, so the population of servers that volunteer
+such glue is visible without lowering anyone's defenses to count it.
+
 **Not implemented, and you should know before relying on it:**
 
 - **No DNSSEC validation** (RFC 4033/4034/4035). Answers are unauthenticated. A

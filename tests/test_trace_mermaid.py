@@ -7,6 +7,7 @@ from namespy.resolver import (
     Answer,
     Demote,
     Done,
+    Fail,
     NeedAddress,
     Nodata,
     Nxdomain,
@@ -14,6 +15,7 @@ from namespy.resolver import (
     SendQuery,
     SlistEntry,
     Sname,
+    VolunteeredGlue,
 )
 from namespy.trace import Trace
 
@@ -135,3 +137,49 @@ def test_to_mermaid_glueless_child_appended_below_parent():
     assert "Note over C: glueless: resolve ns.glueless" in out
     # parent + child each open with their own sequenceDiagram block
     assert out.count("sequenceDiagram") == 2
+
+
+def test_to_mermaid_records_volunteered_glue_under_both_verdicts():
+    """The line a researcher reads off the diagram: who offered what, and how it was treated.
+
+    Both verdicts are rendered because the *default* policy produces the refused
+    kind on exactly the traffic worth studying. The diagram is a record of what was
+    seen, not only of what was acted on.
+    """
+    refused = Trace(Sname(DomainName("www.example.com"), DnsQType.A))
+    refused.record(Referral(DomainName("com"), DomainName("example.com"), 1, 2))
+    refused.record(
+        VolunteeredGlue(
+            ns_name=DomainName("ns.evil.net"),
+            records=(),
+            addresses=(ipaddress.IPv4Address("203.0.113.66"),),
+            used=False,
+            reason="not authoritative for this name (RFC 5452 section 6)",
+        )
+    )
+    assert "volunteered glue ns.evil.net (203.0.113.66) discarded" in refused.to_mermaid()
+
+    believed = Trace(Sname(DomainName("www.example.com"), DnsQType.A))
+    believed.record(
+        VolunteeredGlue(
+            ns_name=DomainName("ns.evil.net"),
+            records=(),
+            addresses=(ipaddress.IPv4Address("203.0.113.66"),),
+            used=True,
+            reason="believed under GluePolicy.PERMISSIVE",
+        )
+    )
+    assert "volunteered glue ns.evil.net (203.0.113.66) believed" in believed.to_mermaid()
+
+
+def test_to_mermaid_renders_a_failure_once():
+    """One event, one line.
+
+    This note used to be emitted twice for a single ``Fail``, which a reader would
+    take for two distinct failures -- the reason an event that only ever becomes a
+    note still earns a test of its own.
+    """
+    trace = Trace(Sname(DomainName("example.com"), DnsQType.A))
+    trace.record(Fail("max hops"))
+
+    assert trace.to_mermaid().count("Note over C: FAIL max hops") == 1

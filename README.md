@@ -54,7 +54,8 @@ namespy --serve                      # demo server on 127.0.0.1:53
 
 `python -m namespy` does the same without installing the console script, and
 `namespy --help` lists the rest (`--no-edns`, `--root-hints`, `--dns-suffix`,
-`--timeout`, `--trace-file`, `-v`, `--debug`).
+`--timeout`, `--trace-file`, `--qname-min`, `--allow-out-of-bailiwick-glue`,
+`-v`, `--debug`).
 
 `--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
 useful for seeing exactly where a zone cut was crossed and which NS forced a
@@ -149,12 +150,16 @@ them change the security properties of anything built on top.
   server sees only the labels the previous referral proved relevant, at the
   cost of more queries. `--trace` marks the probe queries, and budget
   exhaustion degrades back to full names rather than failing.
-- **Bailiwick is enforced on glue only.** A referral's address records are accepted
-  for a nameserver name inside the answering zone or inside the zone it delegates
-  (RFC 5452 §6, RFC 1034 §4.2.1); anything else is discarded and that server's
-  address is resolved from its own authority instead. Answers and negative
-  assertions are stored for the queried name only — no other section is cached, so
-  there is nothing else for a referral to smuggle.
+- **Bailiwick is enforced on glue only, and it is now observable.** A referral's
+  address records are accepted for a nameserver name inside the answering zone or
+  inside the zone it delegates (RFC 5452 §6, RFC 1034 §4.2.1); anything else is
+  discarded and that server's address is resolved from its own authority instead.
+  What a delegation volunteered used to vanish inside the classifier; it is now a
+  `VolunteeredGlue` trace event, refused or believed. `GluePolicy.PERMISSIVE`
+  (`--allow-out-of-bailiwick-glue`) makes the refused addresses take effect, which
+  is how you measure the exposure rather than merely assert it — diagnostics only,
+  and it says so at startup. Answers and negative assertions are still stored for
+  the queried name only, so there is nothing else for a referral to smuggle.
 - **Not a name server.** No zone storage, no serving of a zone, no AXFR/IXFR. The
   bundled `DnsServer` answers from the resolver for loopback testing.
 - **UDP, with TCP only for truncation.** No DNS over TLS (RFC 7858), HTTPS
