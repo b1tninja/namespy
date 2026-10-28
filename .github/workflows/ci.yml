@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Hypothesis writes its counterexample database into the repo, which on a
+  # shared runner means a failure reproduced locally never reaches CI. Cached
+  # explicitly below instead of being thrown away with the rest of the checkout.
+  HYPOTHESIS_STORAGE_DIRECTORY: .hypothesis
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      # `check` reports, `format --check` is the one that notices drift: a
+      # formatter that only runs on a developer's machine diverges silently and
+      # then produces whole-file diffs in the next unrelated commit.
+      - run: ruff check . --output-format=github
+      - run: ruff format --check .
+
+      # Blocking at the level the code is actually at: mypy aiodns exits 0 today,
+      # so a check that merely printed the count would let regressions through
+      # while looking like a gate. --strict measures 274 errors, and 245 of them
+      # are no-untyped-def plus no-untyped-call -- one root cause, functions with
+      # no annotations, concentrated in resolver.py (132) rather than spread
+      # evenly. That is a per-module campaign, not a flag to flip: enabling
+      # strict globally would mean silencing the result, which is how a type
+      # checker stops being read.
+      - run: mypy aiodns
+
+  test:
+    name: Test py${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is not decoration. The bundled server used to call
+        # setsockopt(IPPROTO_IP, IP_MTU_DISCOVER, ...) unconditionally with
+        # hardcoded Linux constants, which raised on Windows in connection_made
+        # -- a bug that no Linux-only CI could ever see. asyncio also swaps to
+        # ProactorEventLoop here, so socket lifetime differs by platform.
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      # The coverage floor is fail_under in pyproject.toml, not duplicated here,
+      # so the threshold and the explanation for it stay in one file.
+      - name: pytest
+        run: python -m pytest -q
+
+      # This step is the reason the suite is worth running at all here. Every
+      # bounds check on a wire path was once an `assert`, which python -O strips
+      # out of the bytecode; the parser's hardening is therefore only real if the
+      # hostile-input tests still pass with assertions compiled away. Without
+      # this leg, "no assert on network data" is a comment rather than a policy.
+      - name: pytest under -O (assertions stripped)
+        run: python -O -m pytest -q -p no:cacheprovider
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: pytest-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            .hypothesis/
+            last_resolution.md
+          if-no-files-found: ignore
+
+  dist:
+    name: Build and audit distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: python -m build
+      - run: python tools/check_dist.py dist/
+      # Installs the wheel in a clean venv and asserts the root hints arrive
+      # through importlib.resources -- the one failure mode unit tests cannot
+      # see, because they always run against the source tree.
+      #
+      # The `cd /` is load-bearing: the checkout contains an aiodns/ directory,
+      # so importing from the workspace would silently import the source tree and
+      # "pass" no matter what the wheel actually contains.
+      - name: Install the wheel and load hints from it
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/python -m pip install --no-deps dist/*.whl
+          cd /
+          /tmp/verify/bin/python -c "import aiodns, importlib.resources as r; print(len(r.files('aiodns').joinpath('named.root').read_text().splitlines()), 'root hint lines')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

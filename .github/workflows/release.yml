@@ -1,0 +1,93 @@
+name: Release
+
+# Publishing is deliberately tag-gated rather than push-to-master: this project
+# has never been on PyPI, and the first upload should be an explicit act with a
+# version that exists in the tree. Cut a release with:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag must agree with aiodns.__init__.__version__, which is what hatchling
+# reads for the wheel's own version -- an unforced mismatch would put a name on
+# PyPI that no source tree anywhere claims to be.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.hash.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: Refuse a tag that disagrees with the package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          ACTUAL="$(python -c 'import aiodns; print(aiodns.__version__)')"
+          if [ "$TAG" != "$ACTUAL" ]; then
+            echo "tag says $TAG but aiodns.__version__ is $ACTUAL" >&2
+            exit 1
+          fi
+
+      - run: python -m build
+      - run: python tools/check_dist.py dist/
+
+      # SLSA provenance attribute: the SHA256 of every artifact the publish job
+      # will upload. Recorded here so a later audit can tie a file on PyPI back
+      # to this exact run without trusting the PyPI entry.
+      - name: Collect artifact digests
+        id: hash
+        run: |
+          cd dist && LANG=C LC_ALL=C sha256sum * | sort | sed 's/ *  */ /' \
+            | base64 -w0 > ../digest.b64
+          echo "digest=$(cat ../digest.b64)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing (OIDC) rather than a stored API token: no long-lived
+    # credential exists to leak, and the audience/environment gate means only
+    # this repository's tagged builds can mint an upload credential.
+    #
+    # DORMANT UNTIL ACTIVATED. Before the first release, on PyPI create the
+    # project `aiodns-dnspy` under Trusted Publishing with this repo, workflow
+    # file `release.yml`, and environment `pypi`; then create the matching
+    # `pypi` environment under Settings -> Environments and uncomment the
+    # `environment:` line below. GitHub rejects a job naming an environment that
+    # does not exist, which is why it is commented rather than pre-declared here:
+    # a misfired tag should fail at `twine` with a legible error, not at a
+    # half-configured environment.
+    # environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade twine
+      - run: python -m twine check dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

@@ -35,6 +35,9 @@ dev = [
   "hypothesis",
   "ruff",
   "mypy",
+  # tools/check_dist.py runs after it, and CI cannot assert a wheel contains the
+  # root hints without first being able to build one.
+  "build",
 ]
 
 [project.urls]
@@ -146,7 +149,11 @@ python_version = "3.12"
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
-# Advisory for now: the modules gained type hints unevenly, so failing CI on
-# this would block unrelated work. Tighten to strict per-module as they clear.
+# Advisory in intent, blocking in practice: CI runs `mypy aiodns` without `||
+# true`, and it exits 0. ignore_missing_imports stays on because the optional
+# third-party integrations are genuinely absent from a minimal install, not
+# merely unannotated. Do not turn on --strict globally: it measures 274 errors,
+# 245 of them unannotated functions concentrated in resolver.py. Clear it
+# per-module with [[tool.mypy.overrides]] instead.
 ignore_missing_imports = true
 
