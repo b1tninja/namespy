@@ -1,7 +1,7 @@
 """Resolution trace + Mermaid renderer.
 
 A `Trace` is the recorded yield stream of a `resolve_steps` generator. The
-async driver in `aiodns.resolver` calls `record(step)` on the trace for
+async driver in `namespy.resolver` calls `record(step)` on the trace for
 every yielded effect, and asks for a `child(sname)` whenever a glueless
 sub-resolution starts. `to_mermaid()` renders the recorded events as a
 Mermaid `sequenceDiagram` with one lane per zone-cut visited; nested

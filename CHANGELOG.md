@@ -16,7 +16,7 @@ nothing has been tagged or published yet, so `master` is the only version.
 - A release workflow gated on `v*` tags, using OIDC trusted publishing. Dormant
   until the PyPI project and its `pypi` environment exist; see the comments.
 - `tools/check_dist.py` — asserts a built wheel *and* sdist contain
-  `aiodns/named.root`, `aiodns/py.typed` and the license text, and that generated
+  `namespy/named.root`, `namespy/py.typed` and the license text, and that generated
   files have not leaked in.
 - `SECURITY.md`, `CONTRIBUTING.md`, `docs/rfc-map.md` (spec obligation → code →
   test), `docs/HANDOFF.md`, `docs/legacy/`.
@@ -28,7 +28,7 @@ nothing has been tagged or published yet, so `master` is the only version.
 - `DomainName.from_labels()`, `DomainName.is_subdomain_of()`,
   `DomainName.is_hostname`, `DomainName.is_wildcard`, `RData_SOA.serial_ahead()`,
   `RData_TXT.from_text()` / `.text`, `RData_MX.is_null_mx`.
-- `aiodns/py.typed`, a `dnspy` console script, and `[project.urls]`.
+- `namespy/py.typed`, a `namespy` console script, and `[project.urls]`.
 - `TC` now triggers a TCP retry. A UDP response with the truncation bit set, or a
   UDP attempt that times out, is re-asked over TCP to the same server
   (RFC 1123 section 6.1.3.2, RFC 7766 section 6). A truncated UDP answer is never
@@ -88,12 +88,12 @@ nothing has been tagged or published yet, so `master` is the only version.
   rdata=b"")` still works and wrapping never changes the wire form — asserted for
   every registered codec by `tests/test_rdata_wrapping.py`.
 - Package metadata: explicit `[build-system]` (hatchling), version `0.1.0` read
-  from `aiodns.__version__`, declared license, classifiers, coverage and lint
-  configuration, `mypy` clean on `aiodns`.
+  from `namespy.__version__`, declared license, classifiers, coverage and lint
+  configuration, `mypy` clean on `namespy`.
 
 ### Removed
 
-- `aiodns/dns.py` (empty), `Forwarder` (a constructor that did nothing), the
+- `namespy/dns.py` (empty), `Forwarder` (a constructor that did nothing), the
   unreachable `self.resolver.db` references, and the committed `dns.sql` /
   `database.png` scratch — legacy SQL notes moved to `docs/legacy/`.
 - Tracked generated files: `last_resolution.md` (in two places), `.cursor/plans/`.

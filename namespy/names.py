@@ -423,7 +423,7 @@ class DomainName:
           needing an unbounded set of seen offsets (RFC 9267 section 2);
         * a pointer whose target is another pointer is followed (legitimate wire
           form that a single-hop implementation rejects), up to
-          :data:`~aiodns.wire.MAX_POINTER_HOPS` hops;
+          :data:`~namespy.wire.MAX_POINTER_HOPS` hops;
         * the 63-octet label and 255-octet name budgets are enforced against
           the expanded name, counting length octets and the root terminator
           (RFC 1035 section 3.1, RFC 2181 section 11);

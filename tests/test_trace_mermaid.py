@@ -1,9 +1,9 @@
 import ipaddress
 
-from aiodns.enums import DnsQType, DnsRClass, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsRecord
-from aiodns.resolver import (
+from namespy.enums import DnsQType, DnsRClass, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsRecord
+from namespy.resolver import (
     Answer,
     Demote,
     Done,
@@ -15,7 +15,7 @@ from aiodns.resolver import (
     SlistEntry,
     Sname,
 )
-from aiodns.trace import Trace
+from namespy.trace import Trace
 
 
 def test_to_mermaid_emits_sequence_diagram_with_zone_lanes():

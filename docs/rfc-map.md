@@ -1,7 +1,7 @@
-# Recursive Resolution: RFC 1034 mapped onto DNSpy
+# Recursive Resolution: RFC 1034 mapped onto Namespy
 
 This document is the contributor reference for changes to
-[`aiodns/resolver.py`](../aiodns/resolver.py). It summarizes the parts of
+[`namespy/resolver.py`](../namespy/resolver.py). It summarizes the parts of
 [RFC 1034](https://www.ietf.org/rfc/rfc1034.txt) that drive resolution
 decisions and points at the symbols in our code that implement each.
 
@@ -22,7 +22,7 @@ itself. The `SendQuery` effect builds queries via
 
 ## 2. Resolver state (RFC 1034 §5.3.2)
 
-| Spec field | Meaning | DNSpy symbol |
+| Spec field | Meaning | Namespy symbol |
 |---|---|---|
 | SNAME  | The name we're searching for | `Sname.qname` |
 | STYPE  | QTYPE of the search | `Sname.qtype` |
@@ -49,7 +49,7 @@ flowchart TD
     Analyze -- "SERVFAIL/bizarre (4d)" --> Demote[demote server] --> Send
 ```
 
-In DNSpy:
+In Namespy:
 
 - **Step 1** (cache lookup): consulted at the top of every iteration of
   `resolve_steps`, so a re-anchored alias target gets a cache check too rather
@@ -57,7 +57,7 @@ In DNSpy:
   `Done(_synthesize_response(...))` and returns without touching the network;
   a miss falls through to step 2. Writes happen through `cache.put` when a
   response is classified. See
-  [`aiodns/cache/__init__.py`](../aiodns/cache/__init__.py) for `DnsCache`, its
+  [`namespy/cache/__init__.py`](../namespy/cache/__init__.py) for `DnsCache`, its
   in-memory and SQLite backends, and how negative entries take their TTL from
   the SOA (RFC 2308 §5).
 - **Step 2** (pick best server): `Slist.best()` returns the first
@@ -225,7 +225,7 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 | Negative responses (§4.3.4) | `Nodata`, `Nxdomain` events |
 | Truncation → TCP retry (RFC 1123 §6.1.3.2) | `Resolver._await_udp()` → `Resolver._query_tcp()` |
 | No-cache-on-truncation (RFC 1035 §7.4) | `_write_cache()` early return |
-| Trace tree | [`aiodns/trace.py`](../aiodns/trace.py) `Trace` |
+| Trace tree | [`namespy/trace.py`](../namespy/trace.py) `Trace` |
 | Mermaid output | `Trace.to_mermaid()` |
 
 ## 11. Known gaps

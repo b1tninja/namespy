@@ -18,10 +18,10 @@ Spec anchors, all quoted or paraphrased closely:
 
 import ipaddress
 
-from aiodns.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Response
-from aiodns.resolver import (
+from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Response
+from namespy.resolver import (
     MAX_ALIAS_HOPS,
     SendQuery,
     Slist,
@@ -70,7 +70,7 @@ def _record(name, rtype, rdata, ttl=300):
 
 def _soa(zone, minimum=3600, ttl=3600):
     """An SOA carrying a real MINIMUM, as RFC 2308 section 4 requires readers to use."""
-    from aiodns.rdata import RData_SOA
+    from namespy.rdata import RData_SOA
 
     rdata = RData_SOA(
         DomainName("ns1.example.com"),

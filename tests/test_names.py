@@ -1,5 +1,5 @@
-from aiodns.names import DomainName
-from aiodns.rdata import RData_NS
+from namespy.names import DomainName
+from namespy.rdata import RData_NS
 
 
 def test_domain_name_roundtrip_bytes_parse_from() -> None:

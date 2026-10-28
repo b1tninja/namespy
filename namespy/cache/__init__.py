@@ -5,10 +5,10 @@ own absolute expiry deadline in the cache's ``time_fn`` units (defaults
 to wall-clock seconds). Concrete backings:
 
 * :class:`MemoryDnsCache` — process-local dict with optional LRU bound.
-* :class:`SqliteDnsCache` — SQLite, ephemeral or on-disk (see :mod:`aiodns.cache.sqlite`).
+* :class:`SqliteDnsCache` — SQLite, ephemeral or on-disk (see :mod:`namespy.cache.sqlite`).
 
-The :class:`aiodns.resolver.RecursiveResolver` consults the cache at the
-top of each :func:`aiodns.resolver.resolve_steps` iteration before sending
+The :class:`namespy.resolver.RecursiveResolver` consults the cache at the
+top of each :func:`namespy.resolver.resolve_steps` iteration before sending
 any query, and writes back positive/negative results when an authoritative
 response classifies as ``Answer`` / ``Nodata`` / ``Nxdomain``.
 """

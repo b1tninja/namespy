@@ -1,7 +1,7 @@
-"""Wire-format primitives shared by :mod:`aiodns.names` and :mod:`aiodns.packet`.
+"""Wire-format primitives shared by :mod:`namespy.names` and :mod:`namespy.packet`.
 
 This module exists so that name parsing can raise structured errors without
-importing :mod:`aiodns.packet` (which imports :mod:`aiodns.names`). Everything
+importing :mod:`namespy.packet` (which imports :mod:`namespy.names`). Everything
 here is deliberately dependency-free.
 
 Two rules drive the design of the readers in this package:

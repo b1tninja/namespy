@@ -6,7 +6,7 @@ name: Release
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# The tag must agree with aiodns.__init__.__version__, which is what hatchling
+# The tag must agree with namespy.__init__.__version__, which is what hatchling
 # reads for the wheel's own version -- an unforced mismatch would put a name on
 # PyPI that no source tree anywhere claims to be.
 
@@ -35,9 +35,9 @@ jobs:
       - name: Refuse a tag that disagrees with the package version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          ACTUAL="$(python -c 'import aiodns; print(aiodns.__version__)')"
+          ACTUAL="$(python -c 'import namespy; print(namespy.__version__)')"
           if [ "$TAG" != "$ACTUAL" ]; then
-            echo "tag says $TAG but aiodns.__version__ is $ACTUAL" >&2
+            echo "tag says $TAG but namespy.__version__ is $ACTUAL" >&2
             exit 1
           fi
 
@@ -68,7 +68,7 @@ jobs:
     # this repository's tagged builds can mint an upload credential.
     #
     # DORMANT UNTIL ACTIVATED. Before the first release, on PyPI create the
-    # project `aiodns-dnspy` under Trusted Publishing with this repo, workflow
+    # project `namespy` under Trusted Publishing with this repo, workflow
     # file `release.yml`, and environment `pypi`; then create the matching
     # `pypi` environment under Settings -> Environments and uncomment the
     # `environment:` line below. GitHub rejects a job naming an environment that

@@ -1,8 +1,8 @@
 """Property-based fuzzing of the wire parsers.
 
 This module exists because the parsers are a network trust boundary, and a
-boundary is only as good as its worst failure mode. :class:`aiodns.server` and
-:class:`aiodns.resolver` both catch :class:`~aiodns.wire.DnsPacketParseError`
+boundary is only as good as its worst failure mode. :class:`namespy.server` and
+:class:`namespy.resolver` both catch :class:`~namespy.wire.DnsPacketParseError`
 from inside an asyncio protocol callback and answer the client with FORMERR.
 Any *other* exception type escaping a parser therefore escapes that handler,
 reaches the event loop, and kills the datagram connection. The bugs that make
@@ -17,10 +17,10 @@ correctly"**: for arbitrary bytes, every parser must either return or raise
 ``test_names_wire.py`` and ``test_packet_wire.py`` stay valuable for the cases
 whose *rejection* is the point; this file covers the ones nobody enumerated.
 
-The round-trip properties matter for a different reason. :mod:`aiodns.cache`
+The round-trip properties matter for a different reason. :mod:`namespy.cache`
 stores ``bytes(record)`` and re-parses it later, so a record whose serialisation
 does not survive re-parsing corrupts the cache silently -- which is why
-:mod:`aiodns.rdata` serialises names without compression pointers at all.
+:mod:`namespy.rdata` serialises names without compression pointers at all.
 
 Hypothesis shrinks every failure to a minimal repro and records it in
 ``.hypothesis/``, so a red run here names the exact byte string to turn into a
@@ -29,9 +29,9 @@ corpus test.
 .. rubric:: What this file does *not* catch
 
 Measured, not assumed: deleting a single rejection rule is **not** detected
-here. Replacing :func:`aiodns.wire.is_reserved_label_type` with a stub returning
+here. Replacing :func:`namespy.wire.is_reserved_label_type` with a stub returning
 ``False``, and turning the pointer-target check in
-:meth:`aiodns.names.DomainName.parse_from` into an off-by-one, both leave this
+:meth:`namespy.names.DomainName.parse_from` into an off-by-one, both leave this
 file entirely green. Two reasons, both structural:
 
 * The property constrains the exception *type*, and a message that slips past one
@@ -54,10 +54,10 @@ from __future__ import annotations
 import hypothesis.strategies as st
 from hypothesis import HealthCheck, assume, given, settings
 
-from aiodns.enums import DnsQR
-from aiodns.names import MAX_NAME_OCTETS, DomainName
-from aiodns.packet import DnsPacket, DnsQuestion, DnsRecord, Response
-from aiodns.rdata import (
+from namespy.enums import DnsQR
+from namespy.names import MAX_NAME_OCTETS, DomainName
+from namespy.packet import DnsPacket, DnsQuestion, DnsRecord, Response
+from namespy.rdata import (
     RData_A,
     RData_AAAA,
     RData_CNAME,
@@ -69,7 +69,7 @@ from aiodns.rdata import (
     RData_TXT,
     all_rdata_classes,
 )
-from aiodns.wire import DnsPacketParseError
+from namespy.wire import DnsPacketParseError
 
 # Parsing on a network path is allowed exactly one outcome besides success.
 PARSE_ERRORS = (DnsPacketParseError,)
@@ -114,7 +114,7 @@ def test_record_parser_fails_only_in_the_declared_way(data: bytes, extra: int) -
         return
     assert 0 <= end <= len(data)
     # A record that cannot be re-serialised and re-parsed identically would
-    # corrupt the cache: aiodns.cache.sqlite stores bytes(record) and reads it
+    # corrupt the cache: namespy.cache.sqlite stores bytes(record) and reads it
     # back with DnsRecord.parse(payload, 0), long after the datagram that gave
     # it compression pointers has vanished.
     wire = bytes(record)
@@ -178,7 +178,7 @@ def test_every_rdata_codec_fails_only_in_the_declared_way(
 ) -> None:
     """Each codec, driven directly, honours the same failure contract.
 
-    :class:`aiodns.packet.DnsRecord` bounds RDATA for these, but they are public
+    :class:`namespy.packet.DnsRecord` bounds RDATA for these, but they are public
     and reachable on their own; a caller that hands one a short slice must get
     ``DnsPacketParseError`` rather than a half-built object.
     """
@@ -324,7 +324,7 @@ _RDATA_FOR = {
 def built_message(draw):
     """A syntactically valid response, assembled from the real encoders.
 
-    Built through :class:`~aiodns.rdata` rather than by hand so the fixture and
+    Built through :class:`~namespy.rdata` rather than by hand so the fixture and
     the code under test cannot agree on a shared misunderstanding of the wire
     format -- the encoders themselves are part of what these properties check.
     """
@@ -399,7 +399,7 @@ def test_one_corrupt_octet_never_brings_down_the_parser(
 
     # Canonical fixed point. Anything the parser chooses to accept must survive a
     # serialize/re-parse cycle unchanged, because serialization is canonical
-    # (pointer-free, per aiodns.rdata). This is the oracle that notices a *lost
+    # (pointer-free, per namespy.rdata). This is the oracle that notices a *lost
     # rejection rule*: checking only the exception type cannot, since a message
     # that slips past one removed check usually still fails a later bounds check
     # with the same exception class, and the property still holds.

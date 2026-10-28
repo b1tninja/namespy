@@ -99,7 +99,7 @@ class Resolver(asyncio.Protocol):
     #: The instance logger. Deliberately :func:`~logging.getLogger`, not a
     #: freshly-constructed ``logging.Logger``: constructing a Logger directly
     #: puts it outside the hierarchy, so it does not propagate, does not obey a
-    #: level or handler the application set on the ``aiodns`` logger, and -- with
+    #: level or handler the application set on the ``namespy`` logger, and -- with
     #: a module-global handler attached to each instance -- duplicates output.
     log = LOGGER
 
@@ -116,7 +116,7 @@ class Resolver(asyncio.Protocol):
     #: A trailing ``.`` on the SNAME prevents this suffix from being assumed
     #: (RFC 1035 §3.1's wire form is always absolute; the trailing dot in
     #: presentation form is a hint to the resolver, not a wire identity).
-    #: Set to a ``str`` or :class:`~aiodns.names.DomainName`; left ``None``,
+    #: Set to a ``str`` or :class:`~namespy.names.DomainName`; left ``None``,
     #: relative names are simply anchored at the root.
     dns_suffix = None
 
@@ -639,9 +639,9 @@ def _answer_address(record):
     """The address in an ``A``/``AAAA`` answer, or ``None`` for anything else.
 
     Re-runs the codec over the record's wire octets rather than trusting
-    ``record.rdata`` to already be an :class:`~aiodns.rdata.RData_A`, because a
+    ``record.rdata`` to already be an :class:`~namespy.rdata.RData_A`, because a
     caller may have built the record by hand with a bare :class:`bytes` or a
-    :class:`~aiodns.names.DomainName`. A malformed address yields "no address"
+    :class:`~namespy.names.DomainName`. A malformed address yields "no address"
     here instead of raising inside a resolution loop: one bad glue record must
     not abort the lookup that happened to receive it.
     """
@@ -726,7 +726,7 @@ def _is_expected_response(query_packet, response_packet, dst) -> bool:
 def _records_by_owner(response):
     """Group a response's answer-section records by owner name.
 
-    Keyed on :class:`~aiodns.names.DomainName`, whose equality and hash are
+    Keyed on :class:`~namespy.names.DomainName`, whose equality and hash are
     case-insensitive over raw labels, so ``WWW.Example.COM`` and
     ``www.example.com.`` land in the same bucket without normalising twice.
     """
@@ -1089,7 +1089,7 @@ def resolve_steps(
     driver `RecursiveResolver._drive` fulfills `SendQuery` / `NeedAddress`
     yields and feeds results back via `gen.send(...)`.
 
-    If ``cache`` is provided (a :class:`aiodns.cache.DnsCache`), every hop
+    If ``cache`` is provided (a :class:`namespy.cache.DnsCache`), every hop
     first consults it (RFC 1034 §5.3.3 step 1) and short-circuits with
     ``Answer``/``Done`` or ``Nxdomain``/``Nodata``/``Done`` on a hit. After
     a real authoritative response classifies as a terminal event, the
@@ -1437,7 +1437,7 @@ class RecursiveResolver(Resolver):
         """Build a resolver without touching the network.
 
         :param root_hints_path: a master-file path to read hints from. Left
-            ``None``, the copy packaged inside DNSpy is used, which is what makes
+            ``None``, the copy packaged inside Namespy is used, which is what makes
             ``RecursiveResolver()`` work offline, in a test, and on a host with no
             route to internic. A path that is given but does not exist is an
             error rather than a licence to fetch: silently downloading during
@@ -1569,10 +1569,10 @@ class RecursiveResolver(Resolver):
         """The ``named.root`` shipped inside the package, as a readable path.
 
         :mod:`importlib.resources` rather than ``os.path.dirname(__file__)`` so it
-        also works when DNSpy is installed as a zip or wheel, where there may be no
+        also works when Namespy is installed as a zip or wheel, where there may be no
         directory on disk to name.
         """
-        return resources.files("aiodns").joinpath("named.root")
+        return resources.files("namespy").joinpath("named.root")
 
     def bootstrap(self, root_hints_path=None):
         """Build the root-hints ``Response`` from a master file, offline.
@@ -1592,7 +1592,7 @@ class RecursiveResolver(Resolver):
             if not os.path.isfile(root_hints_path):
                 raise FileNotFoundError(
                     f"root hints file not found: {root_hints_path!r}. Omit "
-                    f"root_hints_path to use the copy packaged with DNSpy, or "
+                    f"root_hints_path to use the copy packaged with Namespy, or "
                     f"call refresh_root_hints() to fetch a current one."
                 )
             source = root_hints_path

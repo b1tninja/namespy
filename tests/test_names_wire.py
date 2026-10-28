@@ -20,8 +20,8 @@ import pathlib
 
 import pytest
 
-from aiodns.names import DomainName, DomainNameError, escape_label, unescape_label
-from aiodns.wire import MAX_NAME_OCTETS, DnsNameParseError
+from namespy.names import DomainName, DomainNameError, escape_label, unescape_label
+from namespy.wire import MAX_NAME_OCTETS, DnsNameParseError
 
 # A response-shaped message: 12-octet header, QNAME at 12, QTYPE/QCLASS at 25,
 # then an answer whose NAME is a pointer back to 12 (the shape real servers
@@ -213,7 +213,7 @@ def test_parser_has_no_bare_assert() -> None:
     how a bounds check quietly stops existing in production. This test fails if
     anyone reintroduces one, in either the name parser or the shared primitives.
     """
-    package = pathlib.Path(__file__).resolve().parent.parent / "aiodns"
+    package = pathlib.Path(__file__).resolve().parent.parent / "namespy"
     for filename in ("names.py", "wire.py", "packet.py", "rdata.py"):
         tree = ast.parse((package / filename).read_text(encoding="utf-8"))
         offenders = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]

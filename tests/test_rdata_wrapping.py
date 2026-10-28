@@ -9,8 +9,8 @@ cache round-trip. Property-checked rather than trusted.
 import ipaddress
 import struct
 
-from aiodns import DnsPacket, DnsRClass, DnsRecord, DnsRType, DomainName, Response
-from aiodns.rdata import RData, RData_SOA, RData_TXT, all_rdata_classes
+from namespy import DnsPacket, DnsRClass, DnsRecord, DnsRType, DomainName, Response
+from namespy.rdata import RData, RData_SOA, RData_TXT, all_rdata_classes
 
 #: SOA timers in wire order, so the payloads below read as fields not hex.
 _TIMERS = "!IIIII"

@@ -28,7 +28,7 @@ body:
       label: What happened, and what did you expect?
       description: >
         For a parsing bug, paste the datagram as hex (`data.hex()`), plus the
-        offset in the error if one was raised. For a resolver bug, `dnspy
+        offset in the error if one was raised. For a resolver bug, `namespy
         --trace NAME` and the resulting `last_resolution.md` are usually enough
         on their own.
       render: shell
@@ -70,4 +70,4 @@ body:
       options:
         - label: "`pytest -q` passes on a clean checkout"
         - label: "`python -O -m pytest -q` also passes (assertions stripped)"
-        - label: "`ruff check .` and `mypy aiodns` are clean"
+        - label: "`ruff check .` and `mypy namespy` are clean"

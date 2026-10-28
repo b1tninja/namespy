@@ -3,15 +3,15 @@
 Two distinct failures this guards, both of which are invisible until someone
 installs the wheel:
 
-1. ``__all__`` naming something that was never imported. ``from aiodns import *``
+1. ``__all__`` naming something that was never imported. ``from namespy import *``
    then raises AttributeError, and a static checker flags it but nothing in a
    test-only suite would.
-2. The circular import between ``aiodns/__init__.py`` and ``aiodns.resolver``.
+2. The circular import between ``namespy/__init__.py`` and ``namespy.resolver``.
    Both the resolver and the server do ``from . import enable_path_mtu_discovery``
    while ``__init__`` re-exports them, so the re-export block has to sit *below*
    that function's definition. Move it up and the package fails to import at all.
 
-``importlib.reload`` is the point: a test that merely imports ``aiodns`` proves
+``importlib.reload`` is the point: a test that merely imports ``namespy`` proves
 nothing about rebuild order, because the module object is cached from the first
 test that touched it.
 """
@@ -24,11 +24,11 @@ import sys
 
 import pytest
 
-import aiodns
+import namespy
 
 
 def test_all_names_resolve():
-    missing = [name for name in aiodns.__all__ if not hasattr(aiodns, name)]
+    missing = [name for name in namespy.__all__ if not hasattr(namespy, name)]
     assert missing == []
 
 
@@ -37,14 +37,14 @@ def test_all_has_no_duplicates():
     # constants first, then CamelCase classes, then dunders and lowercase names.
     # Asserting `__all__ == sorted(__all__)` here would fight that rule, since
     # plain string sort puts "__author__" and "IP_MTU" somewhere ruff rejects.
-    assert len(aiodns.__all__) == len(set(aiodns.__all__))
+    assert len(namespy.__all__) == len(set(namespy.__all__))
 
 
 def test_star_import_yields_the_declared_surface():
     namespace: dict[str, object] = {}
-    exec("from aiodns import *", namespace)  # noqa: S102
+    exec("from namespy import *", namespace)  # noqa: S102
     delivered = {name for name in namespace if not name.startswith("__")}
-    declared = set(aiodns.__all__) - {"__author__", "__version__"}
+    declared = set(namespy.__all__) - {"__author__", "__version__"}
     assert delivered == declared
 
 
@@ -59,11 +59,11 @@ def test_package_reimports_cleanly():
     """
     saved = dict(sys.modules)
     try:
-        for module in [m for m in sys.modules if m.split(".")[0] == "aiodns"]:
+        for module in [m for m in sys.modules if m.split(".")[0] == "namespy"]:
             del sys.modules[module]
-        package = importlib.import_module("aiodns")
-        resolver = importlib.import_module("aiodns.resolver")
-        server = importlib.import_module("aiodns.server")
+        package = importlib.import_module("namespy")
+        resolver = importlib.import_module("namespy.resolver")
+        server = importlib.import_module("namespy.server")
         assert package.__version__
         assert issubclass(package.RecursiveResolver, package.Resolver)
         assert package.RecursiveResolver is not package.Resolver
@@ -76,10 +76,10 @@ def test_package_reimports_cleanly():
 
 def test_every_submodule_imports_alone():
     """Each submodule must import standalone, not only as a side effect of __init__."""
-    for info in pkgutil.iter_modules(aiodns.__path__):
-        importlib.import_module(f"aiodns.{info.name}")
+    for info in pkgutil.iter_modules(namespy.__path__):
+        importlib.import_module(f"namespy.{info.name}")
 
 
 @pytest.mark.parametrize("name", ["Resolver", "RecursiveResolver", "DomainName", "DnsPacket"])
 def test_headline_names_are_reachable(name):
-    assert getattr(aiodns, name) is not None
+    assert getattr(namespy, name) is not None

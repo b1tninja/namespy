@@ -6,13 +6,13 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aiodns-dnspy"
+name = "namespy"
 dynamic = ["version"]
 description = "Asyncio DNS library: iterative resolver, wire codec, and inspection CLI"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-keywords = ["dns", "asyncio", "resolver", "recursive", "dnssec-adjacent", "wire-format"]
+keywords = ["dns", "asyncio", "resolver", "recursive", "wire-format", "packet-parsing"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Framework :: AsyncIO",
@@ -41,30 +41,30 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/b1tninja/DNSpy"
-Repository = "https://github.com/b1tninja/DNSpy"
-Issues = "https://github.com/b1tninja/DNSpy/issues"
-Changelog = "https://github.com/b1tninja/DNSpy/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/b1tninja/namespy"
+Repository = "https://github.com/b1tninja/namespy"
+Issues = "https://github.com/b1tninja/namespy/issues"
+Changelog = "https://github.com/b1tninja/namespy/blob/master/CHANGELOG.md"
 
 [project.scripts]
 # The CLI is the reason most people find this repo; making it an entry point
-# means `pip install aiodns-dnspy` alone gives you `dnspy example.com`.
-dnspy = "aiodns.__main__:main"
+# means `pip install namespy` alone gives you `namespy example.com`.
+namespy = "namespy.__main__:main"
 
 [tool.hatch.version]
 # Single source of truth: the distribution version is read from the package, so
 # a release bump is one edit rather than two that can drift apart.
-path = "aiodns/__init__.py"
+path = "namespy/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aiodns"]
+packages = ["namespy"]
 
 [tool.hatch.build]
 # Root hints are data, not code, and are read via importlib.resources. Named
 # explicitly because hatchling's default excludes come from .gitignore, which
 # ignores a *working-tree* named.root -- without this the wheel would ship a
 # resolver with no starting point.
-artifacts = ["aiodns/named.root", "aiodns/py.typed"]
+artifacts = ["namespy/named.root", "namespy/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -83,7 +83,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["aiodns"]
+source = ["namespy"]
 branch = true
 
 [tool.coverage.report]
@@ -137,8 +137,8 @@ ignore = [
 # Renaming them to satisfy PEP 8 would break the one-to-one correspondence with
 # RFC 1035 section 4.1.1 and RFC 3597 section 5 that makes this code auditable
 # against the spec, so the naming exception is scoped to exactly these modules.
-"aiodns/packet.py" = ["N801", "N802", "N803", "N806"]
-"aiodns/rdata.py" = ["N801", "N802", "N806"]
+"namespy/packet.py" = ["N801", "N802", "N803", "N806"]
+"namespy/rdata.py" = ["N801", "N802", "N806"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -149,7 +149,7 @@ python_version = "3.12"
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
-# Advisory in intent, blocking in practice: CI runs `mypy aiodns` without `||
+# Advisory in intent, blocking in practice: CI runs `mypy namespy` without `||
 # true`, and it exits 0. ignore_missing_imports stays on because the optional
 # third-party integrations are genuinely absent from a minimal install, not
 # merely unannotated. Do not turn on --strict globally: it measures 274 errors,

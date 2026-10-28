@@ -24,11 +24,11 @@ import ipaddress
 
 import pytest
 
-from aiodns.cache import MemoryDnsCache
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Query, Response
-from aiodns.rdata import RData_A
-from aiodns.resolver import RecursiveResolver, _is_expected_response, _pending_key
+from namespy.cache import MemoryDnsCache
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Query, Response
+from namespy.rdata import RData_A
+from namespy.resolver import RecursiveResolver, _is_expected_response, _pending_key
 
 SERVER = ipaddress.IPv4Address("198.51.100.53")
 SERVER_V6 = ipaddress.IPv6Address("2001:db8::53")

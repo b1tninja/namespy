@@ -30,7 +30,7 @@ main historical failure mode.
 pytest -q                      # coverage floor enforced by pyproject
 python -O -m pytest -q
 ruff check . && ruff format --check .
-mypy aiodns
+mypy namespy
 ```
 
 - [ ] All four pass locally

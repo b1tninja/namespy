@@ -1,4 +1,4 @@
-"""SQLite-backed :class:`~aiodns.cache.DnsCache`.
+"""SQLite-backed :class:`~namespy.cache.DnsCache`.
 
 A single ``rrset_cache`` table keyed on ``(name, qtype, qclass)`` with an
 ``expires_at`` column for TTL eviction. Records are stored length-prefixed
@@ -87,7 +87,7 @@ def _name_text(name):
 
 
 class SqliteDnsCache(DnsCache):
-    """SQLite-backed :class:`~aiodns.cache.DnsCache`.
+    """SQLite-backed :class:`~namespy.cache.DnsCache`.
 
     ``path`` is a filesystem path or ``":memory:"`` for an ephemeral DB.
     ``time_fn`` is the cache's clock (defaults to :func:`time.time`); the

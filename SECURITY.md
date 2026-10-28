@@ -14,7 +14,7 @@ since no address is published here. There is no NDA and no embargo period
 imposed — the expectation is simply that a fix exists before details are
 public.
 
-[advisory]: https://github.com/b1tninja/DNSpy/security/advisories/new
+[advisory]: https://github.com/b1tninja/namespy/security/advisories/new
 
 ## Supported versions
 
@@ -88,7 +88,7 @@ section 5 and neither is optional.
 
 ### The bundled server and CLI demo
 
-`aiodns.server.Server` and `dnspy --serve` exist to exercise the codec against a
+`namespy.server.Server` and `namespy --serve` exist to exercise the codec against a
 loopback peer. **They are not a name server product and must not be exposed to a
 network you do not control.** An unauthorised recursive resolver on a reachable
 address is an amplification and cache-poisoning instrument; RFC 5358 and RFC 9085

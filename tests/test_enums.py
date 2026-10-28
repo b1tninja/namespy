@@ -17,7 +17,7 @@ the query-only pseudo-types must exist nowhere else.
 
 import pytest
 
-from aiodns.enums import (
+from namespy.enums import (
     DnsOpCode,
     DnsQClass,
     DnsQType,
@@ -55,7 +55,7 @@ def test_opt_is_in_the_type_space_but_is_pseudo_data() -> None:
     """``OPT`` (41) must decode, yet must never be treated as zone data.
 
     IANA lists 41 in the RR TYPEs registry with a pseudo-record annotation, so a
-    receiver has to recognise it -- :meth:`aiodns.packet.DnsPacket.opt` cannot
+    receiver has to recognise it -- :meth:`namespy.packet.DnsPacket.opt` cannot
     work otherwise. RFC 6891 section 6.3 then forbids storing it, which is why it
     is excluded from the cache key path rather than from the enum.
     """

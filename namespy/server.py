@@ -7,7 +7,7 @@ consequences shape this module:
 
 * **Never emit output the operator did not ask for.** The module previously built
   a fresh ``logging.Logger("server")`` and attached a module-global handler to it,
-  so importing DNSpy and constructing a server produced output regardless of
+  so importing Namespy and constructing a server produced output regardless of
   application configuration -- and an ``INFO`` line per query plus a ``print`` of
   every response turned a query flood into a log flood.
 * **Bound the in-flight upstream lookups.** Each inbound datagram previously
@@ -42,7 +42,7 @@ MAX_CONCURRENT_LOOKUPS = 32
 class DnsServer(asyncio.Protocol):
     """Answer DNS queries over a datagram transport by recursing.
 
-    :param resolver: the :class:`~aiodns.resolver.RecursiveResolver` that does
+    :param resolver: the :class:`~namespy.resolver.RecursiveResolver` that does
         the work. It must already be bound to a transport, which is why resolver
         and server are connected to the event loop in that order.
     :param max_concurrent_lookups: cap on outstanding recursive lookups.

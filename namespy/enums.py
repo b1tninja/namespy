@@ -30,7 +30,7 @@ Unknown values are *not* an error: RFC 3597 section 3 requires a responder's
 unknown types to be handled transparently, and RFC 5625 section 6.3 permits
 dropping a message but does not require rejecting an unfamiliar code. Parsers
 therefore fall back to the raw ``int`` rather than raising, which is why the
-member lookup in :class:`~aiodns.packet.DnsRecord` is guarded.
+member lookup in :class:`~namespy.packet.DnsRecord` is guarded.
 """
 
 from enum import IntEnum

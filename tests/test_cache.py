@@ -2,16 +2,16 @@ import ipaddress
 
 import pytest
 
-from aiodns.cache import (
+from namespy.cache import (
     DnsCache,
     MemoryDnsCache,
     NegativeEntry,
     PositiveEntry,
     SqliteDnsCache,
 )
-from aiodns.enums import DnsRClass, DnsResponseCode, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsRecord
+from namespy.enums import DnsRClass, DnsResponseCode, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsRecord
 
 
 class _Clock:

@@ -3,7 +3,7 @@
 Nothing here touches the network. ``cli_query`` and ``serve`` build their
 endpoints through ``loop.create_datagram_endpoint``, which is patched to hand
 back the protocol the factory would have produced -- a real
-:class:`~aiodns.resolver.RecursiveResolver`, since constructing one reads the
+:class:`~namespy.resolver.RecursiveResolver`, since constructing one reads the
 packaged root hints and does no I/O -- with its ``resolve`` replaced. That keeps
 the tests honest about the wiring while leaving resolver behaviour to
 :mod:`tests.test_resolve_steps`.
@@ -18,8 +18,8 @@ import logging
 
 import pytest
 
-from aiodns import __main__ as cli
-from aiodns.__main__ import (
+from namespy import __main__ as cli
+from namespy.__main__ import (
     _dump_last_resolution_md,
     _format_rdata,
     _format_record_row,
@@ -30,12 +30,12 @@ from aiodns.__main__ import (
     _parse_qtype,
     build_parser,
 )
-from aiodns.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Response
-from aiodns.rdata import RData, RData_A, RData_NS, RData_TXT
-from aiodns.resolver import Done, Sname
-from aiodns.trace import Trace
+from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Response
+from namespy.rdata import RData, RData_A, RData_NS, RData_TXT
+from namespy.resolver import Done, Sname
+from namespy.trace import Trace
 
 
 def _args(argv):
@@ -244,7 +244,7 @@ def _response_with_opt():
 
 def test_response_renders_dig_sections():
     text = _format_response(_response_with_opt(), _args(["example.com"]), 12.9)
-    assert "; <<>> dnspy <<>> example.com A IN" in text
+    assert "; <<>> namespy <<>> example.com A IN" in text
     assert ";; ->>HEADER<<- opcode: QUERY, status: BADVERS, id: 4660" in text
     assert "qr rd ra ad" in text
     assert ";; OPT PSEUDOSECTION:" in text

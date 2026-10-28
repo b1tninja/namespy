@@ -1,4 +1,4 @@
-"""DNSpy: an async DNS resolver, message codec, and inspector.
+"""Namespy: an async DNS resolver, message codec, and inspector.
 
 Two things live here that every other module reaches for: the logging posture,
 and the socket options used to keep UDP datagrams from being fragmented.
@@ -8,7 +8,7 @@ must not be silent either; the usual convention is to attach a
 :class:`logging.NullHandler` to the top-level logger and let the application
 decide. Previously each protocol object built its own ``logging.Logger(...)``
 and attached a shared module-level :data:`console` handler to it, so importing
-DNSpy and constructing a resolver caused output no matter what the application
+Namespy and constructing a resolver caused output no matter what the application
 had configured, and every extra object re-attached the same handler until each
 line printed twice. ``console`` is still exported for anyone who was using it,
 but it is no longer attached to anything.
@@ -76,7 +76,7 @@ def enable_path_mtu_discovery(transport, log=None) -> bool:
     return True
 
 
-#: A ready-made stderr handler, for scripts that want DNSpy's messages without
+#: A ready-made stderr handler, for scripts that want Namespy's messages without
 #: configuring :mod:`logging`. Attaching handlers is the application's job.
 console = logging.StreamHandler()
 console.setLevel(logging.DEBUG)
@@ -94,7 +94,7 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 # ImportError on a half-built module object, which is a confusing failure to
 # diagnose because it names neither of the two files that caused it.
 #
-# They exist because ``from aiodns.resolver import RecursiveResolver`` is not a
+# They exist because ``from namespy.resolver import RecursiveResolver`` is not a
 # reasonable thing to make a caller type, and because the previous ``__all__``
 # advertised socket option constants as the package's public surface while the
 # classes people actually want were only reachable through module paths.

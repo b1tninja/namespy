@@ -6,7 +6,7 @@ phases below land. It exists so the work survives an interrupted session.
 **Start here every time:**
 
 ```powershell
-cd D:\code\DNSpy
+cd D:\code\namespy
 git --no-pager log --oneline -8   # what has already landed
 git status --short                # must be clean; if not, finish or commit it
 ```
@@ -28,14 +28,14 @@ git status --short                # must be clean; if not, finish or commit it
 ## Commands
 
 ```powershell
-cd D:\code\DNSpy
+cd D:\code\namespy
 .venv\Scripts\python.exe -m pip install -e ".[dev]"      # venv already exists
 .venv\Scripts\python.exe -m pytest -q                    # suite
-.venv\Scripts\python.exe -m pytest -q --cov=aiodns --cov-report=term
+.venv\Scripts\python.exe -m pytest -q --cov=namespy --cov-report=term
 .venv\Scripts\python.exe -O -m pytest -q                 # see "the -O rule"
 .venv\Scripts\python.exe -m ruff check .
 .venv\Scripts\python.exe -m ruff format .
-.venv\Scripts\python.exe -m mypy aiodns                  # advisory, not gating
+.venv\Scripts\python.exe -m mypy namespy                  # advisory, not gating
 .venv\Scripts\python.exe -m build                        # sdist + wheel
 ```
 
@@ -69,7 +69,7 @@ These are the decisions the code is built on. Reversing one silently undoes a
 fix that has an RFC behind it.
 
 1. **No `assert` on anything that came off the wire.** All validation raises
-   `DnsPacketParseError` (defined once in `aiodns/wire.py`). The original bug set
+   `DnsPacketParseError` (defined once in `namespy/wire.py`). The original bug set
    was that every bounds check was an `assert`, so `python -O` deleted the
    parser's entire defence. This is why `-O` is part of the definition of done:
    `pytest -O` must stay green.
@@ -171,7 +171,7 @@ when a zone crosses 2**31.
 ### Repo and packaging
 
 Installable (`[build-system]` + hatchling, dynamic version read from the
-package), `py.typed` shipped, console script `dnspy`, coverage floor 80 wired to
+package), `py.typed` shipped, console script `namespy`, coverage floor 80 wired to
 `--cov-fail-under`, mypy configured but advisory. Generated and legacy files
 untracked (`last_resolution.md` ×2, the 2014-era `dns.sql`/`database.png` moved
 to `docs/legacy/`), `.gitignore` reconciled with what is actually tracked.
@@ -197,7 +197,7 @@ implements it — that file is the fastest way into this codebase.
 
 1. **LICENSE — do this first.** `pyproject.toml` declares
    `license = "Apache-2.0"` and there is **no license file on disk**, no README
-   mention, and `gh api repos/b1tninja/DNSpy` returns `license: null`. A declared
+   mention, and `gh api repos/b1tninja/namespy` returns `license: null`. A declared
    license nobody granted is worse than an absent one. Write the Apache-2.0 text,
    make sure both sdist and wheel carry it (`license-files`), add a README
    section. While there: the keyword `dnssec-adjacent` reads as a capability
@@ -208,10 +208,10 @@ implements it — that file is the fastest way into this codebase.
    currently survives only because someone remembers to run it. `ci.yml` on
    push/PR, matrix `{3.12, 3.13} × {ubuntu, windows}` — the Windows leg matters
    specifically because `IP_MTU_DISCOVER`/`IP_PMTUDISC_DO` are Linux-only and the
-   `getattr`-based guard in `aiodns/__init__.py` is the only thing keeping the
+   `getattr`-based guard in `namespy/__init__.py` is the only thing keeping the
    listener from dying there. Steps: `ruff check`, `ruff format --check`,
    `compileall`, `pytest` (coverage gate is already in `pyproject.toml`), then
-   `pip install .` and assert `aiodns/named.root` is importable from the
+   `pip install .` and assert `namespy/named.root` is importable from the
    *installed* package. That last step is not decoration: hatchling derives
    default excludes from `.gitignore`, which ignores a working-tree
    `named.root`, so the `artifacts` line in `pyproject.toml` is the only thing
@@ -284,5 +284,5 @@ then the docs, then the type and coverage tail.
   nobody else uses it.
 - License is **Apache-2.0**; **no PyPI publish** yet, so release automation stays
   tag-gated and dormant.
-- The import name stays **`aiodns`** for now (the PyPI collision with the well-known
-  `aiodns` is accepted; a `dnspy` alias was discussed and deliberately deferred).
+- The import name stays **`namespy`** for now (the PyPI collision with the well-known
+  `namespy` is accepted; a `namespy` alias was discussed and deliberately deferred).

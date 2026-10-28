@@ -1,9 +1,9 @@
 import ipaddress
 
-from aiodns.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Response
-from aiodns.resolver import (
+from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Response
+from namespy.resolver import (
     Answer,
     Cname,
     Demote,

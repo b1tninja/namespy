@@ -1,7 +1,7 @@
 import pytest
 
-from aiodns.names import DomainName
-from aiodns.packet import DnsPacket, DnsPacketParseError, DnsQuestion, Query
+from namespy.names import DomainName
+from namespy.packet import DnsPacket, DnsPacketParseError, DnsQuestion, Query
 
 
 def test_dns_packet_defaults_are_not_shared() -> None:

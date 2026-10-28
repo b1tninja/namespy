@@ -1,21 +1,21 @@
 """DNS message framing: header, question section, and the three RR sections.
 
 Parsing here is a trust boundary. Everything that arrives is an untrusted
-datagram, so the rules set out in :mod:`aiodns.wire` apply throughout:
+datagram, so the rules set out in :mod:`namespy.wire` apply throughout:
 
 * **No :keyword:`assert` on anything that came off the wire.** An ``assert``
   compiled out by ``python -O`` or ``PYTHONOPTIMIZE`` is not a check, and the
   previous revision of this module used one for every bounds test.
-* **Every failure is** :class:`~aiodns.wire.DnsPacketParseError`, carrying the
+* **Every failure is** :class:`~namespy.wire.DnsPacketParseError`, carrying the
   datagram and the offset at which parsing gave up.
 * **Structure is validated before it is trusted** -- section counts must be
   satisfiable, and RDLENGTH must fit inside the message (RFC 9267 section 5).
 
-The exception type lives in :mod:`aiodns.wire` and is re-exported here for
+The exception type lives in :mod:`namespy.wire` and is re-exported here for
 existing import sites. Having it defined in two places once meant a failure
 raised as one class and caught as the other, so malformed datagrams escaped the
-``except DnsPacketParseError`` handlers in :mod:`aiodns.server` and
-:mod:`aiodns.resolver` entirely.
+``except DnsPacketParseError`` handlers in :mod:`namespy.server` and
+:mod:`namespy.resolver` entirely.
 
 .. rubric:: References
 
@@ -143,7 +143,7 @@ def _wrap_rdata(rtype, blob: bytes) -> RData:
     raising. That keeps the constructor as permissive as it has always been
     while still making ``record.rdata`` a single, spec-shaped kind of object.
 
-    Decoding is safe to attempt because :mod:`aiodns.rdata` codecs never read
+    Decoding is safe to attempt because :mod:`namespy.rdata` codecs never read
     outside the length they are given, and every one of them re-encodes to the
     octets it was handed, so a successful decode cannot alter the wire form.
     """
@@ -166,10 +166,10 @@ class DnsRecord:
     mode that made a single ``HTTPS`` record (RFC 9460) fatal, because the code
     reached for ``rtype.value`` on what was already an int.
 
-    :param rdata: an :class:`~aiodns.rdata.RData`, or raw ``bytes``, which are
-        wrapped in the opaque :class:`~aiodns.rdata.RData`. No codec is *run*
+    :param rdata: an :class:`~namespy.rdata.RData`, or raw ``bytes``, which are
+        wrapped in the opaque :class:`~namespy.rdata.RData`. No codec is *run*
         here: tests and the root-hints loader build records with ``rdata=b""``
-        or a bare :class:`~aiodns.names.DomainName`, and parsing those as an
+        or a bare :class:`~namespy.names.DomainName`, and parsing those as an
         SOA or an address would reject input the caller knowingly supplied.
         :meth:`parse` is the strict path.
 
@@ -256,7 +256,7 @@ class DnsRecord:
 
         A record built by hand and one read off the wire must both serialise to
         something a receiver can parse, so the length field is recomputed from
-        the encoded RDATA -- which :mod:`aiodns.rdata` guarantees is
+        the encoded RDATA -- which :mod:`namespy.rdata` guarantees is
         pointer-free. Keeping a stale ``rdlength`` alongside edited RDATA would
         emit a message whose sections no longer align.
         """
@@ -482,7 +482,7 @@ class DnsPacket:
             question of an answer too large for one packet, which is the first
             step of the TCP retry RFC 7766 section 6 calls for.
 
-        Raises :class:`~aiodns.wire.DnsPacketParseError` for anything a receiver
+        Raises :class:`~namespy.wire.DnsPacketParseError` for anything a receiver
         should drop rather than interpret (RFC 5625 section 6.3).
         """
         if not isinstance(data, (bytes, bytearray, memoryview)):
@@ -522,7 +522,7 @@ class DnsPacket:
         # an inspection library, so it has to be able to read a message it would
         # reject, and a server that could not parse the FORMERR reply it sends for a
         # two-question query would be contradicting itself. The refusal belongs to
-        # the policy layer and lives in aiodns.server, per RFC 8906 section 5.2.
+        # the policy layer and lives in namespy.server, per RFC 8906 section 5.2.
         # The loop below is bounded by the message itself -- each question consumes
         # at least three octets -- so a hostile count cannot spin.
 
@@ -590,7 +590,7 @@ class DnsPacket:
     def _parse_section(parser, data: bytes, offset: int, count: int):
         """Read up to *count* entries; returns ``(items, offset, failure)``.
 
-        *failure* is the :class:`~aiodns.wire.DnsPacketParseError` that stopped
+        *failure* is the :class:`~namespy.wire.DnsPacketParseError` that stopped
         the section, or ``None``. Returning it instead of raising lets the caller
         distinguish "this message is corrupt, drop it" from "this answer is
         truncated, keep the part that parsed" without a try/except that would

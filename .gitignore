@@ -1,4 +1,4 @@
-# Root hints ship INSIDE the package (aiodns/named.root) and are loaded through
+# Root hints ship INSIDE the package (namespy/named.root) and are loaded through
 # importlib.resources, so that file must stay tracked and must not be ignored --
 # hatchling derives its default wheel/sdist excludes from this file, and an
 # ignore rule here once meant a built wheel would have had no hints at all.
@@ -6,7 +6,7 @@
 /named.root
 
 # Traces the CLI writes with --trace; generated, never committed. Matches at
-# any depth, which is how aiodns/last_resolution.md got committed in the first
+# any depth, which is how namespy/last_resolution.md got committed in the first
 # place while being "ignored" -- it was tracked, so the rule never applied.
 last_resolution.md
 

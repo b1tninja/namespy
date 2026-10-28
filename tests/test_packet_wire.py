@@ -1,9 +1,9 @@
-"""Wire-format regression tests for :mod:`aiodns.packet` and :mod:`aiodns.rdata`.
+"""Wire-format regression tests for :mod:`namespy.packet` and :mod:`namespy.rdata`.
 
 Each test marks a bug the parser used to have, or a rule from the standards that
 the previous revision broke. The hostile corpus is constructed rather than
 mutated: every case is a payload a hostile server can send, and each must fail as
-:class:`~aiodns.wire.DnsPacketParseError` rather than as ``AttributeError``,
+:class:`~namespy.wire.DnsPacketParseError` rather than as ``AttributeError``,
 ``IndexError``, ``struct.error`` -- or, worse, silently succeed.
 """
 
@@ -11,9 +11,9 @@ import struct
 
 import pytest
 
-from aiodns.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import (
+from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from namespy.names import DomainName
+from namespy.packet import (
     DnsPacket,
     DnsPacketParseError,
     DnsQuestion,
@@ -22,7 +22,7 @@ from aiodns.packet import (
     Response,
     clamp_ttl,
 )
-from aiodns.rdata import (
+from namespy.rdata import (
     RData,
     RData_A,
     RData_AAAA,
@@ -173,7 +173,7 @@ def test_aaaa_parses() -> None:
 def test_ns_rdata_canonicalises_pointers() -> None:
     """Stored RDATA must not keep a pointer into a datagram that no longer exists.
 
-    :mod:`aiodns.cache.sqlite` writes ``bytes(record)`` and re-parses it at offset
+    :mod:`namespy.cache.sqlite` writes ``bytes(record)`` and re-parses it at offset
     zero, where the original offsets are meaningless.
     """
     qname = b"\x07example\x03com\x00"
@@ -367,7 +367,7 @@ def test_multi_question_message_decodes_although_no_server_accepts_it() -> None:
     """Decoding is not accepting (RFC 8906 section 5.2).
 
     Every current server answers a two-question query with FORMERR, and
-    :mod:`aiodns.server` is one of them -- but the refusal is policy, not syntax.
+    :mod:`namespy.server` is one of them -- but the refusal is policy, not syntax.
     A decoder that refused here could not inspect the odd message it is named for,
     and would be unable to read the very FORMERR reply this library sends back.
     """

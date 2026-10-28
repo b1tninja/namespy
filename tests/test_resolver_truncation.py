@@ -28,11 +28,11 @@ import ipaddress
 
 import pytest
 
-from aiodns.cache import MemoryDnsCache
-from aiodns.enums import DnsQR, DnsQType, DnsRClass, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Response
-from aiodns.resolver import Answer, Resolver, Sname, _write_cache
+from namespy.cache import MemoryDnsCache
+from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Response
+from namespy.resolver import Answer, Resolver, Sname, _write_cache
 
 NS_NAME = DomainName("ns1.example.com.")
 NS_IP = ipaddress.IPv4Address("198.51.100.53")

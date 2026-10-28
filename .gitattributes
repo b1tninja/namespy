@@ -24,4 +24,4 @@
 
 # The root hints file is data with an exact on-the-wire meaning per RFC 1035
 # section 5; keep its LF and treat edits to it as substantive.
-aiodns/named.root text eol=lf
+namespy/named.root text eol=lf

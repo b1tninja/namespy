@@ -1,16 +1,20 @@
-# DNSpy
+# namespy
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![CI](https://github.com/b1tninja/DNSpy/workflows/CI/badge.svg)
+![CI](https://github.com/b1tninja/namespy/actions/workflows/ci.yml/badge.svg)
 
 An asyncio DNS library: a wire codec that survives malformed input, an iterative
 resolver that follows RFC 1034 section 5.3.3 literally, and a `dig`-flavoured
 inspector. No runtime dependencies.
 
-- **Python:** 3.12+ · **Imports as:** `aiodns` · **Installs as:** `aiodns-dnspy`
-  (the distribution name avoids colliding with the unrelated, established
-  [`aiodns`](https://pypi.org/project/aiodns/) on PyPI; the import name has not
-  changed)
+- **Python:** 3.12+ · **one name everywhere:** `pip install namespy`,
+  `import namespy`, `namespy example.com`
+- **Naming:** it used to be `aiodns` on import and `dnspy` on the command line.
+  Both collided with unrelated projects — [`aiodns`](https://pypi.org/project/aiodns/)
+  is an established asyncio resolver, and `dnspy` is an FQDN-manipulation library
+  — so installing this would have shadowed one of them. One string now covers the
+  distribution, the import and the console script, which is the only arrangement
+  that cannot surprise anyone.
 - **Status:** the codec, resolver and CLI are tested and usable; there is no
   DNSSEC validation and no EDNS(0) on the wire yet — see
   [What it does not do](#what-it-does-not-do)
@@ -31,15 +35,15 @@ Not published to PyPI yet, so install from the repository.
 ## Try it
 
 ```bash
-dnspy example.com                  # dig-style answer
-dnspy example.com AAAA
-dnspy --short example.com MX       # or: dnspy +short example.com MX
-dnspy example.com --trace          # write the resolution walk to last_resolution.md
-dnspy --serve                      # demo server on 127.0.0.1:53
+namespy example.com                  # dig-style answer
+namespy example.com AAAA
+namespy --short example.com MX       # or: namespy +short example.com MX
+namespy example.com --trace          # write the resolution walk to last_resolution.md
+namespy --serve                      # demo server on 127.0.0.1:53
 ```
 
-`python -m aiodns` does the same without installing the console script, and
-`dnspy --help` lists the rest (`--root-hints`, `--dns-suffix`, `--timeout`,
+`python -m namespy` does the same without installing the console script, and
+`namespy --help` lists the rest (`--root-hints`, `--dns-suffix`, `--timeout`,
 `--trace-file`, `-v`, `--debug`).
 
 `--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
@@ -63,7 +67,7 @@ await `resolve()`.
 
 ```python
 import asyncio
-from aiodns import DnsQType, DnsQuestion, DomainName, Query, RecursiveResolver
+from namespy import DnsQType, DnsQuestion, DomainName, Query, RecursiveResolver
 
 
 async def main():
@@ -89,8 +93,8 @@ The pieces are useful apart from the resolver. Decoding a capture needs neither 
 resolver nor an event loop:
 
 ```python
-from aiodns import DnsPacket
-from aiodns.rdata import RData_SOA
+from namespy import DnsPacket
+from namespy.rdata import RData_SOA
 
 packet, consumed = DnsPacket.parse(raw_datagram)
 print(packet.ID, packet.RCODE, packet.extended_rcode, packet.TC, len(packet.answers))
@@ -148,7 +152,7 @@ lint, typing and the distribution checks run once on Linux.
 pytest -q                              # coverage floor enforced by pyproject
 python -O -m pytest -q                 # assertions stripped
 ruff check . && ruff format --check .
-mypy aiodns
+mypy namespy
 ```
 
 The second line is the one that matters most here: `python -O` strips `assert`,

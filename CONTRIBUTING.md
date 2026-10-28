@@ -18,7 +18,7 @@ Check everything the way CI does:
 pytest                                   # coverage floor enforced by pyproject
 python -O -m pytest                      # assertions stripped — see below
 ruff check . && ruff format --check .
-mypy aiodns                              # blocking in CI; tightens per module
+mypy namespy                              # blocking in CI; tightens per module
 python -m build && python tools/check_dist.py dist/
 ```
 
@@ -29,7 +29,7 @@ python -m build && python tools/check_dist.py dist/
 `assert` disappears from the bytecode under `python -O` and `PYTHONOPTIMIZE`. In a
 parser, that means the bounds check you wrote is not executed in somebody's
 production environment. On a wire path, raise
-`aiodns.wire.DnsPacketParseError` (or `DnsNameParseError`) with the datagram and
+`namespy.wire.DnsPacketParseError` (or `DnsNameParseError`) with the datagram and
 the offset:
 
 ```python
@@ -95,9 +95,9 @@ an entry.
 ## Running things
 
 ```bash
-dnspy example.com                  # one-shot lookup via the packaged resolver
-dnspy example.com --trace          # per-step RFC 1034 section 5.3.3 trace
-dnspy --serve                      # loopback demo server, 127.0.0.1:53
+namespy example.com                  # one-shot lookup via the packaged resolver
+namespy example.com --trace          # per-step RFC 1034 section 5.3.3 trace
+namespy --serve                      # loopback demo server, 127.0.0.1:53
 ```
 
 `--serve` binds loopback on purpose. Do not turn it into something that listens

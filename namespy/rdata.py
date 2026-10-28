@@ -6,7 +6,7 @@ revision of this module broke without it.
 1. **Serialization is canonical (compression-free).** :meth:`RData.to_wire`
    always emits full labels, never a compression pointer, so the result is a
    self-contained octet string that is valid outside the datagram it came from.
-   This matters concretely: :mod:`aiodns.cache.sqlite` stores ``bytes(record)``
+   This matters concretely: :mod:`namespy.cache.sqlite` stores ``bytes(record)``
    and reads it back with ``DnsRecord.parse(payload, 0)``, where the original
    name offsets no longer exist. Returning the pointer octets would silently
    resurrect a *different* name -- or none -- on the next load. The octets as
@@ -16,12 +16,12 @@ revision of this module broke without it.
    section 5 names this exact class of bug: an RDATA field read that runs past
    its declared length walks into the next record.
 3. **Malformed input raises; it never half-parses.** All failures are
-   :class:`~aiodns.wire.DnsPacketParseError`, never an :keyword:`assert`.
+   :class:`~namespy.wire.DnsPacketParseError`, never an :keyword:`assert`.
 
 Unknown types are *not* errors. RFC 3597 section 3 requires a server to handle
 unknown RR types opaquely, and section 5 gives the master-file presentation
 ``\\# <rdlength> <hex>`` mirrored here by :func:`generic_presentation`. An RR
-whose type is absent from :class:`~aiodns.enums.DnsRType` therefore lands in the
+whose type is absent from :class:`~namespy.enums.DnsRType` therefore lands in the
 base :class:`RData` as a blob instead of raising -- the bug that previously made
 a single ``HTTPS`` record (type 65, RFC 9460) fatal to the whole listener.
 
@@ -322,7 +322,7 @@ def _read_name(buffer: bytes, offset: int, rdata_end: int, *, where: str) -> tup
 class RData_SingleName(DomainName):
     """RDATA that is exactly one ``<domain-name>`` -- the NS/CNAME/PTR/DNAME shape.
 
-    Subclasses :class:`~aiodns.names.DomainName` rather than :class:`RData`, so an
+    Subclasses :class:`~namespy.names.DomainName` rather than :class:`RData`, so an
     ``RData_NS`` *is* a domain name and compares and hashes as one; the concrete
     codecs below mix this in with :class:`RData`. That is what lets resolver code
     write ``ns_targets.append(r.rdata)`` and treat the result as a name, and what
@@ -434,7 +434,7 @@ class RData_SOA(RData):
     to the negative-caching TTL, and section 5.1 requires the authoritative
     server to set a negative response's TTL to ``min(SOA.MINIMUM, SOA.TTL)`` --
     which cannot be computed without reading it. It was absent before, so
-    :meth:`aiodns.resolver.Resolver._negative_ttl_seconds` could only fall back
+    :meth:`namespy.resolver.Resolver._negative_ttl_seconds` could only fall back
     to the RR's own TTL and therefore over-cached negative answers.
 
     Serial comparison is RFC 1982 unsigned 32-bit wrap-around arithmetic, per

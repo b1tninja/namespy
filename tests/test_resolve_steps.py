@@ -1,10 +1,10 @@
 import ipaddress
 
-from aiodns.cache import MemoryDnsCache, NegativeEntry, PositiveEntry
-from aiodns.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Response
-from aiodns.resolver import (
+from namespy.cache import MemoryDnsCache, NegativeEntry, PositiveEntry
+from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Response
+from namespy.resolver import (
     Answer,
     Demote,
     Done,

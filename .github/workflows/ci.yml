@@ -37,7 +37,7 @@ jobs:
       - run: ruff check . --output-format=github
       - run: ruff format --check .
 
-      # Blocking at the level the code is actually at: mypy aiodns exits 0 today,
+      # Blocking at the level the code is actually at: mypy namespy exits 0 today,
       # so a check that merely printed the count would let regressions through
       # while looking like a gate. --strict measures 274 errors, and 245 of them
       # are no-untyped-def plus no-untyped-call -- one root cause, functions with
@@ -45,7 +45,7 @@ jobs:
       # evenly. That is a per-module campaign, not a flag to flip: enabling
       # strict globally would mean silencing the result, which is how a type
       # checker stops being read.
-      - run: mypy aiodns
+      - run: mypy namespy
 
   test:
     name: Test py${{ matrix.python-version }} on ${{ matrix.os }}
@@ -106,7 +106,7 @@ jobs:
       # through importlib.resources -- the one failure mode unit tests cannot
       # see, because they always run against the source tree.
       #
-      # The `cd /` is load-bearing: the checkout contains an aiodns/ directory,
+      # The `cd /` is load-bearing: the checkout contains an namespy/ directory,
       # so importing from the workspace would silently import the source tree and
       # "pass" no matter what the wheel actually contains.
       - name: Install the wheel and load hints from it
@@ -114,7 +114,7 @@ jobs:
           python -m venv /tmp/verify
           /tmp/verify/bin/python -m pip install --no-deps dist/*.whl
           cd /
-          /tmp/verify/bin/python -c "import aiodns, importlib.resources as r; print(len(r.files('aiodns').joinpath('named.root').read_text().splitlines()), 'root hint lines')"
+          /tmp/verify/bin/python -c "import namespy, importlib.resources as r; print(len(r.files('namespy').joinpath('named.root').read_text().splitlines()), 'root hint lines')"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

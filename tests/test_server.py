@@ -25,8 +25,8 @@ import random
 
 import pytest
 
-from aiodns.cache import MemoryDnsCache
-from aiodns.enums import (
+from namespy.cache import MemoryDnsCache
+from namespy.enums import (
     DnsOpCode,
     DnsQClass,
     DnsQR,
@@ -34,11 +34,11 @@ from aiodns.enums import (
     DnsResponseCode,
     DnsRType,
 )
-from aiodns.names import DomainName
-from aiodns.packet import DnsPacket, DnsQuestion, DnsRecord, Query, Response
-from aiodns.rdata import RData_A
-from aiodns.resolver import RecursiveResolver
-from aiodns.server import DnsServer
+from namespy.names import DomainName
+from namespy.packet import DnsPacket, DnsQuestion, DnsRecord, Query, Response
+from namespy.rdata import RData_A
+from namespy.resolver import RecursiveResolver
+from namespy.server import DnsServer
 
 HOST = DomainName("www.example.com.")
 HOST_IP = ipaddress.IPv4Address("93.184.216.34")

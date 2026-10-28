@@ -106,7 +106,7 @@ def _parse_qtype(token):
     cannot ask for a type until this library happens to list it, which is the
     opposite of what RFC 3597 section 3 requires of a receiver: unknown types are
     legitimate wire values, and a freshly assigned one should be queryable on the
-    day it is registered, not after DNSpy catches up.
+    day it is registered, not after Namespy catches up.
     """
     s = str(token).upper()
     try:
@@ -119,8 +119,8 @@ def _parse_qtype(token):
 def _parse_qclass(token):
     """Resolve a record class, mnemonic or number (see :func:`_parse_qtype`).
 
-    Both paths return :class:`~aiodns.enums.DnsQClass`, the space of the question
-    section's QCLASS field. Reaching for :class:`~aiodns.enums.DnsRClass` on the
+    Both paths return :class:`~namespy.enums.DnsQClass`, the space of the question
+    section's QCLASS field. Reaching for :class:`~namespy.enums.DnsRClass` on the
     mnemonic path made the return type depend on how the user spelled the same
     value -- ``IN`` yielding one enum and ``1`` the other -- which is invisible
     while comparing by value and surprising the moment anything keys on type.
@@ -154,14 +154,14 @@ def _parse_field(text, token, enum, label):
 def _format_rdata(record):
     r"""Render one record's RDATA for the dig-style answer.
 
-    Goes through the codec's :meth:`~aiodns.rdata.RData.to_presentation` so that
+    Goes through the codec's :meth:`~namespy.rdata.RData.to_presentation` so that
     every type renders the way the wire format describes it: an address as an
     address, a name absolutely qualified, and an unknown type as RFC 3597
     section 5 ``\# <len> <hex>``. The alternative was decoding bytes as ASCII,
     which turned a binary RDATA into mojibake on the terminal -- and which a
     `ZONEMD` or `CSYNC` record hits routinely now that unknown types parse.
 
-    ``record.rdata`` is always an :class:`~aiodns.rdata.RData`, so there is no
+    ``record.rdata`` is always an :class:`~namespy.rdata.RData`, so there is no
     raw-bytes case to special-case here; the fallback exists only because
     ``__slots__`` lets a caller assign one in after construction.
     """
@@ -191,7 +191,7 @@ def _format_response(response, args, elapsed_ms):
     """
     lines = []
     lines.append(
-        f"; <<>> dnspy <<>> {args.name} {type_name_of(args.type)} {DnsQClass.mnemonic(args.qclass)}"
+        f"; <<>> namespy <<>> {args.name} {type_name_of(args.type)} {DnsQClass.mnemonic(args.qclass)}"
     )
     if response is None:
         lines.append(";; no response")
@@ -289,19 +289,19 @@ def _normalize_dig_plus_args(argv):
 
 
 def build_parser():
-    # prog is dnspy, matching the console-script name, because that is what a
-    # user actually typed when they see this text; the import name stays aiodns
+    # prog is namespy, matching the console-script name, because that is what a
+    # user actually typed when they see this text; the import name stays namespy
     # for compatibility, so the examples show both entry points.
     p = argparse.ArgumentParser(
-        prog="dnspy",
-        description="DNSpy: a dig-style CLI for the recursive resolver, plus a demo server mode.",
+        prog="namespy",
+        description="Namespy: a dig-style CLI for the recursive resolver, plus a demo server mode.",
         epilog="Examples:\n"
-        "  dnspy example.com\n"
-        "  dnspy example.com MX\n"
-        "  dnspy +short example.com\n"
-        "  dnspy +trace example.com A\n"
-        "  dnspy --serve\n"
-        "  python -m aiodns example.com   (same thing, without installing)",
+        "  namespy example.com\n"
+        "  namespy example.com MX\n"
+        "  namespy +short example.com\n"
+        "  namespy +trace example.com A\n"
+        "  namespy --serve\n"
+        "  python -m namespy example.com   (same thing, without installing)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("name", nargs="?", help="domain name to resolve (presentation form)")
@@ -342,7 +342,7 @@ def build_parser():
         "--root-hints",
         default=None,
         help="path to a root hints zone file (default: the copy packaged "
-        "with DNSpy; refresh it with refresh_root_hints())",
+        "with Namespy; refresh it with refresh_root_hints())",
     )
     p.add_argument(
         "--dns-suffix",

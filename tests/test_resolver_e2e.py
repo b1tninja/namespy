@@ -13,11 +13,11 @@ import ipaddress
 
 import pytest
 
-from aiodns.cache import MemoryDnsCache
-from aiodns.names import DomainName
-from aiodns.packet import DnsQuestion, DnsRecord, Query, Response
-from aiodns.rdata import RData_A, RData_AAAA, RData_NS, RData_SOA
-from aiodns.resolver import Demote, RecursiveResolver
+from namespy.cache import MemoryDnsCache
+from namespy.names import DomainName
+from namespy.packet import DnsQuestion, DnsRecord, Query, Response
+from namespy.rdata import RData_A, RData_AAAA, RData_NS, RData_SOA
+from namespy.resolver import Demote, RecursiveResolver
 
 GTLD = DomainName("a.gtld-servers.net.")
 GTLD_IP = ipaddress.IPv4Address("192.5.6.4")

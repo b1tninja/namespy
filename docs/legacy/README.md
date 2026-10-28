@@ -10,9 +10,9 @@ earlier MySQL-backed design: tables `blob`, `blacklist`, `packet`, `name`,
 rows, keep raw payloads content-addressed by SHA-1 in `blob`, and hold a
 `blacklist` of addresses to ignore.
 
-What replaced it is :mod:`aiodns.cache`: a small positive/negative RR cache with
+What replaced it is :mod:`namespy.cache`: a small positive/negative RR cache with
 two interchangeable backends, `MemoryCache` and `SqliteCache`
-(:mod:`aiodns.cache.memory`, :mod:`aiodns.cache.sqlite`). The difference is the
+(:mod:`namespy.cache.memory`, :mod:`namespy.cache.sqlite`). The difference is the
 point of keeping these files around. The old schema modelled *observed traffic*;
 the current one models *cached answers with TTLs*, because RFC 1034 section 4.5.4
 and RFC 2181 sections 5-8 make caching a time-bounded, authority-aware

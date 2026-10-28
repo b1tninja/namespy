@@ -5,7 +5,7 @@ Run after ``python -m build``:
 
     python tools/check_dist.py dist/
 
-Unit tests cannot cover this. ``aiodns/named.root`` is read through
+Unit tests cannot cover this. ``namespy/named.root`` is read through
 :func:`importlib.resources.files`, so it is invisible to anything that imports
 the source tree -- a wheel missing it installs cleanly, imports cleanly, passes
 every test, and then fails on the first lookup with no starting point. It is
@@ -27,17 +27,17 @@ import zipfile
 
 #: Must appear in the wheel, because the resolver cannot start without them.
 REQUIRED_IN_WHEEL = (
-    "aiodns/__init__.py",
-    "aiodns/named.root",
-    "aiodns/py.typed",
+    "namespy/__init__.py",
+    "namespy/named.root",
+    "namespy/py.typed",
 )
 
 #: Must appear in the sdist, or a build-from-source cannot reproduce them. The
 #: root hints are the sharp edge here: they are gitignored, so the default
 #: exclude list would otherwise drop them from the tarball too.
 REQUIRED_IN_SDIST = (
-    "aiodns/named.root",
-    "aiodns/py.typed",
+    "namespy/named.root",
+    "namespy/py.typed",
     "pyproject.toml",
     "README.md",
     "LICENSE",
