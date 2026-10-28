@@ -85,11 +85,83 @@ console.setFormatter(logging.Formatter("%(name)-12s: %(levelname)-8s %(message)s
 # Library logging posture: silence unless the application opts in.
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
+# Re-exports, deliberately at the bottom.
+#
+# resolver.py and server.py both say ``from . import enable_path_mtu_discovery``,
+# so the package body has to finish defining that function before either
+# submodule runs -- and importing a submodule here executes it immediately. Moved
+# these lines above the definition and every import in the package raises
+# ImportError on a half-built module object, which is a confusing failure to
+# diagnose because it names neither of the two files that caused it.
+#
+# They exist because ``from aiodns.resolver import RecursiveResolver`` is not a
+# reasonable thing to make a caller type, and because the previous ``__all__``
+# advertised socket option constants as the package's public surface while the
+# classes people actually want were only reachable through module paths.
+from .cache import (  # noqa: E402
+    DnsCache,
+    MemoryDnsCache,
+    NegativeEntry,
+    PositiveEntry,
+    SqliteDnsCache,
+)
+from .enums import (  # noqa: E402
+    DnsOpCode,
+    DnsQClass,
+    DnsQR,
+    DnsQType,
+    DnsRClass,
+    DnsResponseCode,
+    DnsRType,
+)
+from .names import DomainName  # noqa: E402
+from .packet import (  # noqa: E402
+    DnsPacket,
+    DnsPacketParseError,
+    DnsQuestion,
+    DnsRecord,
+    Query,
+    Response,
+)
+from .resolver import RecursiveResolver, Resolver  # noqa: E402
+from .trace import Trace  # noqa: E402
+from .wire import DnsNameParseError  # noqa: E402
+
 __all__ = [
+    # Socket-level helpers, kept exported because server.py and resolver.py
+    # share them and a caller building their own transport needs the guard.
     "IP_MTU",
     "IP_MTU_DISCOVER",
     "IP_PMTUDISC_DO",
     "PMTUD_SUPPORTED",
+    # The API surface: names a caller should not have to know a module path for.
+    "DnsCache",
+    "DnsNameParseError",
+    "DnsOpCode",
+    "DnsPacket",
+    "DnsPacketParseError",
+    "DnsQClass",
+    "DnsQR",
+    "DnsQType",
+    "DnsQuestion",
+    "DnsRClass",
+    "DnsRType",
+    "DnsRecord",
+    "DnsResponseCode",
+    "DomainName",
+    "MemoryDnsCache",
+    "NegativeEntry",
+    "PositiveEntry",
+    "Query",
+    "RecursiveResolver",
+    "Resolver",
+    "Response",
+    "SqliteDnsCache",
+    "Trace",
+    # Trailing because ruff's RUF022 sorts dunders last within this group; the
+    # grouping in this list is by case convention, not by meaning.
+    "__author__",
     "__version__",
     "console",
+    "enable_path_mtu_discovery",
 ]
