@@ -232,6 +232,14 @@ class Resolver(asyncio.Protocol):
                 version,
             )
             return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+        except asyncio.CancelledError:
+            # The docstring above promised the slot cannot leak; timeout was
+            # covered but cancellation was not, and cancellation is the common
+            # case (caller timeout on the outer task, server reconnect, client
+            # disconnect). An abandoned future with its key still in `pending`
+            # grows the dict for the lifetime of the resolver.
+            pending.pop(key, None)
+            raise
 
         if response is not None and response.TC:
             self.log.debug(
@@ -1534,8 +1542,12 @@ class RecursiveResolver(Resolver):
         try:
             (dns_packet, _offset) = DnsPacket.parse(data)
         except DnsPacketParseError as e:
-            self.log.warning(
-                "parse failed in resolver: err=%s offset=%s len=%d hex=%s",
+            # Debug, not warning: this is the attacker-controlled path, and a
+            # warning with a hex dump per datagram is a free log-flood
+            # primitive. The v6 path and server.py already stay quiet; this
+            # was the last loud one.
+            self.log.debug(
+                "resolver_parse_failed(err=%s offset=%s len=%d hex=%s)",
                 e,
                 e.offset,
                 len(e.data),

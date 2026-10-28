@@ -391,6 +391,16 @@ class RData_SingleName(DomainName):
                 data=buffer,
                 offset=offset,
             )
+        if length is not None and len(original) < int(length):
+            # Fail closed on the other side too: RDATA that does not end with
+            # the name carries octets no field accounts for. MX, SRV and SOA
+            # already refuse this; NS/CNAME/PTR/DNAME must not accept it.
+            raise DnsPacketParseError(
+                f"{cls._type_label()} RDATA has {int(length) - len(original)} "
+                f"trailing octet(s) after the name (RFC 9267 section 5)",
+                data=buffer,
+                offset=end,
+            )
         return cls(name.name, buffer, offset, wire=original)
 
     def __bytes__(self) -> bytes:
@@ -595,6 +605,15 @@ class RData_TXT(RData):
                 )
             strings.append(blob[cursor : cursor + size])
             cursor += size
+        if not strings:
+            # RFC 1035 section 3.3.14: TXT RDATA is one or more
+            # <character-string>; an empty RDLENGTH is malformed, not an
+            # empty string.
+            raise DnsPacketParseError(
+                "TXT RDATA contains no character-string (RFC 1035 section 3.3.14)",
+                data=blob,
+                offset=offset,
+            )
         return cls(strings, wire=blob)
 
     def to_wire(self) -> bytes:

@@ -101,7 +101,10 @@ def unescape_label(text: str) -> bytes:
         if i >= length:
             raise DomainNameError("trailing backslash in presentation label")
         nxt = text[i]
-        if nxt.isdigit():
+        if nxt.isascii() and nxt.isdigit():
+            # isascii() matters: '²'.isdigit() is true, and int("²") reaching
+            # the escape decoder would raise ValueError instead of the
+            # DomainNameError callers are built to catch.
             digits = text[i : i + 3]
             if len(digits) < 3 or not digits.isdigit():
                 raise DomainNameError(f"escape needs exactly three decimal digits, got {digits!r}")
@@ -194,7 +197,16 @@ class DomainName:
         parts = split_presentation((self.name or "").strip())
         if parts and parts[-1] == "":
             parts = parts[:-1]  # trailing dot is the root terminator, not a label
-        return [unescape_label(p) for p in parts if p != ""]
+        if parts == [""]:
+            # "." splits to two empty parts and the strip above removes one;
+            # what remains is the root terminator seen as a label, not a
+            # label with an unterminated name. The root has no labels.
+            parts = []
+        # Interior empty labels survive: "a..b" is not "a.b". to_wire() refuses
+        # to encode one (no wire form exists -- a zero length terminates the
+        # name), and silently reinterpreting the name here would corrupt
+        # equality and cache keys before anything could object.
+        return [unescape_label(p) for p in parts]
 
     def _labels(self) -> tuple[bytes, ...]:
         """Raw, ASCII-case-folded label octets -- the name's true identity.
@@ -437,6 +449,7 @@ class DomainName:
         labels: list[bytes] = []
         budget = 0
         hops = 0
+        start = offset
         resume_at: int | None = None
         seen: set[int] = set()
 
@@ -490,7 +503,11 @@ class DomainName:
                         data=buffer,
                         offset=offset,
                     )
-                budget += 2
+                # The two pointer octets are not part of the expanded name
+                # (RFC 1035 section 3.1 bounds the expansion, not the
+                # encoding); counting them here would reject valid wide names
+                # carried on pointers. Termination is the hop cap and the
+                # seen-set, neither of which moved.
                 offset = target
                 continue
 
@@ -541,4 +558,7 @@ class DomainName:
         else:
             presentation = ".".join(escape_label(label) for label in labels) + "."
         end = resume_at if resume_at is not None else offset
-        return cls(presentation, buffer, resume_at), end
+        # `start`, not `resume_at`: the constructor's offset is documented as
+        # where the name begins in `buffer`. resume_at says where the enclosing
+        # record resumes -- past the pointer, not past the name's start.
+        return cls(presentation, buffer, start), end

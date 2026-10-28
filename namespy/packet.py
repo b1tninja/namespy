@@ -188,7 +188,7 @@ class DnsRecord:
         self.name = name if isinstance(name, DomainName) else DomainName(name)
         self.rtype = DnsRType.parse(rtype)
         self.rclass = DnsRClass.parse(rclass)
-        self.ttl = int(ttl) & 0xFFFFFFFF
+        self.ttl = clamp_ttl(ttl)
         if isinstance(rdata, str):
             rdata = rdata.encode("ascii", "surrogateescape")
         if isinstance(rdata, (bytes, bytearray, memoryview)):

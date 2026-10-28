@@ -253,7 +253,10 @@ def test_unregistered_types_carry_their_rdata_untouched(
     assert end == len(wire)
     assert int(parsed.rtype) == rtype
     assert int(parsed.rclass) == rclass
-    assert parsed.ttl == ttl
+    # RFC 2181 section 8: above 2147483647 the TTL is *that value*, so the
+    # round-trip property is the identity up to the documented clamp, not
+    # raw equality over the whole 32-bit field.
+    assert parsed.ttl == min(ttl, 0x7FFFFFFF)
     assert bytes(parsed.rdata) == blob
     # RFC 3597 section 5 presentation. Stated as the rule rather than by
     # repeating the library's own helper, so a change to the helper is caught.
@@ -308,7 +311,11 @@ _RDATA_FOR = {
     RData_CNAME: st.builds(RData_CNAME, _name),
     RData_PTR: st.builds(RData_PTR, _name),
     RData_SOA: st.builds(RData_SOA, _name, _name, *(st.integers(0, 0xFFFFFFFF) for _ in range(5))),
-    RData_TXT: st.builds(RData_TXT, st.lists(st.binary(max_size=40), max_size=3)),
+    # min_size=1: RFC 1035 section 3.3.14 requires at least one
+    # <character-string>, and the parser refuses an empty RDLENGTH, so a
+    # builder allowed to emit [] would build messages that are malformed by
+    # definition rather than by any bug under test.
+    RData_TXT: st.builds(RData_TXT, st.lists(st.binary(max_size=40), min_size=1, max_size=3)),
     RData_MX: st.builds(RData_MX, _name, st.integers(0, 0xFFFF)),
     RData_SRV: st.builds(
         RData_SRV,

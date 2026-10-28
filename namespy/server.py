@@ -7,7 +7,7 @@ consequences shape this module:
 
 * **Never emit output the operator did not ask for.** The module previously built
   a fresh ``logging.Logger("server")`` and attached a module-global handler to it,
-  so importing Namespy and constructing a server produced output regardless of
+  so importing namespy and constructing a server produced output regardless of
   application configuration -- and an ``INFO`` line per query plus a ``print`` of
   every response turned a query flood into a log flood.
 * **Bound the in-flight upstream lookups.** Each inbound datagram previously
@@ -169,4 +169,15 @@ class DnsServer(asyncio.Protocol):
             dns_packet.ID,
             getattr(question, "name", "?"),
         )
+        if len(self._tasks) >= 2 * self.max_concurrent_lookups:
+            # Bound the *spawn*, not only the upstream lookup: taking the
+            # semaphore inside the task meant every flooded datagram still
+            # minted a coroutine, so ingress -- not the operator -- sized the
+            # task set. The 2x margin keeps the semaphore meaningful (a few
+            # lookups may wait their turn) while the backlog stays bounded;
+            # past it, silent drop is RFC 5625 section 6.2's answer for
+            # overload: no response, no amplification, no log growth at
+            # default level.
+            self.log.debug("server_overload_drop(src=%s:%s)", host, port)
+            return
         self._spawn(self.respond_to_packet(dns_packet, addr))
