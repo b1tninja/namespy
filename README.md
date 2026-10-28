@@ -93,7 +93,10 @@ async def main():
             print(record.name, record.rtype, record.ttl, record.rdata)
         print(resolver.last_trace.to_mermaid())
     finally:
+        # Both halves: the socket asyncio handed you, and the private IPv6 socket
+        # the resolver opened for itself to fetch AAAA glue.
         transport.close()
+        await resolver.aclose()
 
 
 asyncio.run(main())

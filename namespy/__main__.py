@@ -416,10 +416,15 @@ async def cli_query(args) -> int:
         return 0 if response is not None else 2
     finally:
         _transport.close()
+        # The endpoint transport is only half of it. The resolver opened a second
+        # socket for AAAA glue, and that one belongs to nobody but itself.
+        await resolver_protocol.aclose()
 
 
 async def serve(args) -> int:
     resolver_protocol = None
+    _resolver_transport = None
+    _server_transport = None
     try:
         loop = asyncio.get_running_loop()
 
@@ -460,6 +465,16 @@ async def serve(args) -> int:
         except asyncio.CancelledError:
             return 0
         return 0
+    finally:
+        # This mode runs until someone stops it, which is exactly when an
+        # unclosed socket stops being a detail: the two endpoint transports, plus
+        # the resolver's private IPv6 one. Every way out of here -- bind failure,
+        # Ctrl+C, something unexpected -- lets all three go.
+        for transport in (_resolver_transport, _server_transport):
+            if transport is not None:
+                transport.close()
+        if resolver_protocol is not None:
+            await resolver_protocol.aclose()
 
 
 def main(argv=None) -> int:

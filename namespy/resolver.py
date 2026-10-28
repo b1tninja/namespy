@@ -1627,6 +1627,75 @@ class RecursiveResolver(Resolver):
         if dns_suffix is not None:
             self.dns_suffix = dns_suffix
 
+    async def aclose(self):
+        """Release every socket and pending query this resolver owns.
+
+        asyncio hands a protocol its endpoint transport, and this class opens a
+        second one privately, for AAAA glue (:meth:`_ensure_v6_transport`).
+        Neither closes itself. An unclosed transport is an unclosed socket: it
+        surfaces as a ``ResourceWarning`` when garbage-collected, and as a leaked
+        descriptor in anything that builds resolvers in a loop -- a measurement
+        harness, a server. This is why the class is an async context manager:
+        :meth:`__aexit__` calls this method, so forgetting is not the default.
+
+        Safe to call twice, and safe on a resolver that never connected --
+        closing an already-closed transport is a no-op in asyncio, and the
+        transports are read defensively because a protocol that never saw
+        ``connection_made`` has none to read.
+
+        Pending queries are *failed*, not cancelled. Cancelling the future would
+        surface as ``CancelledError`` in whoever is awaiting it, and inside
+        :func:`asyncio.wait_for` that makes the caller's own task look cancelled
+        -- a wrong story about who is shutting down.
+        """
+        # Stop the background IPv6 bring-up first: it may be sitting inside
+        # create_datagram_endpoint, and finishing a socket we are about to stop
+        # using would only create one more thing to close.
+        task, self._v6_ready = self._v6_ready, None
+        if task is not None and not task.done():
+            task.cancel()
+
+        # Transports before the futures, and before the one ``await`` below: if a
+        # cancellation reaches this coroutine while it is suspended, the sockets
+        # are already gone.
+        for transport in (getattr(self, "transport", None), self.transport_v6):
+            if transport is not None:
+                transport.close()
+        self.transport = None
+        self.transport_v6 = None
+
+        for queue in (getattr(self, "queue", None), getattr(self, "queue_v6", None)):
+            for _key, (_query, future) in list((queue or {}).items()):
+                if future.done():
+                    continue
+                future.set_exception(RuntimeError("resolver closed"))
+                # Reading the exception back is what keeps asyncio from logging
+                # "Future exception was never retrieved" for every query that was
+                # in flight when the caller stopped caring. The future's state --
+                # and therefore what an awaiting caller sees -- is unchanged.
+                future.exception()
+            if queue is not None:
+                queue.clear()
+
+        if task is not None:
+            # Let the cancellation land rather than leaving a task pending when
+            # the loop stops. The handler swallows this one cancellation because
+            # this method is the one that asked for it.
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def __aenter__(self):
+        """Enter an ``async with`` block that guarantees :meth:`aclose`."""
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        """Close the resolver on the way out, including down the error path."""
+        await self.aclose()
+        # Do not swallow: an exception raised inside the block is the caller's
+        # business, not this method's.
+
     def connection_made(self, transport):
         self.transport = transport
         enable_path_mtu_discovery(transport, self.log)

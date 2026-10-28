@@ -415,6 +415,39 @@ async def test_serve_runs_until_cancelled(monkeypatch, caplog):
     assert any("Press Ctrl+C" in record.message for record in caplog.records)
 
 
+async def test_serve_closes_every_socket_on_the_way_out(monkeypatch):
+    """Server mode runs until someone stops it, which is when leaks start to matter.
+
+    Two endpoints are opened here, and the resolver keeps a third socket of its
+    own. Nothing in asyncio closes any of them, so the ``finally`` in ``serve`` is
+    the only thing standing between a demo server and a descriptor leak -- and the
+    path exercised is the ordinary Ctrl+C one, not an exceptional one.
+    """
+    made = []
+
+    async def idle_endpoint(factory, **_kwargs):
+        transport = _FakeTransport()
+        made.append(transport)
+        return transport, factory()
+
+    async def skip_demo(_loop):
+        return None
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
+    )
+    monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+
+    task = asyncio.ensure_future(cli.serve(_args(["--serve"])))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()
+    assert await task == 0
+
+    assert len(made) == 2, "resolver endpoint plus the server's own socket"
+    assert [transport.closed for transport in made] == [True, True]
+
+
 def test_main_routes_serve_to_the_server(monkeypatch):
     seen = {}
 

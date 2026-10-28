@@ -17,6 +17,14 @@ nothing has been tagged or published yet, so `master` is the only version.
   exhaustion degrades to full-name queries; `--trace` marks probes. Off by
   default because it changes wire behaviour toward every downline server;
   CNAME chasing deliberately keeps full names.
+- `RecursiveResolver.aclose()`, plus `async with` support, releases every socket
+  a resolver owns: the endpoint transport asyncio attached, the private IPv6
+  socket it opens for AAAA glue, and a bring-up task still in flight. Fails are
+  completed with `RuntimeError` rather than cancelled, so a caller's
+  `asyncio.wait_for` reports that *this* resolver closed instead of appearing to
+  have been cancelled from outside. Both CLI modes use it, and the library
+  example in the README now shows it next to `transport.close()`. Pinned by
+  `test_resolver_lifecycle.py`.
 - Security CI (`.github/workflows/security.yml`): CodeQL with `security-extended`
   (weekly and on change), `dependency-review` on every pull request, and
   `pip-audit` over the resolved dev environment. `socket.yml` screens every
