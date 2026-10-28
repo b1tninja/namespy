@@ -37,6 +37,7 @@ dist/
 htmlcov/
 .mypy_cache/
 .pyright_cache/
+.hypothesis/
 
 # Local-only caches and captures from manual experiments
 *.sqlite
