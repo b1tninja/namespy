@@ -14,6 +14,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release this version; must equal namespy.__version__ (e.g. 0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -22,27 +27,55 @@ jobs:
   build:
     name: Build release artifacts
     runs-on: ubuntu-latest
+    # id-token + attestations are for the provenance step below; everything
+    # else in this job stays under contents: read.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     outputs:
       digest: ${{ steps.hash.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
 
-      - name: Refuse a tag that disagrees with the package version
+      - name: Refuse a version that disagrees with the package
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script: an input is data, not shell text, even a maintainer's.
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          # A dispatched run carries no tag, so GITHUB_REF_NAME would be a
+          # branch name and the comparison would always fail; the input stands
+          # in for the tag. The rule itself is the same either way: what lands
+          # on PyPI must be a version some source tree actually claims.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            WANT="${INPUT_VERSION}"
+          else
+            WANT="${GITHUB_REF_NAME#v}"
+          fi
           ACTUAL="$(python -c 'import namespy; print(namespy.__version__)')"
-          if [ "$TAG" != "$ACTUAL" ]; then
-            echo "tag says $TAG but namespy.__version__ is $ACTUAL" >&2
+          if [ "$WANT" != "$ACTUAL" ]; then
+            echo "release says $WANT but namespy.__version__ is $ACTUAL" >&2
             exit 1
           fi
 
       - run: python -m build
       - run: python tools/check_dist.py dist/
+
+      # GitHub-side SLSA provenance, signed by Sigstore against this run's OIDC
+      # identity: `gh attestation verify` ties the shipped files back to this
+      # repo and commit. PyPI receives its own PEP 740 attestations from the
+      # publish action; two independent proofs of the same build.
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
 
       # SLSA provenance attribute: the SHA256 of every artifact the publish job
       # will upload. Recorded here so a later audit can tie a file on PyPI back
@@ -54,7 +87,7 @@ jobs:
             | base64 -w0 > ../digest.b64
           echo "digest=$(cat ../digest.b64)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-dist
           path: dist/
@@ -67,19 +100,19 @@ jobs:
     # credential exists to leak, and the audience/environment gate means only
     # this repository's tagged builds can mint an upload credential.
     #
-    # DORMANT UNTIL ACTIVATED. Before the first release, on PyPI create the
-    # project `namespy` under Trusted Publishing with this repo, workflow
-    # file `release.yml`, and environment `pypi`; then create the matching
-    # `pypi` environment under Settings -> Environments and uncomment the
-    # `environment:` line below. GitHub rejects a job naming an environment that
-    # does not exist, which is why it is commented rather than pre-declared here:
-    # a misfired tag should fail at `twine` with a legible error, not at a
-    # half-configured environment.
-    # environment: pypi
+    # The `pypi` environment exists in Settings -> Environments; the job
+    # names it, so only runs from this repo/workflow can mint its token.
+    # The remaining half is on PyPI: the project `namespy` must list this
+    # repo, this workflow file and this environment name as a trusted
+    # publisher before any upload will be accepted. Until then a misfired
+    # tag fails at `twine` with a legible OIDC error rather than publishing.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/namespy
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist/
@@ -91,3 +124,29 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           print-hash: true
+          # PEP 740 digital attestations are generated and uploaded by the
+          # action automatically for trusted publishing; there is nothing to
+          # enable here.
+
+  release:
+    name: Create the GitHub Release
+    needs: [build, publish]
+    # A dispatched run has no tag to cut a release from: it is a rehearsal of
+    # the build/publish path and stays out of the releases list.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-dist
+          path: dist/
+      # The GitHub Release is the human-facing artifact page, and it only
+      # appears after PyPI accepted the files: a failed publish leaves no
+      # half-release pointing at binaries that are not on PyPI.
+      - name: Publish the release
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
