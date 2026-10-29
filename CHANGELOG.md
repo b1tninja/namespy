@@ -180,6 +180,37 @@ nothing has been tagged or published yet, so `master` is the only version.
 - `tests/test_review_fixes.py` — locks every finding from the correctness
   review (TTL clamp, trailing-RDATA refusal, empty-label refusal, cancellation
   pending-slot release, log-level discipline, server spawn bound).
+- SVCB and HTTPS (RFC 9460) — types 64 and 65 stop being an RFC 3597 hex blob.
+  `RData_SVCB`/`RData_HTTPS` in `namespy.rdata` carry the priority, the TargetName
+  and a `SvcParams` object; `namespy.svcb` is the module behind them. Encoding
+  obeys §2.2's "SvcParamKeys SHALL appear in increasing numeric order" — the
+  parameters are stored by key number and written in sorted order, so a record
+  built in the wrong order still leaves this program canonical, while *receiving*
+  out-of-order or duplicated parameters is refused as a wire error rather than
+  quietly normalised. Unknown keys are kept, not dropped: §2.1.1 does not make an
+  unrecognised SvcParam a wire error at all — it matters only when it is
+  mandatory, and then the whole record is ignored — so nothing here edits one
+  away, and `keyNNNNN` (§2.1) round-trips so a generated zone file says what it
+  meant.
+  `select_records()` implements the §2.4 client behaviour — AliasMode wins over
+  every ServiceMode record in the RRset, records that fail a test cost only
+  themselves unless `strict=True` takes §2.4.3's option of rejecting the RRset,
+  and each discarded record arrives in `skipped` with the reasons that removed it.
+  §8's automatically mandatory keys are the part most likely to be got wrong: an
+  `HTTPS` mapping mandates `port` and `no-default-alpn` without saying so in the
+  RDATA, so `SvcbCandidate` carries them separately from any explicit `mandatory`
+  parameter and a client that supports neither is told, correctly, to ignore the
+  record. RFC 9460 Appendix D is the test oracle: `tests/test_svcb_rdata.py` (30
+  tests) walks every figure through both wire decoding and presentation parsing.
+  `tests/test_svcb_wire.py` (46) works the framing one level below that — a partial
+  parameter header, a `SvcParamValue` length that overruns the RDATA, keys out of
+  order, an uninterpretable key followed by a readable one — and holds every
+  registered key's value to its own section, which is where §2.2's third malformed
+  condition bites: a key that was not recognised as registered would let a corrupt
+  `port` through as a record that merely has no `port`, silently changing how the
+  client connects instead of losing the record. `tests/test_svcb_presentation.py`
+  (101) covers §2.1's encoding rules in both directions — charstring escaping,
+  value-list splitting and joining, the `keyNNNNN` spelling, and the rejections.
 
 ### Changed
 

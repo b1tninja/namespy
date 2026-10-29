@@ -33,16 +33,21 @@ a single ``HTTPS`` record (type 65, RFC 9460) fatal to the whole listener.
 * RFC 2782 section 3 (SRV), RFC 7505 (null MX)
 * RFC 3597 sections 3, 5 (opaque unknown types, ``\\#`` presentation)
 * RFC 9267 section 5 (validate RDLENGTH; do not read past it)
+* RFC 9460 sections 2.1, 2.2, 2.4, 2.5, 9 (SVCB/HTTPS presentation, wire format,
+  AliasMode/ServiceMode, the root TargetName, the HTTP mapping); the SvcParamKeys
+  themselves are :mod:`namespy.svcb`
 """
 
 from __future__ import annotations
 
 import ipaddress
 import struct
+from collections.abc import Iterable
 from typing import ClassVar
 
 from .enums import DnsRType
 from .names import DomainName
+from .svcb import HTTPS_AUTO_MANDATORY, IntOrStr, SvcbCandidate, SvcParams
 from .wire import DnsPacketParseError, read_octets
 
 __all__ = [
@@ -51,11 +56,13 @@ __all__ = [
     "RData_AAAA",
     "RData_CNAME",
     "RData_DNAME",
+    "RData_HTTPS",
     "RData_MX",
     "RData_NS",
     "RData_PTR",
     "RData_SOA",
     "RData_SRV",
+    "RData_SVCB",
     "RData_SingleName",
     "RData_TXT",
     "all_rdata_classes",
@@ -757,3 +764,127 @@ class RData_SRV(RData):
 
     def to_presentation(self) -> str:
         return f"{self.priority} {self.weight} {self.port} {self.target}"
+
+
+# ---------------------------------------------------------- service binding
+
+
+class RData_SVCB(RData):
+    """``SVCB`` RDATA -- SvcPriority, TargetName, SvcParams (RFC 9460 section 2.2).
+
+    One layout serves two modes and the first field selects: SvcPriority 0 is
+    AliasMode, which renames the service, and anything else is ServiceMode, which
+    binds parameters to a target (section 2.4). The SvcParams have no length field
+    of their own -- section 2.2 says they consume "the remainder of the record" --
+    so the only thing that can tell a parser where they stop is the RDLENGTH, and a
+    SvcParam that would run past it is malformed rather than merely suspicious.
+
+    The target comes first in the constructor's order, as in :class:`RData_MX` and
+    :class:`RData_SRV`, and has no default: ``.`` is a real value in both modes --
+    "service not available" in AliasMode, "the owner name itself" in ServiceMode
+    (section 2.5) -- so defaulting it would make the constructor state something.
+
+    What to do about a record that will not decode is not this class's decision.
+    :class:`RData` keeps the received octets intact either way, and
+    :func:`namespy.svcb.select_records` is where section 2.2's "MUST reject the
+    entire RRset" verdict belongs.
+    """
+
+    RType = DnsRType.SVCB
+
+    #: SvcParamKeys the protocol mapping makes mandatory without their being listed.
+    #: Section 8: generic SVCB defines no mapping, so it has none. HTTPS overrides
+    #: this with :data:`namespy.svcb.HTTPS_AUTO_MANDATORY`.
+    _AUTO_MANDATORY: ClassVar[frozenset[int]] = frozenset()
+
+    def __init__(
+        self,
+        target: DomainName | str,
+        priority: int = 0,
+        params: SvcParams | Iterable[tuple[IntOrStr, bytes]] = (),
+        *,
+        wire: bytes | None = None,
+    ) -> None:
+        self.priority = int(priority)
+        if not 0 <= self.priority <= 0xFFFF:
+            raise ValueError(f"SvcPriority {priority} is outside 0..65535")
+        self.target = target if isinstance(target, DomainName) else DomainName(target)
+        self.params = params if isinstance(params, SvcParams) else SvcParams(params)
+        super().__init__(self.to_wire(), wire=wire)
+
+    @property
+    def is_alias(self) -> bool:
+        """SvcPriority 0: the record renames the service instead of describing it."""
+        return self.priority == 0
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        end = offset + len(blob)
+        if len(blob) < 3:
+            raise DnsPacketParseError(
+                f"{cls._type_label()} RDATA is {len(blob)} octet(s), too short for a "
+                "SvcPriority and a TargetName",
+                data=blob,
+                offset=offset,
+            )
+        (priority,) = struct.unpack_from("!H", buffer, offset)
+        target, cursor = _read_name(
+            buffer, offset + 2, end, where=f"{cls._type_label()} TargetName"
+        )
+        # The parameters run to the end of the RDLENGTH: from_wire is handed that
+        # window and refuses a SvcParam that would cross it (RFC 9460 section 2.2).
+        params, _ = SvcParams.from_wire(buffer, cursor, size=end - cursor, data=blob)
+        return cls(target, priority, params, wire=blob)
+
+    def to_wire(self) -> bytes:
+        """Priority, then the TargetName written out in full -- section 2.2's rule."""
+        return struct.pack("!H", self.priority) + bytes(self.target) + self.params.to_wire()
+
+    def to_presentation(self) -> str:
+        """``SvcPriority TargetName [SvcParams]`` -- section 2.1's order."""
+        params = self.params.to_presentation()
+        return f"{self.priority} {self.target} {params}".rstrip()
+
+    def candidate(self, owner: DomainName | str) -> SvcbCandidate:
+        """This RDATA and an owner name, in the shape :func:`namespy.svcb.select_records` reads.
+
+        RDATA has no owner name, yet two of the decisions a client makes need one:
+        RFC 9460 section 2.4.3 checks 11-13 compare the owner with the TargetName,
+        and section 2.5 turns a root TargetName into the owner name. The mapping's
+        automatically-mandatory keys come along from :attr:`_AUTO_MANDATORY` for the
+        same reason -- section 8 judges those by protocol, and the RDATA class is
+        what knows which protocol this is.
+        """
+        return SvcbCandidate(
+            owner=owner if isinstance(owner, DomainName) else DomainName(owner),
+            priority=self.priority,
+            target=self.target,
+            params=self.params,
+            auto_mandatory=self._AUTO_MANDATORY,
+        )
+
+
+class RData_HTTPS(RData_SVCB):
+    """``HTTPS`` RDATA -- the SVCB format plus the HTTP mapping (RFC 9460 sections 9, 14.2).
+
+    Nothing about the wire format changes; what changes is what the fields mean. Two
+    of those differences are attached to the class so a caller cannot lose them:
+    section 9 and Appendix B Table 3 make ``port`` and ``no-default-alpn``
+    automatically mandatory, so a client that cannot act on one must ignore an RR
+    that carries it; and section 9 gives ``http/1.1`` alone as the default ALPN set,
+    which :attr:`default_alpn` carries so that an HTTPS call site of
+    :meth:`namespy.svcb.SvcParams.svc_alpn_set` needs no arguments.
+    """
+
+    RType = DnsRType.HTTPS
+    _AUTO_MANDATORY: ClassVar[frozenset[int]] = HTTPS_AUTO_MANDATORY
+
+    #: RFC 9460 section 9: "The default set of ALPN IDs is the single value
+    #: 'http/1.1'"; Appendix B Table 3 repeats it as the mapping's SvcParam default.
+    _DEFAULT_ALPN: ClassVar[tuple[bytes, ...]] = (b"http/1.1",)
+
+    @property
+    def default_alpn(self) -> tuple[bytes, ...]:
+        """The ALPN set an RR with neither ``alpn`` nor ``no-default-alpn`` offers."""
+        return self._DEFAULT_ALPN

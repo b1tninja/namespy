@@ -115,6 +115,11 @@ def test_every_registered_codec_round_trips_through_a_wrapped_record():
         int(DnsRType.SOA): (
             bytes(DomainName(".")) + bytes(DomainName(".")) + struct.pack(_TIMERS, 0, 0, 0, 0, 0)
         ),
+        # RFC 9460 Appendix D Figure 3 (SVCB) and the same shape for HTTPS: the
+        # parameters are already in ascending key order, which the section 2.2
+        # encoding rule requires and which this sweep compares byte for byte.
+        int(DnsRType.SVCB): bytes.fromhex("000100000300020035"),
+        int(DnsRType.HTTPS): bytes.fromhex("001003666f6f076578616d706c6503636f6d00000300020035"),
     }
     untested = set(all_rdata_classes()) - set(payloads)
     assert not untested, f"add a round-trip payload for: {sorted(untested)}"

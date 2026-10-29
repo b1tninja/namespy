@@ -37,6 +37,8 @@ Spec anchors: RFC 1035, RFC 2181, RFC 9267, RFC 3597, RFC 4343, RFC 3688.
 | Name comparison is case-insensitive octet folding | 1035 §2.4.4, 4343 §2.1 | ✅ | `test_names.py` |
 | Length limits: 255-octet names, 63-octet labels | 1035 §2.3.4, 2181 §2 | ✅ | `test_names_wire.py` |
 | Served TTLs clamped to 2³¹−1 — an unclamped `0xFFFFFFFF` is a forever cache entry | 2181 §8, 3688 §1 | ✅ | `test_review_fixes.py` |
+| SVCB/HTTPS `SvcParams` on the wire: ascending keys, no duplicates, reserved key 0 refused, `SvcParamValue` lengths kept inside RDLENGTH, and every registered key's value held to its own section | 9460 §2.2, §2.2.1, §2.2.2 | ✅ | `test_descending_key_order_is_refused`, `test_a_repeated_key_is_refused`, `test_the_reserved_invalid_key_is_refused_in_position`, `test_a_value_claiming_more_octets_than_remain_is_refused`, `test_a_value_that_disagrees_with_its_key_is_malformed`, `test_a_registered_key_is_not_reported_as_unknown` (`test_svcb_wire.py`) |
+| SVCB presentation format in both directions: decimal escapes and quoting, comma-separated value lists, `keyNNNNN` for a key with no registered name | 9460 §2.1, §2.1.1, Appendix A.1 | ✅ | `test_encoding_escapes_in_decimal`, `test_quoting_groups_octets_that_would_end_the_token`, `test_appendix_a1_worked_example`, `test_unregistered_keys_use_the_keynnnnn_form`, `test_generated_spelling_reparses_to_the_same_wire_value` (`test_svcb_presentation.py`) |
 
 ## 2. Transport and truncation
 
@@ -47,8 +49,8 @@ Spec anchors: RFC 1035, RFC 2181, RFC 9267, RFC 3597, RFC 4343, RFC 3688.
 | UDP timeout re-asks over TCP | 1035 §4.2.2, 7766 §6 | ✅ | `test_resolver_truncation.py` |
 | TCP framing: 2-octet length prefix, same query re-sent verbatim | 7766 §3.1, §6 | ✅ | `test_resolver_truncation.py` |
 | DNS over TLS / HTTPS / QUIC / CoAP, as the transport for a *forwarded* query | 7858, 8484, 9250, 9953 | ⬜ | roadmap P4 — these are stub-to-resolver protocols, and there is no forwarding mode here to put them behind; the row that fits this resolver is the next one |
-| Opportunistic encryption of the recursive-to-authoritative leg: probe SVCB at `_dns.<NS-name>`, remember the answer by server address, fall back to Do53 on any failure | 9539 §4, 9460, 9461 | ⬜ | roadmap P4 — Experimental, optional by design, and gated on the SVCB codecs below |
-| SVCB / HTTPS RDATA codecs (SvcParams, `alpn`, `dohpath`) rather than an RFC 3597 blob | 9460 | ⬜ | roadmap P2 — `enums.py` names types 64 and 65, `rdata.py` registers no codec for them, so every HTTPS RR arrives opaque |
+| Opportunistic encryption of the recursive-to-authoritative leg: probe SVCB at `_dns.<NS-name>`, remember the answer by server address, fall back to Do53 on any failure | 9539 §4, 9460, 9461 | ⬜ | roadmap P4 — Experimental and optional by design. The SVCB codecs it was gated on have landed; what is left is the `_dns.<name>` probe itself, the answer store keyed by server address, and the Do53 fallback |
+| SVCB / HTTPS RDATA codecs (SvcParams, `alpn`, `dohpath`) rather than an RFC 3597 blob | 9460 | ✅ | `namespy/svcb.py` holds the registry, `SvcParams`, `SvcbCandidate` and `select_records` (§2.4 client behaviour); `RData_SVCB`/`RData_HTTPS` are registered in `rdata.py`; Appendix D is the test oracle in `test_svcb_rdata.py`, and the two §2.1/§2.2 format obligations it rests on are the last two rows of §1 |
 | TCP connection reuse, with the `edns-tcp-keepalive` idle timeout that authorises it | 7828, 9210 | ⬜ | roadmap P3 — `_query_tcp` opens a connection, uses it once and closes it |
 | Both address families kept in play so one family's outage cannot partition the answer | 10001 §4.2 | 🟡 | an SLIST queries whatever addresses the glue happened to carry; there is no family-aware selection or fallback policy |
 
@@ -185,7 +187,7 @@ of code built on namespy, not by implementation cost.
 | ~~P1~~ | ~~EDNS options TLV parse/emit, then per-server payload adaptation~~ shipped | 6891 §6.1.2/§6.2.3, 5001, 7873, 7830 | ✅ options ride in OPT RDATA both ways; NSID is asked for, answered only on request and printed as hex; COOKIE and Padding carry their length rules; each responder's advertised size now caps what we offer it | — |
 | ~~P1~~ | ~~Server echoes OPT; EDNS-aware responses~~ shipped | 6891 §6.1.1/§6.2.4/§7 | ✅ the demo server now answers extended queries with its own OPT, refuses a second OPT with FORMERR, answers an unknown VERSION with BADVERS, and keeps §7 silence for unextended requestors | — |
 | **P2** | ~~QNAME minimisation~~ shipped opt-in | 9156 | ✅ probe walk + descent integration; flipping the default is a field-behaviour decision, not a code one | — |
-| **P2** | SVCB / HTTPS RDATA codecs, so an `HTTPS` RR arrives as parameters rather than an RFC 3597 blob | 9460, 9461 | every encrypted-transport and discovery idea in this table starts by reading an `HTTPS` RR, which today means reading a hex string | small |
+| ~~P2~~ | ~~SVCB / HTTPS RDATA codecs~~ shipped, so an `HTTPS` RR arrives as parameters rather than an RFC 3597 blob | 9460, 9461 | ✅ every encrypted-transport and discovery idea in this table can now begin by reading parameters instead of a hex string; §8's automatically mandatory keys travel with each record, so a client supporting neither `port` nor `no-default-alpn` is told to ignore an `HTTPS` RR that offers them — the part a hand-rolled implementation gets wrong | — |
 | ~~P2~~ | ~~Extended DNS Errors: compose and consume the `ERROR` option~~ shipped | 8914 | ✅ an unexplained SERVFAIL now says which server stopped answering and which zone could not be reached, and a resolver that receives one keeps the sender's words in the failure it remembers and in the debug log. What the code deliberately does *not* buy: influence over resolution — section 6 forbids it — nor propagation of an upstream code to this resolver's own client, which would mean synthesising a response the failure path never builds | — |
 | **P2** | Multiple QTYPEs (MQTYPE) | 10029 | one exchange instead of an A, an AAAA and an HTTPS query that each walk the same servers down the same tree | medium |
 | **P3** | IDNA/punycode | 5891/3492 | correctness for internationalised names; currently the caller's job | medium |
@@ -210,6 +212,6 @@ server costing one UDP query and one TCP attempt is what the text allows, and
 project from talking itself out of that reading later.
 
 Everything below changes the answers this resolver gives or the transports it can
-use: the cheap correctness item still open is the SVCB codec, then IDNA and
+use: the SVCB codec has landed, so the cheap correctness items still open are IDNA and
 wildcard synthesis, then DNSSEC, which remains both the largest trust gap and by
 far the largest project.

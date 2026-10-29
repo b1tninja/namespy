@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 497 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Suite | 675 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
 | Coverage | 87.2% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -189,9 +189,31 @@ decorate), and no invented name for a code the registry does not carry — it pr
 number. Worth knowing: every §2/§3/§6 quotation in the EDE code was re-checked against the
 RFC body this round, and three that had crept in as paraphrases were replaced — the rule 8
 failure mode is alive, so re-check a quote rather than trusting the section number beside
-it. What remains in `docs/roadmap.md`, in order: SVCB/HTTPS RDATA codecs (9460/9461, the
-small one and the door to everything encrypted-transport), MQTYPE (10029), then wildcard
-synthesis (4592 §2.2).
+it. Shipped since that was written: SVCB and HTTPS (9460) — `namespy/svcb.py` with the
+key registry, `SvcParams`, `SvcbCandidate` and `select_records`, plus `RData_SVCB` and
+`RData_HTTPS` in `rdata.py`, with Appendix D of the RFC as the test oracle. Two things
+worth knowing before touching either file. First, a malformed `HTTPS` RDATA now fails the
+whole message parse, as a malformed `A` or `SOA` always has: the codec is registered, so
+"opaque fallback" applies only to types with no codec (RFC 3597 §3), and refusing to guess
+where the next record starts is RFC 9267 §5 rather than a local preference. Second,
+`namespy/svcb.py` measured 70% under `pytest --cov` while the note in `pyproject.toml`
+expects 89% or better, because much of its presentation layer was exercised only by
+doctests and CI runs `pytest -q --cov` without `--doctest-modules`. Writing those examples
+into `tests/` is what found the two bugs fixed in the same commit: `_PARSABLE_KEYS` was a
+set of key *names* while `SvcParams.from_wire` and `to_wire` compare key *numbers*, so no
+registered key ever matched and every one was treated as uninterpretable — a one-octet
+`port` therefore decoded as a well-formed record that merely has no `port`, which changes
+how a client connects instead of losing the record, because §2.2's third malformed
+condition was never reached — and `SvcParams._unknown` came from how an object was built
+rather than from what it stores, so a hand-built `SvcParams` could not say which of its
+keys have no value definition. `SvcParams._unknown` is now derived from the stored keys,
+which is also what keeps `ech` (registered at 5, no value definition) opaque in both
+directions: `test_ech_is_conveyed_but_stays_opaque`'s `unknown_keys == (5,)` on a
+hand-built `SvcParams` is the pin. What is
+still doctest-only is `zone_file_warnings` (svcb.py:1325–1368), which leaves the module at
+88% — chase that by moving those examples into `tests/`, not by writing weaker tests.
+What remains in `docs/roadmap.md`, in order: MQTYPE (10029),
+then wildcard synthesis (4592 §2.2).
 
 Housekeeping that turned out to be a real fix: the coverage floor had never been *read*
 by CI. `[tool.coverage.report] fail_under` is a pytest-cov input, and pytest-cov measures

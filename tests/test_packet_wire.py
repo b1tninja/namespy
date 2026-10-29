@@ -26,10 +26,12 @@ from namespy.rdata import (
     RData,
     RData_A,
     RData_AAAA,
+    RData_HTTPS,
     RData_MX,
     RData_NS,
     RData_SOA,
     RData_SRV,
+    RData_SVCB,
     RData_TXT,
     all_rdata_classes,
     generic_presentation,
@@ -61,17 +63,42 @@ def message(*, qname=b"\x07example\x03com\x00", qtype=1, answers=(), nameservers
 # ------------------------------------------------------------ unknown types
 
 
-def test_https_rr_does_not_kill_the_parse() -> None:
-    """Type 65 crashed the listener: the enum lookup left an int, then ``.value``.
+def test_https_rr_is_decoded_not_dropped() -> None:
+    """Type 65 used to crash the listener; it now decodes like any other type.
 
-    RFC 9460 made ``HTTPS`` common enough that any browser-facing answer could
-    carry one, and RFC 3597 section 3 requires it to be handled opaquely.
+    RFC 9460 made ``HTTPS`` common enough that any browser-facing answer can carry
+    one, and the crash came from the enum lookup leaving an ``int`` where the
+    serialiser expected a member. The record below is RFC 9460 Appendix D Figure 3,
+    and what matters is the whole path: it parses, it decodes to a real SvcParams
+    object, and it re-serialises to the octets it arrived as.
+    """
+    rdata = bytes.fromhex("001003666f6f076578616d706c6503636f6d00000300020035")
+    answer = rr_wire(b"\x07example\x03com\x00", 65, 1, 300, rdata)
+    payload = message(answers=[answer])
+    packet, consumed = DnsPacket.parse(payload)
+    record = packet.answers[0]
+    assert isinstance(record.rdata, RData_HTTPS)
+    assert record.rdata.priority == 16
+    assert not record.rdata.is_alias
+    assert record.rdata.target == DomainName("foo.example.com")
+    assert record.rdata.params.port == 53
+    assert consumed == len(payload)
+    assert bytes(record) == answer
+
+
+def test_malformed_https_rr_fails_the_parse() -> None:
+    """A malformed HTTPS RDATA is a hostile payload and fails like the others.
+
+    RDLENGTH stops inside the TargetName here. Before type 65 had a codec this
+    payload parsed as opaque data; now that it has one, the message is refused --
+    the parser would otherwise have to guess where the next record starts (RFC 9267
+    section 5), and RFC 9460's own "ignore this RR" judgement (section 3) is a
+    client-side decision that :func:`namespy.svcb.select_records` makes, not one that
+    can be made by inventing an interpretation of broken octets.
     """
     payload = message(answers=[rr_wire(b"\x07example\x03com\x00", 65, 1, 300, b"\x00\x00\x03\x00")])
-    packet, consumed = DnsPacket.parse(payload)
-    assert int(packet.answers[0].rtype) == 65
-    assert consumed == len(payload)
-    assert packet.answers[0].rdata.to_presentation() == r"\# 4 00000300"
+    with pytest.raises(DnsPacketParseError, match="truncated label"):
+        DnsPacket.parse(payload)
 
 
 def test_private_type_round_trips() -> None:
@@ -82,8 +109,12 @@ def test_private_type_round_trips() -> None:
 
 
 def test_unknown_rdata_has_no_registered_codec() -> None:
-    assert rdata_class_for(65) is None
+    assert rdata_class_for(65300) is None
     assert rdata_class_for(int(DnsRType.A)) is RData_A
+    # Type 65 sat in this list until RFC 9460 gave HTTPS a format of its own; it and
+    # SVCB (64) now have codecs, so a malformed one must still degrade as above.
+    assert rdata_class_for(int(DnsRType.SVCB)) is RData_SVCB
+    assert rdata_class_for(int(DnsRType.HTTPS)) is RData_HTTPS
 
 
 # ------------------------------------------------------------------- SOA
