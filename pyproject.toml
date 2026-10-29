@@ -90,17 +90,23 @@ branch = true
 # A floor, not a target: it exists so CI notices a module losing its tests,
 # which is the failure mode a parser-heavy library has to watch for.
 #
-# Set just under the measured total (81%) rather than at a round aspirational
-# number, because a gate that fails on arrival gets ignored, and an ignored gate
-# protects nothing. Ratchet it in step with tests, never ahead of them.
+# Measured by the Test job, which passes --cov — without that flag pytest never
+# loads pytest-cov and this number is never read. See the comment on that step.
 #
-# Where the remaining 19% lives, and whether it is worth chasing:
-#   resolver.py  67%  -- the real sockets and the root-hints bootstrap. Needs a
+# Set just under the measured total rather than at a round aspirational number,
+# because a gate that fails on arrival gets ignored, and an ignored gate protects
+# nothing. It stays at 80 for now even though the suite measures 87.2% locally:
+# that figure was taken on one platform and one Python, the gate fires on two of
+# each, and a floor raised on a guess is the same failure as one never applied.
+# Ratchet it from a number CI itself reports.
+#
+# Where the remaining 13% lives, and whether it is worth chasing:
+#   resolver.py  78%  -- the real sockets and the root-hints bootstrap. Needs a
 #                        live-network tier, not more unit tests; see below.
-#   rdata.py     85%  -- mostly defensive branches for malformed RDATA that the
-#                        hostile-input tests reach only through DnsRecord.parse.
-#   __init__.py  50%  -- the re-export table has no logic to test.
-# Anything else dropping materially below these numbers is a module losing cover.
+#   __main__.py  87%  -- the CLI's terminal-writing branches.
+#   __init__.py  59%  -- the re-export table has no logic to test.
+# Everything else measures 89% or better. Anything falling materially below
+# these numbers is a module losing cover.
 fail_under = 80
 show_missing = true
 exclude_lines = [

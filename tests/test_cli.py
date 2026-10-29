@@ -32,7 +32,7 @@ from namespy.__main__ import (
     build_parser,
 )
 from namespy.cache import FailureCache
-from namespy.edns import nsid_option, serialize_options
+from namespy.edns import extended_dns_error_option, nsid_option, serialize_options
 from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Response
@@ -268,6 +268,82 @@ def test_no_response_renders_as_dig_does():
     text = _format_response(None, _args(["example.com"]), 5)
     assert "example.com" in text
     assert ";; no response" in text
+
+
+def _explained(*errors):
+    """A perfectly good NOERROR answer whose OPT carries *errors* -- INFO-CODE and
+    EXTRA-TEXT pairs -- so the printer is tested against a response that has not failed."""
+    response = Response(
+        ID=0x1234,
+        QR=1,
+        questions=[DnsQuestion(DomainName("example.com."), DnsQType.A)],
+        answers=[DnsRecord("example.com.", DnsRType.A, rdata=RData_A("93.184.216.34"))],
+    )
+    response.add_edns(
+        1232, options=[extended_dns_error_option(code, text) for code, text in errors]
+    )
+    return response
+
+
+def test_an_explanation_is_printed_where_the_option_lives():
+    """An Extended DNS Error is OPT RDATA, so dig's own layout puts its report beside
+    the payload size rather than in a section of its own -- and this prints it under the
+    pseudo-section because that is where a reader looking for EDNS matters will look."""
+    text = _format_response(_explained((22, b"no reachable authority")), _args(["example.com"]), 3)
+
+    assert "; EDNS: version: 0" in text
+    assert "; EDE: 22 (No Reachable Authority): no reachable authority" in text
+
+
+def test_an_explanation_is_printed_under_a_code_that_is_not_a_failure():
+    """RFC 8914 section 3: "Receivers MUST be able to accept EDE codes and EXTRA-TEXT in
+    all messages, including those with a NOERROR RCODE". The codes that make that sentence
+    matter are 3 and 4, which travel with answers a resolver is perfectly entitled to use,
+    so a printer that keyed on the status line would hide exactly the two codes worth
+    reading -- a stale answer looks like a fresh one otherwise."""
+    text = _format_response(_explained((3, b"")), _args(["example.com"]), 3)
+
+    assert "status: NO_ERROR" in text
+    assert "; EDE: 3 (Stale Answer)" in text
+
+
+def test_more_than_one_explanation_is_printed_in_the_order_it_arrived():
+    """Section 3: "Senders MAY include more than one EDE option and receivers MUST be
+    able to accept (but not necessarily process or act on) multiple EDE options in a DNS
+    message." Nothing ranks them for us and nothing licenses dropping one, so the printer
+    keeps the sender's order and prints every option it was given."""
+    text = _format_response(_explained((22, b""), (23, b"ns1: timeout")), _args(["example.com"]), 3)
+
+    first, second = text.index("; EDE: 22"), text.index("; EDE: 23")
+    assert first < second
+    assert "; EDE: 23 (Network Error): ns1: timeout" in text
+
+
+def test_an_unsafe_explanation_is_printed_escaped(capsys):
+    """Section 6: the option is "unauthenticated information, unless secured by a form of
+    secured DNS transaction", and "An attacker (e.g., a man in the middle (MITM) or
+    malicious recursive server) could insert an extended error response into untrusted
+    data" -- a sentence a program that writes to a terminal takes literally. The code is
+    printed as the number it provably is; the text arrives escaped."""
+    print(_format_response(_explained((22, b"\x1b[2Jcleared")), _args(["example.com"]), 3))
+
+    out = capsys.readouterr().out
+    assert "\\x1b[2Jcleared" in out, "shown as the octets they are"
+    assert "\x1b" not in out, "never handed to the terminal to obey"
+
+
+def test_a_malformed_explanation_costs_the_answer_nothing():
+    """The printer's share of section 6's "MUST NOT alter DNS protocol processing": an OPT
+    whose option length runs past the packet is a defect four octets wide, and the answer
+    riding beside it is still an answer. It is not half-printed either -- a line that
+    started with "; EDE:" and then stopped would report a code nobody sent."""
+    response = _explained((22, b""))
+    response.opt().rdata = b"\x00\x0f\x00\x0a\x00\x01"
+
+    text = _format_response(response, _args(["example.com"]), 3)
+
+    assert "93.184.216.34" in text
+    assert "; EDE:" not in text
 
 
 def test_short_format_is_rdata_only():

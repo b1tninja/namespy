@@ -8,7 +8,7 @@ octets -- and puts the entire burden of meaning on the registry:
     OPTION-LENGTH  16 bits
     OPTION-DATA  variable length
 
-Three codes are modelled here, because those are the three whose rules are
+Four codes are modelled here, because those are the four whose rules are
 short enough to enforce and whose absence is visible on the wire:
 
 * **NSID (3)**, RFC 5001. A resolver asks by sending the option with no data
@@ -35,6 +35,23 @@ short enough to enforce and whose absence is visible on the wire:
   same option, and DNS over plain UDP is not encrypted, so a UDP responder obeys
   section 6 by *not* padding. The conflict is documented at the point of use in
   :mod:`namespy.server` rather than resolved silently.
+* **ERROR (15)**, RFC 8914. Two octets of INFO-CODE followed by EXTRA-TEXT, and
+  the whole option is built to be read by a human: section 2 says the text "is
+  intended for human consumption (not automated parsing)", that it "may be null
+  terminated but MUST NOT be assumed to be", and that "the length MUST be derived
+  from the OPTION-LENGTH field" -- which is why :attr:`ExtendedDNSError.extra_text`
+  keeps exactly the octets the option carried, and why the display helper
+  :meth:`~ExtendedDNSError.text` is the only place a trailing NUL is dropped.
+  Receiving is deliberately tolerant, because section 3 is emphatic about it:
+  "Receivers MUST be able to accept EDE codes and EXTRA-TEXT in all messages,
+  including those with a NOERROR RCODE but need not act on them", and "Senders MAY
+  include more than one EDE option and receivers MUST be able to accept (but not
+  necessarily process or act on) multiple EDE options". So
+  :func:`extended_errors_of` returns *all* of them and raises nothing. What it must
+  not do is change an answer: section 3's "Applications MUST continue to follow
+  requirements from applicable specifications on how to process RCODEs no matter
+  what EDE values are also received", and section 6's "MUST NOT alter DNS protocol
+  processing", together mean no caller may branch on an INFO-CODE.
 
 The registry is wider than this module and the rule for what is not in it is
 explicit (section 6.1.2): "Any OPTION-CODE values not understood by a responder
@@ -55,6 +72,10 @@ returned. If this occurs, the response MUST include an OPT record."
   discarded)
 * RFC 7830 sections 3-4, 6 (padding format and when it, and the option, is
   mandatory or forbidden)
+* RFC 8914 section 2 (the ERROR option's format and its EXTRA-TEXT rules),
+  section 3 (multiple options, tolerance, and the rule that EDE never changes
+  RCODE processing), sections 4.1-4.25 and 5.2 (the INFO-CODE registry), section
+  6 (why EDE is unauthenticated and diagnostic only)
 """
 
 import struct
@@ -68,12 +89,22 @@ __all__ = [
     "COOKIE_MIN_SERVER_TOTAL_OCTETS",
     "COOKIE_OPTION_CODE",
     "EDNS_OPTION_HEADER_OCTETS",
+    "ERROR_OPTION_CODE",
+    "EXTENDED_ERROR_INFO_OCTETS",
+    "EXTENDED_ERROR_PRIVATE_USE_MIN",
     "MAX_EDNS_OPTION_OCTETS",
+    "MAX_EXTENDED_ERROR_CODE",
     "NSID_OPTION_CODE",
     "PADDING_OPTION_CODE",
     "EdnsOption",
+    "ExtendedDNSError",
     "client_cookie_of",
     "cookie_length_valid",
+    "extended_dns_error_option",
+    "extended_error_name",
+    "extended_error_option_valid",
+    "extended_error_presentation",
+    "extended_errors_of",
     "find_option",
     "nsid_of",
     "nsid_option",
@@ -102,6 +133,26 @@ COOKIE_OPTION_CODE = 10
 #: the IANA record).
 PADDING_OPTION_CODE = 12
 
+#: OPTION-CODE 15. RFC 8914 section 5.1 registers it as "Extended DNS Error", and
+#: section 2 then calls it EDE throughout ("The Extended DNS Error (EDE) option can
+#: be included in any response"), so the short form is what gets printed.
+ERROR_OPTION_CODE = 15
+
+#: The INFO-CODE is "16 bits, which is the principal contribution of this
+#: document" (RFC 8914 section 2) -- also the largest code the field can hold.
+MAX_EXTENDED_ERROR_CODE = 0xFFFF
+
+#: Octets of INFO-CODE, the only part of an EDE option that is not optional:
+#: section 2 allows EXTRA-TEXT to be "zero octets in length" but always expects an
+#: INFO-CODE, so an option shorter than this carries nothing that can be read.
+EXTENDED_ERROR_INFO_OCTETS = 2
+
+#: RFC 8914 section 5.2, Table 2 splits the field: "0 - 49151 | First Come First
+#: Served" and "49152 - 65535 | Private Use". A code at or above this is not
+#: undefined, it is somebody else's meaning -- which is why an unregistered code
+#: still prints as a number instead of being rejected.
+EXTENDED_ERROR_PRIVATE_USE_MIN = 49152
+
 #: The Client Cookie is always this long (RFC 7873 section 4, Figure 1: "Client
 #: Cookie (fixed size, 8 bytes)").
 COOKIE_CLIENT_OCTETS = 8
@@ -125,7 +176,53 @@ _OPTION_NAMES = {
     NSID_OPTION_CODE: "NSID",
     COOKIE_OPTION_CODE: "COOKIE",
     PADDING_OPTION_CODE: "PADDING",
+    ERROR_OPTION_CODE: "EDE",
 }
+
+#: The "Extended DNS Error Codes" registry as RFC 8914 section 5.2 Table 3
+#: populates it, with the Purpose column's wording kept verbatim -- a code that
+#: prints as something other than the name the registry gives it is a code whose
+#: meaning this project invented. Codes 25-49151 are "Unassigned" and 49152-65535
+#: "Reserved for Private Use" (§5.2 Table 2), so they are absent here on purpose
+#: and print as their number.
+_EXTENDED_ERROR_NAMES = {
+    0: "Other Error",
+    1: "Unsupported DNSKEY Algorithm",
+    2: "Unsupported DS Digest Type",
+    3: "Stale Answer",
+    4: "Forged Answer",
+    5: "DNSSEC Indeterminate",
+    6: "DNSSEC Bogus",
+    7: "Signature Expired",
+    8: "Signature Not Yet Valid",
+    9: "DNSKEY Missing",
+    10: "RRSIGs Missing",
+    11: "No Zone Key Bit Set",
+    12: "NSEC Missing",
+    13: "Cached Error",
+    14: "Not Ready",
+    15: "Blocked",
+    16: "Censored",
+    17: "Filtered",
+    18: "Prohibited",
+    19: "Stale NXDomain Answer",
+    20: "Not Authoritative",
+    21: "Not Supported",
+    22: "No Reachable Authority",
+    23: "Network Error",
+    24: "Invalid Data",
+}
+
+
+def extended_error_name(info_code: int) -> str:
+    """The registry name of ``info_code``, or its number if it is unregistered.
+
+    The same rule as :func:`option_name`: a code this project has no entry for is
+    somebody else's meaning -- unassigned space, or the 49152-65535 private-use
+    range RFC 8914 section 5.2 reserves for it -- so it prints as a number rather
+    than a guess.
+    """
+    return _EXTENDED_ERROR_NAMES.get(int(info_code), str(int(info_code)))
 
 
 def option_name(code: int) -> str:
@@ -180,6 +277,96 @@ class EdnsOption:
     def __repr__(self) -> str:
         body = self.data.hex() if self.data else "-"
         return f"<EdnsOption {self.name}({self.code}) {body}>"
+
+
+class ExtendedDNSError:
+    """One Extended DNS Error: an INFO-CODE and the EXTRA-TEXT sent with it.
+
+    RFC 8914 section 2 asks very little of either part. The code "serves as an
+    index into the 'Extended DNS Errors' registry" and nothing more; the text "is
+    intended for human consumption (not automated parsing)". So this class reads
+    the two fields and interprets neither -- there is no :attr:`name`-driven
+    behaviour to hang off a code, because section 3 forbids the inference:
+    "systems interpreting the extended error codes MUST NOT assume that a
+    combination will make sense", and the same section's "Applications MUST
+    continue to follow requirements from applicable specifications on how to
+    process RCODEs no matter what EDE values are also received" is what keeps this
+    a diagnostic object rather than a decision one.
+
+    The two octets of INFO-CODE are the only mandatory part -- section 2 allows
+    EXTRA-TEXT to be "zero octets in length" -- and :attr:`extra_text` holds
+    exactly the octets the option carried, which is what "the length MUST be
+    derived from the OPTION-LENGTH field" asks for. Anything prettier than that,
+    including dropping a trailing NUL, belongs to the reader: see :attr:`text`.
+    """
+
+    __slots__ = ("extra_text", "info_code")
+
+    def __init__(self, info_code: int, extra_text: bytes = b""):
+        code = int(info_code)
+        if not 0 <= code <= MAX_EXTENDED_ERROR_CODE:
+            raise ValueError(f"extended error INFO-CODE out of range: {info_code}")
+        payload = bytes(extra_text)
+        limit = MAX_EDNS_OPTION_OCTETS - EXTENDED_ERROR_INFO_OCTETS
+        if len(payload) > limit:
+            raise ValueError(
+                f"extended error EXTRA-TEXT is {len(payload)} octets, over the "
+                f"{limit} that fit beside an INFO-CODE in a 16-bit OPTION-LENGTH"
+            )
+        self.info_code = code
+        self.extra_text = payload
+
+    @property
+    def name(self) -> str:
+        """The registry name of this code, for display only."""
+        return extended_error_name(self.info_code)
+
+    @property
+    def private_use(self) -> bool:
+        """Whether this code sits in the range RFC 8914 section 5.2 reserves for
+        private use -- unregistered, but not a mistake."""
+        return self.info_code >= EXTENDED_ERROR_PRIVATE_USE_MIN
+
+    @property
+    def octets(self) -> bytes:
+        """The option's payload: INFO-CODE then EXTRA-TEXT (RFC 8914 section 2)."""
+        return struct.pack("!H", self.info_code) + self.extra_text
+
+    @property
+    def option(self) -> EdnsOption:
+        """This error as the EDNS(0) option that carries it."""
+        return EdnsOption(ERROR_OPTION_CODE, self.octets)
+
+    @property
+    def text(self) -> str:
+        """EXTRA-TEXT decoded for a human, never for a parser.
+
+        Two decisions, both from RFC 8914. Section 2's "EDE text may be null
+        terminated but MUST NOT be assumed to be" means a trailing NUL is a
+        convention some senders follow, so this drops one -- from the *display*
+        only, never from :attr:`extra_text`, which stays the exact octets the
+        OPTION-LENGTH described. And because EXTRA-TEXT arrives from whoever ran
+        the server, decoding cannot be allowed to fail: an invalid sequence
+        becomes U+FFFD rather than an exception, since section 6 insists EDE "MUST
+        NOT alter DNS protocol processing" and a UnicodeDecodeError on the way to
+        an answer is exactly that alteration.
+        """
+        decoded = self.extra_text.decode("utf-8", errors="replace")
+        if decoded.endswith("\x00"):
+            decoded = decoded[:-1]
+        return decoded
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, ExtendedDNSError):
+            return NotImplemented
+        return self.info_code == other.info_code and self.extra_text == other.extra_text
+
+    def __hash__(self) -> int:
+        return hash((self.info_code, self.extra_text))
+
+    def __repr__(self) -> str:
+        shown = extended_error_presentation(self)
+        return f"<ExtendedDNSError {shown}>"
 
 
 def parse_options(rdata_options: bytes) -> tuple[EdnsOption, ...]:
@@ -318,3 +505,107 @@ def pad_option(size: int) -> EdnsOption:
     if size < 0:
         raise ValueError(f"padding size cannot be negative: {size}")
     return EdnsOption(PADDING_OPTION_CODE, b"\x00" * size)
+
+
+#: How much EXTRA-TEXT a single line of output will carry. RFC 8914 section 3
+#: tells senders to keep it short -- "implementers and operators creating EDE
+#: options SHOULD avoid lengthy EXTRA-TEXT contents", because long text triggers
+#: the truncation the same paragraph is about -- so a receiver that prints all of
+#: it is displaying a thing the specification discourages sending. The cap is
+#: applied on display, never to :attr:`ExtendedDNSError.extra_text`.
+_TEXT_PRESENTATION_LIMIT = 96
+
+
+def extended_dns_error_option(info_code: int, extra_text: bytes = b"") -> EdnsOption:
+    """An ERROR option carrying ``info_code`` and, optionally, ``extra_text``.
+
+    The text is for a human: RFC 8914 section 2 says so outright, and warns
+    against putting "private information in the EXTRA-TEXT field that an observer
+    would not otherwise have access to" -- this is a plain-UDP option, so anything
+    written here is published to whoever can see the response.
+    """
+    return ExtendedDNSError(info_code, extra_text).option
+
+
+def extended_error_option_valid(option: EdnsOption) -> bool:
+    """Whether an ERROR option is long enough to hold an INFO-CODE.
+
+    This is the one judgement a responder may make about an EDE option, and it is
+    RFC 6891 section 7's, not RFC 8914's: "an option value that is badly formatted
+    or that includes out-of-range values" earns a FORMERR. One octet cannot be an
+    INFO-CODE, so it is badly formatted. Anything longer than that is *somebody's*
+    meaning -- unassigned or private-use codes included, which RFC 8914 section
+    5.2 sanctions -- and section 3's "Receivers MUST be able to accept EDE codes
+    and EXTRA-TEXT in all messages" forbids grading it.
+    """
+    return len(option.data) >= EXTENDED_ERROR_INFO_OCTETS
+
+
+def extended_errors_of(options) -> tuple[ExtendedDNSError, ...]:
+    """Every Extended DNS Error in ``options``, in the order they arrived.
+
+    All of them, because RFC 8914 section 3 makes plurality legal in both
+    directions: "Senders MAY include more than one EDE option and receivers MUST
+    be able to accept (but not necessarily process or act on) multiple EDE options
+    in a DNS message." Returning the first would be a policy about which error
+    matters, and this module has no standing to make one.
+
+    Raises nothing, including on a malformed option, which it skips. That is
+    deliberate and it is not the same question as :func:`extended_error_option_valid`
+    answers: a *responder* judges a request's options and may answer FORMERR,
+    while a *receiver* of an answer must let the option's badness stop at the
+    option -- section 6's "EDE content should be treated only as diagnostic
+    information and MUST NOT alter DNS protocol processing".
+    """
+    errors = []
+    for option in options:
+        if option.code != ERROR_OPTION_CODE:
+            continue
+        if not extended_error_option_valid(option):
+            continue
+        info_code = struct.unpack_from("!H", option.data)[0]
+        errors.append(ExtendedDNSError(info_code, option.data[EXTENDED_ERROR_INFO_OCTETS:]))
+    return tuple(errors)
+
+
+def _presentation_text(text: str) -> str:
+    """EXTRA-TEXT made safe to put on a terminal, and short enough to read.
+
+    EXTRA-TEXT is written by whoever ran the server, and RFC 8914 section 6 is
+    blunt about what that means: "EDE information is unauthenticated information,
+    unless secured by a form of secured DNS transaction" and "An attacker (e.g., a
+    man in the middle (MITM) or malicious recursive server) could insert an
+    extended error response into untrusted data". So control characters -- the
+    ones that move a cursor or clear a screen -- are escaped rather than emitted,
+    and the line is capped per :data:`_TEXT_PRESENTATION_LIMIT`. The cap cuts the
+    text before escaping, so an escape sequence is never chopped in half.
+    """
+    truncated = text[:_TEXT_PRESENTATION_LIMIT]
+    if len(text) > _TEXT_PRESENTATION_LIMIT:
+        truncated += "..."
+    escaped = []
+    for character in truncated:
+        code = ord(character)
+        if code < 0x20 or code == 0x7F:
+            escaped.append(f"\\x{code:02x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def extended_error_presentation(error: ExtendedDNSError) -> str:
+    """One readable line for an EDE: ``22 (No Reachable Authority): source=us``.
+
+    The number leads because it is the only part with a definition; the name in
+    parentheses is this project's copy of the RFC 8914 section 5.2 registry, and
+    appears only when there is one. Text follows a colon, escaped and capped by
+    :func:`_presentation_text`.
+    """
+    label = str(error.info_code)
+    name = error.name
+    if name != label:
+        label = f"{label} ({name})"
+    text = error.text
+    if not text:
+        return label
+    return f"{label}: {_presentation_text(text)}"

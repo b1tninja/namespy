@@ -56,6 +56,10 @@ encryption, so padding is dropped and the reply stays its natural size.
 * RFC 7830 sections 4, 6 (a responder must pad when asked -- and must not use
   the option at all on an unencrypted transport, which plain UDP is)
 * RFC 7873 section 5.2 (COOKIE lengths, and the FORMERR for an illegal one)
+* RFC 8914 section 2 (an Extended DNS Error may ride in any response to a query
+  that carried an OPT), section 3 (drop EDE options before other data when the
+  response outgrows the requestor's payload size), sections 4.22-4.23 (the codes
+  this server's own failures earn)
 """
 
 import asyncio
@@ -64,9 +68,12 @@ import logging
 from . import enable_path_mtu_discovery
 from .edns import (
     COOKIE_OPTION_CODE,
+    ERROR_OPTION_CODE,
     NSID_OPTION_CODE,
     EdnsOption,
     cookie_length_valid,
+    extended_dns_error_option,
+    extended_error_option_valid,
     find_option,
     nsid_of,
 )
@@ -94,6 +101,39 @@ MAX_UNEXTENDED_RCODE = 0xF
 #: The same 1232-octet figure the resolver advertises outbound is reused here so
 #: that one number describes this host's stack rather than two.
 RESPONDER_PAYLOAD_SIZE = EDNS_PAYLOAD_SIZE
+
+#: RFC 8914 section 4.22: "The requested operation or query is not supported."
+EDE_NOT_SUPPORTED = 21
+
+#: RFC 8914 section 4.23: "The resolver could not reach any of the authoritative
+#: name servers (or they potentially refused to reply)." Which is precisely the
+#: condition this server is in when its resolver hands back nothing.
+EDE_NO_REACHABLE_AUTHORITY = 22
+
+#: The Extended DNS Errors this server reports about *itself*.
+#:
+#: Only its own failures are listed, and that is the deliberate half of RFC 8914
+#: section 3: relaying what an upstream server said is left to the forwarder --
+#: "whether or not (and how) to pass along EDE information on to their original
+#: client is implementation dependent" -- and this one keeps upstream explanations
+#: in its log and in its failure cache rather than putting a stranger's words on the
+#: wire as its own. Codes 0 through 24 belong to that registry; nothing here invents
+#: one.
+#:
+#: The text is short on purpose (section 3: "implementers and operators creating EDE
+#: options SHOULD avoid lengthy EXTRA-TEXT contents") and names this software, which
+#: is the attribution the same paragraph asks for and none of the private information
+#: section 2 warns against.
+_OWN_FAILURE_ERRORS = {
+    int(DnsResponseCode.SERVER_FAILURE): (
+        EDE_NO_REACHABLE_AUTHORITY,
+        b"namespy: no authoritative answer",
+    ),
+    int(DnsResponseCode.NOT_IMPLEMENTED): (
+        EDE_NOT_SUPPORTED,
+        b"namespy: only QUERY is supported",
+    ),
+}
 
 #: How many upstream lookups one server instance allows at once. Bounded on
 #: purpose: it is what makes this server's *egress* provably limited relative to
@@ -162,9 +202,9 @@ class DnsServer(asyncio.Protocol):
         task.add_done_callback(self._tasks.discard)
         return task
 
-    def _reply(self, response, addr, request=None) -> None:
+    def _reply(self, response, addr, request=None, extended_errors=()) -> None:
         if request is not None:
-            self._apply_edns(request, response)
+            self._apply_edns(request, response, extended_errors)
         wire = bytes(response)
         self.log.debug(
             "server_reply(dst=%s id=%#06x rcode=%s octets=%d)",
@@ -183,6 +223,10 @@ class DnsServer(asyncio.Protocol):
         empty question section is one the client may discard. *dns_packet* is
         ``None`` when the datagram could not be parsed at all, and there is
         nothing to echo.
+
+        An Extended DNS Error goes along when this server has something to say
+        about the RCODE -- see :meth:`_own_failure_errors` for which ones do, and
+        :meth:`_apply_edns` for why a client that never sent an OPT never sees it.
         """
         questions = list(dns_packet.questions) if dns_packet is not None else []
         self._reply(
@@ -194,14 +238,34 @@ class DnsServer(asyncio.Protocol):
             ),
             addr,
             request=dns_packet,
+            extended_errors=self._own_failure_errors(rcode),
         )
+
+    @staticmethod
+    def _own_failure_errors(rcode) -> tuple:
+        """The EDE option this server sends with *rcode*, or an empty tuple.
+
+        RFC 8914 section 2 lets the option accompany any response, and section 3
+        refuses to bind codes to RCODEs ("This document does not allow or prohibit
+        any particular extended error codes and information to be matched with any
+        particular RCODEs"), so the pairing is the operator's to make. These two are
+        the cases where the RCODE alone leaves the client guessing: SERVFAIL says
+        "no answer" and not "nobody answered", and NOTIMP says "no" and not "to
+        what". FORMERR, BADVERS and the rest already carry their own explanation in
+        the code the client can read, so they get nothing.
+        """
+        explained = _OWN_FAILURE_ERRORS.get(int(rcode))
+        if explained is None:
+            return ()
+        info_code, extra_text = explained
+        return (extended_dns_error_option(info_code, extra_text),)
 
     @staticmethod
     def _opt_count(dns_packet) -> int:
         """How many OPT records a request carried (RFC 6891 section 6.1.1 allows one)."""
         return sum(1 for record in dns_packet.additional_records if int(record.rtype) == OPT_RTYPE)
 
-    def _apply_edns(self, request, response) -> None:
+    def _apply_edns(self, request, response, extended_errors=()) -> None:
         """Attach the OPT record this server is entitled -- or obliged -- to send.
 
         Two halves of RFC 6891 meet here. Section 6.1.1: "If an OPT record is
@@ -237,18 +301,61 @@ class DnsServer(asyncio.Protocol):
                 self.log.debug("server_unextended_rcode_downgrade(rcode=%s)", intended)
                 response.RCODE = int(DnsResponseCode.SERVER_FAILURE)
             return
-        response.add_edns(
-            RESPONDER_PAYLOAD_SIZE,
-            version=EDNS_VERSION_SUPPORTED,
-            options=self._reply_options(request),
-        )
-        if intended > MAX_UNEXTENDED_RCODE:
-            # Put the effective code back where the dropped OPT used to keep it.
-            # Serialisation splits it again -- header nibble here, upper eight
-            # in the record we just added (RFC 6891 section 6.1.3).
-            response.RCODE = intended
 
-    def _reply_options(self, request) -> list:
+        def attach(options) -> None:
+            """Put an OPT record on *response* carrying *options*.
+
+            A closure because RFC 8914 section 3 can make this run twice: the
+            explanation is dropped and the record rebuilt when keeping it would have
+            pushed the answer past what the client said it could reassemble.
+            """
+            response.remove_edns()
+            response.add_edns(
+                RESPONDER_PAYLOAD_SIZE,
+                version=EDNS_VERSION_SUPPORTED,
+                options=options,
+            )
+            if intended > MAX_UNEXTENDED_RCODE:
+                # Put the effective code back where the dropped OPT used to keep it.
+                # Serialisation splits it again -- header nibble here, upper eight
+                # in the record we just added (RFC 6891 section 6.1.3).
+                response.RCODE = intended
+
+        attach(self._reply_options(request, extended_errors))
+        if extended_errors:
+            self._keep_explanation_inside_advertised_size(request, response, attach)
+
+    def _keep_explanation_inside_advertised_size(self, request, response, attach) -> None:
+        """Drop the EDE options if they made the response bigger than the client asked for.
+
+        RFC 8914 section 3: "When the response grows beyond the requestor's UDP
+        payload size [RFC6891], servers SHOULD truncate messages by dropping EDE
+        options before dropping other data from packets." That ordering is the whole
+        method: the explanation is the supplemental thing, so it is what goes, and
+        what the client asked for is what survives.
+
+        The same paragraph's "Implementations SHOULD set the truncation bit when
+        dropping EDE options" is deliberately not followed, and the reason is which
+        response this is. TC is a promise that a retry over TCP will find the rest of
+        an answer, and on a response carrying nothing but its echoed question there is
+        no rest to find -- setting it would buy a TCP handshake and the same SERVFAIL
+        back. The log line is the honest record, and the RCODE already said there is
+        no answer.
+        """
+        incoming = None if request is None else request.opt()
+        if incoming is None:
+            return
+        # RFC 6891 section 6.2.3: "Values lower than 512 MUST be treated as equal to
+        # 512", so a client advertising something tiny is still measured against the
+        # floor it is owed rather than a limit that trims everything away.
+        advertised = max(DnsPacket.EDNS_MINIMUM_PAYLOAD, int(incoming.rclass))
+        size = len(bytes(response))
+        if size <= advertised:
+            return
+        self.log.debug("server_edns_error_dropped(octets=%d advertised=%d)", size, advertised)
+        attach(self._reply_options(request))
+
+    def _reply_options(self, request, extended_errors=()) -> list:
         """The options this server puts in its own OPT for this request.
 
         Only NSID, and only when it was asked for. RFC 5001 section 2.2 is
@@ -269,6 +376,14 @@ class DnsServer(asyncio.Protocol):
         would mean obeying one MUST by breaking another; section 6 is the
         sentence that speaks to the situation this server is actually in, and it
         is the one kept. A future DNS-over-TLS front end is where padding belongs.
+
+        An Extended DNS Error, when the caller has one to report, goes last. That
+        position is RFC 8914 section 3's ordering made concrete: a server whose
+        response has outgrown the requestor's payload size should drop EDE options
+        "before dropping other data from packets", and an option already at the end of
+        an OPT is the cheapest thing on the wire to give up -- which is how
+        :meth:`_keep_explanation_inside_advertised_size` can remove it without
+        disturbing anything else.
         """
         options = []
         try:
@@ -281,6 +396,7 @@ class DnsServer(asyncio.Protocol):
             asked = None
         if self.nsid is not None and asked is not None:
             options.append(EdnsOption(NSID_OPTION_CODE, self.nsid))
+        options.extend(extended_errors)
         return options
 
     def _edns_options_or_error(self, dns_packet, addr) -> bool:
@@ -294,12 +410,17 @@ class DnsServer(asyncio.Protocol):
         one answers with no OPT at all, which would tell the requestor this
         server has no EDNS rather than that it disliked the option it read.
 
-        The only lengths checked are COOKIE's, because it is the only modelled
-        option with a length rule to break: RFC 7873 section 5.2.2 allows 8
-        octets or 16 to 40 and nothing else. NSID is opaque and any length is
-        legal, and an unregistered code is not evaluated at all -- section
-        6.1.2's "MUST be ignored" covers its payload too, so refusing a
-        private-code option for its contents would be inventing a rule.
+        Two modelled options have a length to get wrong. COOKIE's rule is RFC 7873
+        section 5.2.2's: "In summary, valid cookie lengths are 8 and 16 to 40
+        inclusive", and nothing else. EDE's is only a floor -- RFC 8914 section 2
+        makes the INFO-CODE the one part of the option that is always present, so
+        fewer than two octets is a "badly formatted" option value in section 7's
+        phrase -- while anything *longer* is somebody else's meaning and is left
+        alone, because section 3's "Receivers MUST be able to accept EDE codes and
+        EXTRA-TEXT in all messages" covers unassigned and private-use codes alike.
+        NSID is opaque and any length is legal, and an unregistered code is not
+        evaluated at all -- section 6.1.2's "MUST be ignored" covers its payload too,
+        so refusing a private-code option for its contents would be inventing a rule.
         """
         try:
             options = dns_packet.edns_options()
@@ -312,6 +433,18 @@ class DnsServer(asyncio.Protocol):
             self.log.debug("server_bad_cookie_length(src=%s length=%s)", addr[0], len(cookie.data))
             self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
             return False
+        for option in options:
+            # Every EDE option, not the first: RFC 8914 section 3 lets a sender put
+            # more than one in a message, so a request that carries one good and one
+            # unreadable has still shown that its OPT cannot be trusted.
+            if option.code == ERROR_OPTION_CODE and not extended_error_option_valid(option):
+                self.log.debug(
+                    "server_bad_edns_error_length(src=%s length=%s)",
+                    addr[0],
+                    len(option.data),
+                )
+                self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+                return False
         return True
 
     async def respond_to_packet(self, dns_packet, addr):

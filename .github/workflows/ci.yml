@@ -69,9 +69,15 @@ jobs:
       - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
 
       # The coverage floor is fail_under in pyproject.toml, not duplicated here,
-      # so the threshold and the explanation for it stay in one file.
+      # so the threshold and the explanation for it stay in one file. The --cov
+      # flag is what makes pytest read that file: pytest-cov measures only when
+      # asked, so this step exited 0 whatever the tests covered and the floor was
+      # decoration: the floor (50012b4) and the CI that never asked for a
+      # measurement (ecedb5c) both landed 2026-10-27. Checked both ways: one test
+      # file now exits 1 with "Required test coverage of 80.0% not reached", the
+      # whole suite exits 0 at 87%.
       - name: pytest
-        run: python -m pytest -q
+        run: python -m pytest -q --cov
 
       # This step is the reason the suite is worth running at all here. Every
       # bounds check on a wire path was once an `assert`, which python -O strips

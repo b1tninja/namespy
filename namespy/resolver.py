@@ -61,7 +61,7 @@ from typing import NamedTuple
 
 from . import enable_path_mtu_discovery
 from .cache import FailureCache, MemoryDnsCache, NegativeEntry, PositiveEntry
-from .edns import nsid_of, nsid_presentation
+from .edns import extended_error_presentation, extended_errors_of, nsid_of, nsid_presentation
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .minimis import QnameMinimiser
 from .names import DomainName
@@ -1609,6 +1609,10 @@ def resolve_steps(
             questions = sname.questions
         attempted.add(entry.zone)
         response = yield SendQuery(entry, questions, probe=probe is not None)
+        # Whatever this server offered as an explanation, kept for the reason
+        # strings built below. It decides nothing in this loop -- see
+        # :func:`_extended_error_note` for the sentence that forbids that.
+        ede_note = _extended_error_note(response)
         terminal = False
         alias_target = None
         for step in classify(
@@ -1683,7 +1687,13 @@ def resolve_steps(
                 terminal = True
                 break
             if isinstance(step, Demote):
-                _note_demotion(step.entry, step.reason)
+                # The server's own words ride along with the reason this demotion is
+                # remembered for, so a zone declared dead reads as "rcode SERVFAIL;
+                # EDE 22 (No Reachable Authority)" instead of repeating the RCODE the
+                # trace already shows. RFC 9520 section 3.2 governs how long the entry
+                # lives and says nothing about its text, so this is a pure gain in what
+                # an operator learns about why the walk stopped.
+                _note_demotion(step.entry, f"{step.reason}{ede_note}")
                 slist.demote(step.entry)
             elif isinstance(step, Cname):
                 # Recorded, not acted on yet: classify also emits Cname when a
@@ -1717,6 +1727,45 @@ def resolve_steps(
             minimiser = QnameMinimiser(sname.qname)
     _remember("max hops")
     yield Fail("max hops")
+
+
+#: How many upstream EDEs a single failure reason will carry. RFC 8914 section 3
+#: leaves the number of options in a message to the sender ("Senders MAY include
+#: more than one EDE option"), and a reason that quotes twenty of them has stopped
+#: reading as a reason.
+_MAX_NOTED_ERRORS = 3
+
+
+def _extended_error_note(response) -> str:
+    """What the server said about why it failed, as a fragment of a reason string.
+
+    Empty unless the response carried an ERROR option. Note what it is *not*: a
+    code to branch on. RFC 8914 section 3 -- "Applications MUST continue to follow
+    requirements from applicable specifications on how to process RCODEs no matter
+    what EDE values are also received" -- is why this returns text, and section 6's
+    "EDE content should be treated only as diagnostic information and MUST NOT
+    alter DNS protocol processing" is why a malformed option, or a malformed OPT,
+    is swallowed here rather than becoming a failure the client never saw.
+
+    The words are somebody else's, so they arrive escaped and capped
+    (:func:`~namespy.edns.extended_error_presentation`) and go only into a reason
+    string that a trace or a log prints.
+    """
+    if response is None:
+        return ""
+    try:
+        options = response.edns_options()
+    except DnsPacketParseError:
+        return ""
+    errors = extended_errors_of(options)
+    if not errors:
+        return ""
+    noted = "; ".join(
+        f"EDE {extended_error_presentation(error)}" for error in errors[:_MAX_NOTED_ERRORS]
+    )
+    if len(errors) > _MAX_NOTED_ERRORS:
+        noted += f" (+{len(errors) - _MAX_NOTED_ERRORS} more)"
+    return "; " + noted
 
 
 def _cached_failure_reason(entry) -> str:
@@ -2430,9 +2479,38 @@ class RecursiveResolver(Resolver):
                 response = None
 
             if response is not None:
+                self._note_upstream_errors(response)
                 return response
 
         return None
+
+    def _note_upstream_errors(self, response) -> None:
+        """Log any Extended DNS Error a server sent alongside its answer.
+
+        DEBUG and nothing louder, which is this project's rule for text a stranger
+        wrote. RFC 8914 section 6 calls the option "unauthenticated information"
+        that "an attacker (e.g., a man in the middle (MITM) or malicious recursive
+        server) could insert", and RFC 5358 section 4.2's reasoning is the same one
+        the parser paths already follow: a warning per response is a free flood
+        primitive. Escaping handles the octets, the level handles the volume.
+
+        It lives here rather than in the resolution generator because this is where
+        every response passes through, glue sub-resolutions included, and because
+        the answer it is attached to may still be a perfectly good NOERROR --
+        section 3 expects an EDE to be readable "in all messages, including those
+        with a NOERROR RCODE", and a walk that logs only on failure would miss the
+        Stale Answer and Cached Error codes entirely.
+        """
+        try:
+            options = response.edns_options()
+        except DnsPacketParseError:
+            return
+        for error in extended_errors_of(options):
+            self.log.debug(
+                "resolver_extended_error(rcode=%s ede=%s)",
+                DnsResponseCode.mnemonic(response.extended_rcode),
+                extended_error_presentation(error),
+            )
 
     async def _drive(self, gen, trace, depth=0):
         """Pump the resolve_steps generator and fulfill its effects.

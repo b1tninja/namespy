@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 415 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
-| Coverage | floor 80 enforced in `pyproject.toml` |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable) and **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes; `tests/test_edns.py` pins it |
+| Suite | 497 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Coverage | 87.2% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -135,12 +135,15 @@ cd D:\code\namespy
    the RFC does not use. Wrapped lines defeat naive greps — search for a
    fragment that survives the wrap ("valid cookie lengths"), never the whole
    sentence, and confirm the surrounding heading is the one you cited.
-9. **Coverage floor is a ratchet**: raise it with tests, never ahead of them.
+9. **Coverage floor is a ratchet**: raise it with tests, never ahead of them — and it
+   is only ever *read* when something passes `--cov`, so check the flag is present
+   before believing the gate fired.
 
 ## Known gaps (deliberate, documented in README/CHANGELOG)
 
 - ~~EDNS(0) on outbound queries~~ — shipped (f15b751), and so are its option
-  TLVs and the per-server payload sizes that travel with them. RFC 9520 shipped too:
+  TLVs, the per-server payload sizes that travel with them, and Extended DNS Errors
+  (RFC 8914) in both directions. RFC 9520 shipped too:
   `FailureCache` remembers a failed lookup — including a zone whose servers stopped
   answering — and sends nothing upstream while the entry lives. Dead addresses are
   deliberately not remembered; `--no-failure-cache` turns the whole thing off. See
@@ -158,7 +161,50 @@ cd D:\code\namespy
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Latest round: RFC 9520 failure caching (`FailureCache`)
+## Latest round: Extended DNS Errors (RFC 8914)
+
+Shipped: the `ERROR` option (code 15) is written *and* read. `ExtendedDNSError` in
+`namespy/edns.py` holds the INFO-CODE plus the raw EXTRA-TEXT octets and infers nothing
+from either — §3 forbids reading a meaning into a code, §6 forbids the option changing
+anything. `.option` turns one into a TLV; `extended_errors_of` returns a response's whole
+list in wire order and raises nothing, because a malformed option is something a
+*receiver* skips (`extended_error_option_valid`) while the server answers one with FORMERR
+under RFC 6891 §7 — same octets, opposite directions, and that asymmetry is the point.
+`namespy/server.py` sends exactly two codes: 22 (`_own_failure_errors`) for a walk that
+ran out of authoritative servers, 21 for a non-QUERY opcode, each with EXTRA-TEXT naming
+this software; `_apply_edns` drops explanations before anything the client asked for when
+the reply would overflow its advertised size (§3's order), decorates nothing for
+BADVERS/FORMERR, and says nothing at all to a requestor that sent no OPT. On the way in,
+`resolver._extended_error_note` folds up to three codes into the reason a `FailureCache`
+entry remembers and `_note_upstream_errors` logs at DEBUG; `__main__._response_errors`
+prints `; EDE: 22 (No Reachable Authority): text` under any rcode, control octets escaped,
+because §6's MITM sentence describes the field a terminal is about to be handed.
+Patterns worth reusing: `test_cli.py`'s `_explained(*errors)` builds a NOERROR answer that
+carries options — the only sane way to pin §3's "accept them in all messages" without a
+network — and `test_failure_cache_resolver.py`'s `_drive` return value pins what a
+received code *changed* (the remembered reason) beside what it did not (nothing else).
+Absent on purpose: no propagation of an upstream code to this resolver's own client (§3
+permits either answer, and the failure path returns `None` rather than a message to
+decorate), and no invented name for a code the registry does not carry — it prints as its
+number. Worth knowing: every §2/§3/§6 quotation in the EDE code was re-checked against the
+RFC body this round, and three that had crept in as paraphrases were replaced — the rule 8
+failure mode is alive, so re-check a quote rather than trusting the section number beside
+it. What remains in `docs/roadmap.md`, in order: SVCB/HTTPS RDATA codecs (9460/9461, the
+small one and the door to everything encrypted-transport), MQTYPE (10029), then wildcard
+synthesis (4592 §2.2).
+
+Housekeeping that turned out to be a real fix: the coverage floor had never been *read*
+by CI. `[tool.coverage.report] fail_under` is a pytest-cov input, and pytest-cov measures
+only when `--cov` is passed — the Test step ran plain `pytest -q`, so it exited 0 whatever
+the tests covered, while README, CONTRIBUTING and the pyproject comment all said the floor
+was "enforced by pyproject". The step now runs `python -m pytest -q --cov`, the three docs
+say so, and the comment's stale module figures (measured before this round's tests
+landed) are
+replaced with today's. The floor itself stays at 80: 87.2% is one platform's number, and
+rule 9 says a raise waits for a measurement, not a guess — the next one should come from a
+CI run.
+
+## Previous round: RFC 9520 failure caching (`FailureCache`)
 
 Shipped: a resolution failure is remembered and acted on. `FailureCache` in
 `namespy/cache/__init__.py` is consulted by `resolve_steps` before any query leaves
@@ -179,7 +225,7 @@ one TCP attempt is conforming — it just had never been pinned. `test_silence_i
 and `test_edns_refusal_and_silence_do_not_combine_into_three_attempts` in
 `test_resolver_truncation.py` do that now. What remains in the roadmap is P2 and below.
 
-## Previous round: EDNS option TLV + per-server payload adaptation
+## Earlier round: EDNS option TLV + per-server payload adaptation
 
 QNAME minimisation shipped opt-in this round: probe walk + descent
 integration (`resolve_steps` takes `qname_min`), probe-aware handling of

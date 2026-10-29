@@ -8,7 +8,12 @@ import sys
 import time
 import traceback
 
-from .edns import nsid_option, nsid_presentation
+from .edns import (
+    extended_error_presentation,
+    extended_errors_of,
+    nsid_option,
+    nsid_presentation,
+)
 from .enums import (
     DnsOpCode,
     DnsQClass,
@@ -18,7 +23,7 @@ from .enums import (
     DnsResponseCode,
 )
 from .names import DomainName
-from .packet import OPT_RTYPE, DnsPacket, DnsQuestion, Query
+from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query
 from .rdata import generic_presentation, type_name_of
 from .resolver import EDNS_PAYLOAD_SIZE, GluePolicy, RecursiveResolver
 from .server import DnsServer
@@ -233,6 +238,14 @@ def _format_response(response, args, elapsed_ms):
         lines.append(
             f"; EDNS: version: 0, flags: {'; '.join(_opt_flags(response))}; udpsize: {int(record.rclass)}"
         )
+        # One line per Extended DNS Error, in the order they arrived. They belong in
+        # this pseudo-section because they *are* OPT RDATA, and because RFC 8914
+        # section 3 refuses to tie them to any RCODE -- "Receivers MUST be able to
+        # accept EDE codes and EXTRA-TEXT in all messages, including those with a
+        # NOERROR RCODE" -- so printing them only under a failure status would hide
+        # the Stale Answer and Cached Error codes, which are the interesting ones.
+        for error in _response_errors(response):
+            lines.append(f"; EDE: {extended_error_presentation(error)}")
         lines.append("")
 
     if response.questions:
@@ -270,6 +283,22 @@ def _opt_flags(response):
     if response.cd:
         out.append("cd")
     return out
+
+
+def _response_errors(response):
+    """The Extended DNS Errors a response carries -- and never an exception.
+
+    A malformed option inside somebody's OPT is not worth losing an answer over:
+    RFC 8914 section 6 says EDE "MUST NOT alter DNS protocol processing", and a
+    printer that raises would be altering it. So the bad case prints nothing and the
+    good case prints what the server chose to say, escaped and capped by
+    :func:`~namespy.edns.extended_error_presentation` because those octets came from
+    a stranger.
+    """
+    try:
+        return extended_errors_of(response.edns_options())
+    except DnsPacketParseError:
+        return ()
 
 
 def _format_short(response):

@@ -132,23 +132,31 @@ them change the security properties of anything built on top.
   verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
   are unauthenticated: anyone who can deliver a well-formed response that matches
   the question — same source address, same ID, echoed question — is believed.
-- **EDNS(0) options are new, and only NSID is put to use.** Outbound queries
-  advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with `--no-edns`
-  or the constructor knob), arriving OPT records yield `extended_rcode`, `ad`,
-  `cd` and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer
-  *without* an OPT alongside it triggers the §6.2.2 unextended re-ask. Option
-  TLVs (§6.1.2) are carried in both directions: `--nsid` asks each server the
-  walk touches who it is and prints the answers as hex (RFC 5001 §2.4), and
-  what a server advertises becomes the ceiling on the next query sent to it
-  (§6.2.3, §6.2.4). COOKIE (RFC 7873) and Padding (RFC 7830) encode and decode
-  but are not yet *used*: there is no server-side cookie state to validate a
-  reply against — the server only refuses a COOKIE whose length is impossible
-  (§5.2.2) — and RFC 7830 §6 forbids padding over plaintext UDP, which is
-  all this code sends today. The demo server answers an extended query with an
+- **EDNS(0) options are partial: NSID and Extended DNS Errors are put to use.**
+  Outbound queries advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with
+  `--no-edns` or the constructor knob), arriving OPT records yield `extended_rcode`,
+  `ad`, `cd` and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer
+  *without* an OPT alongside it triggers the §6.2.2 unextended re-ask. Option TLVs
+  (§6.1.2) are carried in both directions: `--nsid` asks each server the walk touches
+  who it is and prints the answers as hex (RFC 5001 §2.4), and what a server advertises
+  becomes the ceiling on the next query sent to it (§6.2.3, §6.2.4). Extended DNS Errors
+  (RFC 8914) go both ways as well — the bundled server explains a failure it caused
+  (22 behind a SERVFAIL that ran out of authoritative servers, 21 behind a NOTIMP), and
+  a code that arrives is printed as `; EDE:` on any rcode (§3 requires a receiver to
+  accept them beside a NOERROR too) and folded into the reason a cached failure
+  remembers. It is never *acted on*: §6 says the content "MUST NOT alter DNS protocol
+  processing" and calls it unauthenticated, so an attacker who can deliver a response
+  can deliver an explanation with it. An upstream code is not forwarded to this
+  resolver's own client, which §3 leaves to the implementation and this implementation
+  declines. COOKIE (RFC 7873) and
+  Padding (RFC 7830) encode and decode but are not yet *used*: there is no server-side
+  cookie state to validate a reply against — the server only refuses a COOKIE whose
+  length is impossible (§5.2.2) — and RFC 7830 §6 forbids padding over plaintext UDP,
+  which is all this code sends today. The demo server answers an extended query with an
   OPT of its own — never a forwarded one, always its own payload size, and its
   identifier only if it was given one with `--advertise-nsid` and only if the
-  query asked — and keeps §7's silence for a query that had none. Truncation is
-  fully handled: a `TC` answer is re-asked over TCP instead of being believed
+  query asked — and keeps §7's silence for a query that had none. Truncation is fully
+  handled: a `TC` answer is re-asked over TCP instead of being believed
   (RFC 1123 §6.1.3.2).
 - **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
   §11 requires of a implementation, but it means RFC 5890 A-labels must be
@@ -198,15 +206,18 @@ that exists only on Linux is exactly the kind of bug a Linux-only CI never sees;
 lint, typing and the distribution checks run once on Linux.
 
 ```bash
-pytest -q                              # coverage floor enforced by pyproject
-python -O -m pytest -q                 # assertions stripped
+pytest -q --cov                          # coverage floor enforced by pyproject
+python -O -m pytest -q                   # assertions stripped
 ruff check . && ruff format --check .
 mypy namespy
 ```
 
 The second line is the one that matters most here: `python -O` strips `assert`,
 and a parser whose bounds checks were `assert` stops being a parser under
-production flags. Suite and policy details are in `SECURITY.md`.
+production flags. The `--cov` on the first is not decoration either — pytest
+reads `fail_under` through pytest-cov, and pytest-cov only runs when asked, so
+`pytest -q` alone passes whatever it covers. Suite and policy details are in
+`SECURITY.md`.
 
 ## License
 

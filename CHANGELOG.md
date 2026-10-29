@@ -8,6 +8,49 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- Extended DNS Errors (RFC 8914) — the `ERROR` option, EDNS option code 15, is composed
+  *and* consumed. `ExtendedDNSError` in `namespy.edns` holds an INFO-CODE and the
+  EXTRA-TEXT that followed it and interprets neither: §2 says the text "is intended for
+  human consumption (not automated parsing)", so `extra_text` keeps exactly the octets the
+  option carried — a trailing NUL survives, because §2 also says text "may be null
+  terminated but MUST NOT be assumed to be", and only `.text` drops one, for display —
+  while `.option` writes the INFO-CODE-then-text payload §2's figure describes. Receiving
+  is deliberately broad, because §3 is emphatic: "Receivers MUST be able to accept EDE
+  codes and EXTRA-TEXT in all messages, including those with a NOERROR RCODE but need not
+  act on them", and its next sentence lets a sender include *more than one* option. So
+  `extended_errors_of` returns all of them in wire order and raises nothing — not even for
+  an option too short to hold a code, which is a wire-format error on the way *in*
+  (RFC 6891 §7's badly-formatted option, answered FORMERR) and merely skipped by a
+  *receiver*. That asymmetry is §6: EDE "MUST NOT alter DNS protocol processing", so a
+  four-octet defect must not cost the answer riding beside it.
+- Explaining a failure, on the way out (RFC 8914 §2, §3, §4.22, §4.23): the demo server
+  puts the reason behind a failure it caused into an `ERROR` option instead of handing
+  over a bare rcode. A walk that ran out of authoritative servers answers SERVFAIL with
+  22 (§4.23, "The resolver could not reach any of the authoritative name servers") and a
+  non-QUERY opcode answers NOTIMP with 21 (§4.22, "The requested operation or query is not
+  supported"), each with EXTRA-TEXT short enough to obey §3's "SHOULD avoid lengthy
+  EXTRA-TEXT contents" and naming this software rather than anything §2's
+  private-information caution warns against. Four limits are deliberate: the option goes
+  only to a requestor that sent an OPT (§7), it is never echoed out of a query (§6.1.1
+  forbids forwarding what arrived), it never decorates a rejection that already explains
+  itself (BADVERS and FORMERR carry their own reason), and it is the first thing dropped
+  when the reply would overflow what the client advertised — §3 prescribes that order:
+  "servers SHOULD truncate messages by dropping EDE options before dropping other data".
+- Consuming one, on the way in (§3, §6): a received code is diagnosis and nothing else.
+  It joins the reason a dead zone is remembered for — three codes at most, because §3
+  leaves the count to the sender and a reason quoting twenty has stopped being a reason —
+  and it reaches the debug log, where RFC 5358 §4.2's reasoning and §6's "unauthenticated
+  information" agree that somebody else's octets are logged at DEBUG and nowhere louder.
+  Nothing branches on an INFO-CODE. The CLI prints each one on its own `; EDE:` line
+  beside the EDNS one, on *any* rcode rather than only under a failure (§3's codes 3 and 4
+  travel with answers a resolver may legitimately use), with control characters escaped
+  and the text capped on screen — §6's MITM sentence describes a text field that this
+  program is about to hand to a terminal. What it does *not* do is forward an upstream
+  code to this resolver's own client: §3 calls that "implementation dependent", and the
+  failure path returns `None` rather than a message, so propagation would mean
+  synthesising a response nothing here builds. `tests/test_edns_error.py` (21 tests),
+  plus the EDE sections of `test_server.py`, `test_failure_cache_resolver.py` and
+  `test_cli.py`, pin all of it.
 - Resolution failures are cached now (RFC 9520 §3.2, §3.3) — `FailureCache` and
   `FailureEntry` in `namespy.cache`, consulted by `resolve_steps` before it sends
   anything and owned by `RecursiveResolver` (`failure_cache=`: pass a cache to share
@@ -140,6 +183,15 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Changed
 
+- **The coverage floor was not enforced anywhere.** `fail_under` in `pyproject.toml` is
+  read by pytest through pytest-cov, and pytest-cov measures only when `--cov` is passed;
+  the Test job ran plain `pytest -q`, so it exited 0 whatever the tests covered while the
+  README, CONTRIBUTING and the comment above that floor all said it was enforced by
+  pyproject. The step now runs `python -m pytest -q --cov`, and all three say so too.
+  Verified in both directions: one test file exits 1 with "Required test coverage of 80.0%
+  not reached", the whole suite exits 0 at 87.2%. The floor itself stays at 80 rather than
+  moving to meet that figure — 87.2% was measured on one platform and one Python, CI gates
+  on two of each, and a floor raised on a guess protects nothing.
 - **`--trace` rendered every failure twice.** The `Fail` branch appended its note
   twice, so a reader counted one dead end as two. Fixed as part of giving glue
   observation somewhere to appear; `test_trace_mermaid.py` now pins the count.
@@ -314,11 +366,13 @@ nothing has been tagged or published yet, so `master` is the only version.
 Tracked honestly rather than as a promise — full list with reasons in
 [`docs/HANDOFF.md`](docs/HANDOFF.md):
 
-- EDNS(0) *options* are not implemented: OPT RDATA is written empty and read
-  opaquely, so no NSID (RFC 5001), COOKIE (RFC 7873) or per-server payload
-  adaptation (RFC 6891 section 6.2.3), and the bundled server does not echo
-  OPT in its responses (section 6.2.4). The core record, the 1232-octet
-  advertisement and the section 6.2.2 fallback do ship.
+- EDNS(0) *options* are implemented and several are put to use: NSID (RFC 5001) in
+  both directions, per-server payload adaptation (RFC 6891 §6.2.3, §6.2.4), Extended DNS
+  Errors (RFC 8914) composed and consumed, and the bundled server answers an extended
+  query with an OPT of its own (§6.1.1, §6.2.4). Still unused on purpose: COOKIE has no
+  server-side state to validate a reply against, and Padding is never emitted because
+  RFC 7830 §6 withdraws it from plaintext UDP, which is every transport here. No client
+  subnet option (RFC 7871) and no transport keepalive (RFC 7828) — see `docs/roadmap.md`.
 - No DNSSEC validation, no serve-stale (RFC 8767), no IDN/punycode
   (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 / RFC 8484). QNAME
   minimisation (RFC 9156) ships opt-in — see *Added*.

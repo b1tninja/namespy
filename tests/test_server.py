@@ -38,6 +38,8 @@ from namespy.edns import (
     NSID_OPTION_CODE,
     PADDING_OPTION_CODE,
     EdnsOption,
+    extended_dns_error_option,
+    extended_errors_of,
     nsid_of,
 )
 from namespy.enums import (
@@ -618,6 +620,251 @@ async def test_padding_asked_for_over_plain_udp_is_not_honoured() -> None:
     reply = transport.replies[0]
     assert reply.edns_option(PADDING_OPTION_CODE) is None, "plaintext is plaintext"
     assert b"ns-a" == nsid_of(reply.edns_options()), "one refusal may not swallow the others"
+
+
+# --------------------------------------------- Extended DNS Errors on the way out
+#
+# RFC 8914 gives a responder a second, optional channel: an ERROR option (code 15)
+# whose "INFO-CODE ... provides the additional context for the RESPONSE-CODE of the
+# DNS message" (section 2). Three of its sentences shape what happens here. Section 3
+# refuses to bind any code to any RCODE -- "systems interpreting the extended error
+# codes MUST NOT assume that a combination will make sense" -- so the pairings below
+# are this server's choices, and the tests assert them rather than derive them. The
+# same section orders the trimming: "servers SHOULD truncate messages by dropping EDE
+# options before dropping other data from packets", which is why the option is
+# appended last and why one test finds the exact octet where it stops fitting. Section
+# 6 keeps the whole thing honest -- "EDE content should be treated only as diagnostic
+# information and MUST NOT alter DNS protocol processing" -- so every test here also
+# asserts an RCODE that is what it was before the option existed.
+#
+# The relay half of section 3, passing an upstream server's EDE on to the client, is
+# what a forwarder does, and this server declines it deliberately: "whether or not (and
+# how) to pass along EDE information on to their original client is implementation
+# dependent". Its own refusals get their own explanations; the walk's go to the trace.
+
+
+def failing_answer(packet) -> Response:
+    """A SERVFAIL that nevertheless carries an A record -- the shape that lets the
+    size test have something worth protecting when it decides what to drop."""
+    return Response(
+        ID=packet.ID,
+        QR=DnsQR.RESPONSE,
+        RA=True,
+        RCODE=int(DnsResponseCode.SERVER_FAILURE),
+        questions=list(packet.questions),
+        answers=[
+            DnsRecord(
+                packet.questions[0].name, DnsRType.A, DnsQClass.IN, 300, rdata=RData_A(HOST_IP)
+            )
+        ],
+    )
+
+
+def oversized_failure(packet, minimum: int = 700) -> Response:
+    """A SERVFAIL padded past *minimum* octets with A records of distinct labels.
+
+    Distinct because RFC 1035 section 4.1.4's name compression would otherwise charge
+    a pointer instead of a name and the padding would cost two octets a record; the
+    point of the size is to sit above the 512-octet floor RFC 6891 section 6.2.3 forces
+    on a small advertisement, so the test measures the explanation's octets rather than
+    a floor that has nothing to do with it."""
+    response = failing_answer(packet)
+    index = 0
+    while len(bytes(response)) < minimum:
+        index += 1
+        response.answers.append(
+            DnsRecord(
+                DomainName(f"pad{index}.example"),
+                DnsRType.A,
+                DnsQClass.IN,
+                300,
+                rdata=RData_A(HOST_IP),
+            )
+        )
+    return response
+
+
+def no_authority() -> list:
+    """The option this server builds for SERVFAIL, spelled out here so the arithmetic
+    in the size test stays visible instead of hiding in a helper's constant."""
+    return [extended_dns_error_option(22, b"namespy: no authoritative answer")]
+
+
+async def test_a_failure_that_needs_explaining_explains_itself() -> None:
+    """Section 4.23's code 22 is "The resolver could not reach any of the authoritative
+    name servers (or they potentially refused to reply)" -- precisely what a walk that
+    ran out of servers has hit, and SERVFAIL alone does not say it. The wire is pinned
+    as well as the parsed option because a transposed INFO-CODE is a different error
+    read in a different language: 0x0016 is No Reachable Authority, 0x1600 belongs to
+    nobody, and section 2 puts the field on the wire in "network most significant bit
+    (MSB) byte order"."""
+    server, resolver, transport = make_server()
+
+    async def no_answer(_packet):
+        return None
+
+    resolver.resolve = no_answer
+    server.datagram_received(bytes(extended_query([])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert reply.RCODE == DnsResponseCode.SERVER_FAILURE, "the RCODE is what the client acts on"
+    assert [22] == [error.info_code for error in extended_errors_of(reply.edns_options())]
+    assert "namespy: no authoritative answer" == extended_errors_of(reply.edns_options())[0].text
+    assert b"\x00\x0f\x00\x22\x00\x16" in bytes(reply), "option 15, length 34, INFO-CODE 22"
+
+
+async def test_a_refusal_explains_what_was_refused() -> None:
+    """Section 4.22 is "The requested operation or query is not supported", which is
+    what NOTIMP already reports -- and a bare NOTIMP does not say *which* operation the
+    client tripped over. Section 3 permits the pairing rather than prescribing it, so
+    what is asserted is the pairing this server makes, plus the RCODE beneath it: an EDE
+    may explain a refusal but must not quietly turn it into something else."""
+    server, _resolver, transport = make_server()
+    packet = extended_query([])
+    packet.OPCODE = DnsOpCode.STATUS
+
+    await server.respond_to_packet(packet, ADDR)
+
+    reply = transport.replies[0]
+    assert reply.RCODE == DnsResponseCode.NOT_IMPLEMENTED
+    assert [21] == [error.info_code for error in extended_errors_of(reply.edns_options())]
+
+
+async def test_an_unextended_client_is_told_nothing_extra() -> None:
+    """Section 3.2's second sentence is a MUST NOT -- "an EDNS(0) aware server
+    receiving a DNS query without an accompanying EDNS(0) record MUST NOT include EDE in
+    a response" -- and its first sentence, "A server not sending EDE SHOULD include an
+    EDNS0 record unless the client explicitly indicated that it does not support them",
+    is satisfied by saying nothing at all to a client that sent no OPT. The SERVFAIL and
+    its echoed question still arrive; only the explanation is withheld."""
+    server, resolver, transport = make_server()
+
+    async def no_answer(_packet):
+        return None
+
+    resolver.resolve = no_answer
+    server.datagram_received(bytes(query_packet()), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert reply.RCODE == DnsResponseCode.SERVER_FAILURE
+    assert reply.QDCOUNT == 1, "the echoed question is not part of what is withheld"
+    assert reply.opt() is None, "section 7 forbids the record as firmly as 3.2 forbids the option"
+
+
+async def test_a_rejection_that_already_explains_itself_gets_no_extended_error() -> None:
+    """Sections 4.23 and 4.22 describe a resolver that could not reach anybody and a
+    server that does not support an operation. FORMAT_ERROR for a second question and
+    BADVERS for a version negotiation are statements about the datagram, not about
+    anybody's ability to answer it, so bolting 22 onto them is the assumption section 3
+    forbids. Section 4.3's code 2, "Unsupported DNS Response Code", is declined for
+    BADVERS for the same reason: RFC 6891 section 6.2.2 already prescribes what a
+    version reply carries -- the client's version and this server's bits -- and an
+    option nobody asked for is not part of that. Both replies still carry an OPT, which
+    is what section 6.1.1 requires of any answer to an extended request and is what the
+    assertions below separate from the option."""
+    server, _resolver, transport = make_server()
+    two_questions = Query(
+        ID=0xABCD,
+        questions=[
+            DnsQuestion(HOST, DnsQType.A, DnsQClass.IN),
+            DnsQuestion(HOST, DnsQType.AAAA, DnsQClass.IN),
+        ],
+    ).add_edns(1232)
+
+    await server.respond_to_packet(two_questions, ADDR)
+    refused = transport.replies[0]
+    assert refused.RCODE == DnsResponseCode.FORMAT_ERROR, "two questions is still a refusal"
+    assert refused.opt() is not None, "an extended request still gets an OPT, section 6.1.1"
+    assert () == refused.edns_options(), "but no explanation of a packet-shaped refusal"
+
+    await server.respond_to_packet(query_packet().add_edns(1232, version=1), ADDR)
+    negotiated = transport.replies[1]
+    assert int(DnsResponseCode.BADVERS) == int(negotiated.extended_rcode), (
+        "16 lives in the extension"
+    )
+    assert () == negotiated.edns_options(), "section 6.2.2 answers a version, not section 4.3"
+
+
+def test_an_explanation_is_dropped_before_anything_the_client_asked_for() -> None:
+    """Section 3: "If a message with EDE is too large for the transport being used,
+    servers SHOULD truncate messages by dropping EDE options before dropping other data
+    from packets." The boundary is measured rather than assumed -- the empty-OPT
+    overhead and the answer's own size both come out of the built packet -- so the two
+    requests below advertise the largest payload the explanation still fits inside, and
+    one octet less. Past that line the answer survives and the explanation is what goes,
+    which is the reverse of cutting an RRSet: an answer trimmed short is a server that
+    answered a different question than it was asked. The OPT itself stays in both cases,
+    because RFC 6891 section 6.1.1's MUST is not conditional on there being options. The
+    padding records are what make the measurement mean anything: section 6.2.3 forces
+    "values lower than 512 MUST be treated as equal to 512", so a reply of a hundred
+    octets could never be shown to overflow even a miserly advertisement."""
+    server, _resolver, _transport = make_server()
+    request = query_packet()
+    bare_opt = oversized_failure(request)
+    bare_opt.add_edns(512)
+    explanation = len(no_authority()[0].data) + 4
+    fits = len(bytes(bare_opt)) + explanation
+
+    kept = oversized_failure(query_packet())
+    server._apply_edns(query_packet().add_edns(fits), kept, no_authority())
+    assert [22] == [error.info_code for error in extended_errors_of(kept.edns_options())]
+    assert len(bytes(kept)) <= fits, "it fits the advertised size, so it is kept"
+
+    trimmed = oversized_failure(query_packet())
+    server._apply_edns(query_packet().add_edns(fits - 1), trimmed, no_authority())
+    assert () == trimmed.edns_options(), "the explanation is the first thing dropped"
+    assert trimmed.opt() is not None, "the record the client is owed is not optional"
+    assert len(bytes(trimmed)) <= fits - 1
+    assert len(trimmed.answers) > 1, "the answer is not what gets truncated"
+    assert trimmed.RCODE == DnsResponseCode.SERVER_FAILURE
+
+
+async def test_an_extended_error_option_too_short_to_hold_a_code_is_malformed() -> None:
+    """Section 2 makes the INFO-CODE the first two octets of the option, so one octet of
+    RDATA cannot express even the code, let alone any text. RFC 6891 section 7 says what
+    a responder does with that: "If a requestor includes an option value that is badly
+    formatted or that includes out-of-range values, a FORMERR MUST be returned. If this
+    occurs, the response MUST include an OPT record." The other half of the test is the
+    case a lazy length check gets wrong -- an option with an unassigned INFO-CODE is
+    well formed, and section 3's "Receivers MUST be able to accept EDE codes and
+    EXTRA-TEXT in all messages" means refusing it would be inventing a rule that breaks
+    the next RFC."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([EdnsOption(15, b"\x00")])), ADDR)
+    await drain(server)
+    refused = transport.replies[0]
+    assert refused.RCODE == DnsResponseCode.FORMAT_ERROR
+    assert refused.opt() is not None, "the OPT the FORMERR rule asks for"
+    assert () == refused.edns_options(), "and none of the client's option echoed"
+
+    server.datagram_received(bytes(extended_query([EdnsOption(15, b"\xff\xfftext")])), ADDR)
+    await drain(server)
+    assert transport.replies[1].RCODE == DnsResponseCode.NO_ERROR, (
+        "a code we have not met is not a defect"
+    )
+
+
+async def test_an_extended_error_in_a_query_is_neither_answered_nor_echoed() -> None:
+    """Section 3.1: "A DNS server MAY ignore any EDE codes and EXTRA-TEXT in messages it
+    receives in queries and MUST NOT attempt to resolve any based on such codes."
+    Ignoring has to be proved in both directions: the server must not start resolving an
+    error code, and it must not hand the client's own words back as though they were the
+    server's reason -- the same discipline that stops a client's NSID payload from
+    becoming the server's identity."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([EdnsOption(15, b"\x00\x16please fail")])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert reply.RCODE == DnsResponseCode.NO_ERROR, "a code in a query is not a query"
+    assert () == reply.edns_options(), "an option defined for responses is not echoed"
+    assert b"please fail" not in bytes(reply), "a client's text is not this server's reason"
 
 
 # ------------------------------------------------------- amplification defence

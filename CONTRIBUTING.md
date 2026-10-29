@@ -15,12 +15,16 @@ of PyPI is a DNS stack nobody will embed.
 Check everything the way CI does:
 
 ```bash
-pytest                                   # coverage floor enforced by pyproject
-python -O -m pytest                      # assertions stripped — see below
+pytest -q --cov                          # coverage floor enforced by pyproject
+python -O -m pytest -q                   # assertions stripped — see below
 ruff check . && ruff format --check .
 mypy namespy                              # blocking in CI; tightens per module
 python -m build && python tools/check_dist.py dist/
 ```
+
+The `--cov` is load-bearing: pytest reads `fail_under` through pytest-cov, and
+pytest-cov measures only when asked, so a plain `pytest` exits 0 whatever the
+tests cover. CI passes the flag for the same reason.
 
 ## Two rules that are not negotiable
 

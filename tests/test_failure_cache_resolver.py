@@ -21,11 +21,18 @@ Spec anchors, quoted or paraphrased closely:
 """
 
 import ipaddress
+import logging
 
 from namespy.cache import (
     FAILURE_INITIAL_TTL_S,
     FAILURE_MAX_TTL_S,
     FailureCache,
+    MemoryDnsCache,
+)
+from namespy.edns import (
+    EXTENDED_ERROR_PRIVATE_USE_MIN,
+    extended_dns_error_option,
+    extended_error_name,
 )
 from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from namespy.names import DomainName
@@ -457,3 +464,227 @@ def test_recovery_resets_how_long_the_next_failure_is_kept():
     events = _drive(resolve_steps(sname, slist, failures=None), [None])
     assert isinstance(events[0], SendQuery)
     assert _kinds(events)[-1] == "Fail"
+
+
+# ------------------------------------------- someone else's explanation (RFC 8914)
+#
+# Everything above is about a failure this resolver reaches by itself. What follows is
+# about the explanation a *server* sends with its failure, where RFC 8914 section 6 --
+# "EDE content should be treated only as diagnostic information and MUST NOT alter DNS
+# protocol processing" -- decides the shape of the feature: the words are worth keeping,
+# and worth keeping as nothing but words. RFC 9520 section 3.2, the subject of the rest
+# of this file, governs how long a remembered failure lives and says nothing about its
+# text, which is the gap these tests fill.
+
+
+def _explained(response, *errors):
+    """Attach *errors* -- (INFO-CODE, EXTRA-TEXT) pairs -- to *response* as EDNS options."""
+    response.add_edns(
+        1232, options=[extended_dns_error_option(code, text) for code, text in errors]
+    )
+    return response
+
+
+def _truncated_option(response):
+    """An OPT whose one option promises more octets than the packet contains."""
+    response.add_edns(1232)
+    response.opt().rdata = b"\x00\x0f\x00\x0a\x00\x01"  # code 22, length 10, two octets arrive
+    return response
+
+
+def test_an_upstream_explanation_rides_into_the_remembered_failure():
+    """RFC 8914 section 3.1 lets a resolver pass on what it was told -- "A recursive
+    resolver MAY pass on the EDE information it has received to its clients" -- and RFC
+    9520 section 3.2, the section this file is about, says "Implementation details for
+    such a cache are not specified in this document", which leaves the wording of a
+    remembered failure free. So the server's own words join the reason string: "rcode
+    SERVER_FAILURE" tells an operator that something upstream gave up, and "EDE 22" tells
+    them it gave up because it could not reach anybody -- which sends them to the zone's
+    delegation rather than to their firewall."""
+    failures = FailureCache()
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+    slist = _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)])
+    served = _explained(
+        _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE),
+        (22, b"no reachable authority"),
+    )
+
+    _drive(resolve_steps(sname, slist, failures=failures), [served])
+
+    assert failures.lookup_zone(DEAD_ZONE).reason == (
+        "rcode SERVER_FAILURE; EDE 22 (No Reachable Authority): no reachable authority"
+    )
+
+
+def test_an_explanation_changes_what_is_remembered_and_nothing_else():
+    """The sentence a feature like this can violate, RFC 8914 section 3: "Applications
+    MUST continue to follow requirements from applicable specifications on how to process
+    RCODEs no matter what EDE values are also received." Two walks that differ only in
+    whether one server added an option must produce the same effects on the generator and
+    the same reason for the client. Only the text kept for an operator may differ."""
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+
+    def run(failures, response):
+        return _drive(
+            resolve_steps(
+                sname, _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)]), failures=failures
+            ),
+            [response],
+        )
+
+    silent = _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE)
+    explained = _explained(
+        _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE),
+        (21, b"server refuses to answer"),
+    )
+    plain, annotated = FailureCache(), FailureCache()
+
+    bare = run(plain, silent)
+    noted = run(annotated, explained)
+
+    assert _kinds(bare) == _kinds(noted)
+    assert bare[-1].reason == noted[-1].reason == "no servers"
+    assert plain.lookup_zone(DEAD_ZONE).reason == "rcode SERVER_FAILURE"
+
+
+def test_a_code_this_registry_does_not_know_is_still_remembered():
+    """RFC 8914 section 3: "Receivers MUST be able to accept EDE codes and EXTRA-TEXT in
+    all messages", and section 4's registry is not closed -- private use starts at 49152.
+    A code with no entry prints as its number rather than as a guess at a name, because
+    writing "(Unknown Error)" would be this project entering IANA's registry a second
+    time, in a string that outlives the packet that explains it."""
+    failures = FailureCache()
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+    slist = _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)])
+    served = _explained(
+        _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE),
+        (EXTENDED_ERROR_PRIVATE_USE_MIN, b"site policy"),
+    )
+
+    _drive(resolve_steps(sname, slist, failures=failures), [served])
+
+    assert failures.lookup_zone(DEAD_ZONE).reason.endswith(
+        f"; EDE {EXTENDED_ERROR_PRIVATE_USE_MIN}: site policy"
+    ), failures.lookup_zone(DEAD_ZONE).reason
+
+
+def test_a_flood_of_explanations_is_remembered_three_deep():
+    """Section 3 lets a sender include as many options as it likes -- "Senders MAY include
+    more than one EDE option in a single message" -- and gives a receiver no way to answer
+    that this is too many. So the limit is one this project sets on its own display: a
+    remembered reason quoting five codes has stopped being a reason. The first three are
+    quoted in the order they arrived and the rest are counted, so what was dropped is at
+    least still numbered."""
+    failures = FailureCache()
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+    slist = _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)])
+    served = _explained(
+        _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE),
+        (22, b""),
+        (21, b""),
+        (23, b""),
+        (20, b""),
+        (19, b""),
+    )
+
+    _drive(resolve_steps(sname, slist, failures=failures), [served])
+
+    reason = failures.lookup_zone(DEAD_ZONE).reason
+    quoted = "; ".join(f"EDE {code} ({extended_error_name(code)})" for code in (22, 21, 23))
+    assert quoted in reason, "quoted in the order the server sent them"
+    assert "(+2 more)" in reason
+    assert "EDE 20" not in reason
+    assert "EDE 19" not in reason
+
+
+def test_someone_elses_words_cannot_write_into_the_reason():
+    """Section 6: "an attacker (e.g., a man in the middle (MITM) or malicious recursive
+    server) could insert or modify EDE information", which is why the option's text is
+    somebody else's and not an input to be trusted. The octets the option carried are kept
+    exactly -- a code with hostile text is still that code -- and what reaches a string
+    that a terminal will render is escaped, so an ESC or a CR cannot clear a screen or
+    forge a log line while explaining itself."""
+    failures = FailureCache()
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+    slist = _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)])
+    served = _explained(
+        _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE),
+        (22, b"\x1b[2Jall clear\r\n"),
+    )
+
+    _drive(resolve_steps(sname, slist, failures=failures), [served])
+
+    reason = failures.lookup_zone(DEAD_ZONE).reason
+    assert "EDE 22 (No Reachable Authority)" in reason, "the code outlives its text"
+    for hostile in ("\x1b", "\r", "\n"):
+        assert hostile not in reason, repr(reason)
+
+
+async def test_an_upstream_explanation_is_logged_at_debug_and_nowhere_louder(caplog):
+    """Section 3 expects an EDE to be readable "in all messages, including those with a
+    NOERROR RCODE", and codes 3 (Stale Answer) and 4 (Cached Error) ride along with
+    answers that are perfectly usable -- so the logging sits where every response passes,
+    not only on the path that failed. DEBUG is the level, for the two reasons that govern
+    stranger's text throughout this project: section 6 calls the option unauthenticated
+    and RFC 5358 section 4.2's flood argument applies to a warning per response."""
+    resolver = RecursiveResolver(cache=MemoryDnsCache())
+    entry = SlistEntry(DEAD_ZONE, DEAD_NS, [DEAD_IP])
+    questions = [DnsQuestion(Sname(DomainName("a.dead.example"), DnsQType.A).qname, DnsQType.A)]
+    stale = _explained(_answer_for(DomainName("a.dead.example"), DEAD_IP), (3, b""))
+
+    async def stale_answer(*_args, **_kwargs):
+        return stale
+
+    resolver.query = stale_answer
+    with caplog.at_level(logging.DEBUG, logger="namespy.resolver"):
+        assert stale is await resolver._send_for_entry(entry, questions)
+
+    assert any("ede=3 (Stale Answer)" in record.getMessage() for record in caplog.records)
+    assert all(logging.DEBUG >= record.levelno for record in caplog.records), "not one line louder"
+
+    caplog.clear()
+    quiet = _answer_for(DomainName("a.dead.example"), DEAD_IP)
+
+    async def quiet_answer(*_args, **_kwargs):
+        return quiet
+
+    resolver.query = quiet_answer
+    with caplog.at_level(logging.DEBUG, logger="namespy.resolver"):
+        await resolver._send_for_entry(entry, questions)
+    assert "resolver_extended_error" not in caplog.text, "a server that adds nothing is silent"
+
+
+def test_a_malformed_explanation_is_swallowed_and_the_walk_continues():
+    """A truncated option is a defect in the packet, and RFC 8914 section 6's "MUST NOT
+    alter DNS protocol processing" is what stops it from becoming a defect in the
+    resolution. This zone already has an honest reason -- the RCODE it was given -- so
+    losing the decoration cannot be allowed to lose that, let alone raise at a caller that
+    never asked about EDNS and would not know what to do with the answer."""
+    failures = FailureCache()
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+    slist = _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)])
+    broken = _truncated_option(
+        _response(sname.qname, aa=False, rcode=DnsResponseCode.SERVER_FAILURE)
+    )
+
+    events = _drive(resolve_steps(sname, slist, failures=failures), [broken])
+
+    assert _kinds(events)[-1] == "Fail"
+    assert failures.lookup_zone(DEAD_ZONE).reason == "rcode SERVER_FAILURE"
+
+
+def test_a_malformed_explanation_on_an_answer_is_still_not_a_failure():
+    """The combination the two rules above leave, made explicit because it is the one that
+    would be worst to get wrong: a broken option arriving with a NOERROR answer must not
+    reach the cache at all. A resolver that treated a parse failure as bad news would
+    turn a malformed four octets into an outage lasting the failure cache's TTL, which is
+    the opposite of what section 6's "MUST NOT alter DNS protocol processing" is for."""
+    failures = FailureCache()
+    sname = Sname(DomainName("a.dead.example"), DnsQType.A)
+    slist = _seed_slist(sname, DEAD_ZONE, [(DEAD_NS, DEAD_IP)])
+    broken = _truncated_option(_answer_for(sname.qname, DEAD_IP))
+
+    events = _drive(resolve_steps(sname, slist, failures=failures), [broken])
+
+    assert _kinds(events)[-1] == "Done"
+    assert 0 == len(failures)
