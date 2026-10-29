@@ -55,7 +55,7 @@ namespy --serve                      # demo server on 127.0.0.1:53
 `python -m namespy` does the same without installing the console script, and
 `namespy --help` lists the rest (`--no-edns`, `--nsid`, `--root-hints`,
 `--dns-suffix`, `--timeout`, `--trace-file`, `--qname-min`,
-`--allow-out-of-bailiwick-glue`, `-v`, `--debug`).
+`--allow-out-of-bailiwick-glue`, `--no-failure-cache`, `-v`, `--debug`).
 
 `--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
 useful for seeing exactly where a zone cut was crossed and which NS forced a
@@ -159,6 +159,17 @@ them change the security properties of anything built on top.
   server sees only the labels the previous referral proved relevant, at the
   cost of more queries. `--trace` marks the probe queries, and budget
   exhaustion degrades back to full names rather than failing.
+- **Failure caching is coarse, on purpose** (`FailureCache`, RFC 9520 §3.2). A name
+  that just failed — or any name under a zone whose servers just stopped answering
+  (§3.3) — is answered `SERVFAIL` for one second to five minutes without a query
+  leaving the process, and a successful lookup clears what was remembered about the
+  name and about every zone that spoke during it. What is *not* cached is an
+  unresponsive server *address*, which §3.2 permits: within a lookup the Slist
+  already cycles a zone's remaining servers, and across lookups an address key would
+  retire one of a zone's several healthy servers for minutes over a single dropped
+  datagram. `--no-failure-cache` (`failure_cache=False`) turns it off, which is what
+  a resolver built to watch a zone fail needs — one that has stopped asking is, from
+  outside, indistinguishable from one that is itself broken.
 - **Bailiwick is enforced on glue only, and it is now observable.** A referral's
   address records are accepted for a nameserver name inside the answering zone or
   inside the zone it delegates (RFC 5452 §6, RFC 1034 §4.2.1); anything else is

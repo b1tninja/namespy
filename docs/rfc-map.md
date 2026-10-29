@@ -60,6 +60,19 @@ In Namespy:
   [`namespy/cache/__init__.py`](../namespy/cache/__init__.py) for `DnsCache`, its
   in-memory and SQLite backends, and how negative entries take their TTL from
   the SOA (RFC 2308 §5).
+  Ahead of any query, and just behind that lookup, sits the other cache,
+  `FailureCache` (RFC 9520 §3.2): if this name, or a zone it lies beneath, failed
+  recently, the lookup ends there with `Fail` and no query leaves the process. The
+  order is deliberate — a stored answer beats a remembered failure, because having
+  once resolved a name is better evidence than having once failed to, and it is
+  what lets a cached CNAME restart the loop instead of being masked by a dead zone
+  it happens to sit under. It is a separate store because a failure is not an
+  answer: `DnsCache.get(name, qtype, qclass)` cannot express "every name under
+  `dead.example`". Recording happens at the two places a lookup dies — servers
+  exhausted (a zone failure, keyed on `slist.zone`, so §3.3's next name under that
+  zone is stopped too) and name-specific death (alias loop, hop budget, no servers
+  to ask) — and a successful lookup clears what was remembered about the name and
+  about every zone that spoke during it.
 - **Step 2** (pick best server): `Slist.best()` returns the first
   non-demoted entry. If that entry has no addresses, the generator
   yields `NeedAddress(ns)` and the driver runs a *nested* `resolve_steps`
@@ -223,6 +236,7 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 | Match count (§5.3.3 step 4b) | `Sname.match_count(zone)` |
 | Glueless NS resolution | `NeedAddress` effect + `_drive` recursion |
 | Negative responses (§4.3.4) | `Nodata`, `Nxdomain` events |
+| Cached resolution failures (RFC 9520 §3.2, §3.3) | `FailureCache` + `FailureEntry` (`namespy/cache/__init__.py`), consulted and recorded in `resolve_steps`, owned by `RecursiveResolver.failure_cache` |
 | Truncation → TCP retry (RFC 1123 §6.1.3.2) | `Resolver._await_udp()` → `Resolver._query_tcp()` |
 | No-cache-on-truncation (RFC 1035 §7.4) | `_write_cache()` early return |
 | Trace tree | [`namespy/trace.py`](../namespy/trace.py) `Trace` |

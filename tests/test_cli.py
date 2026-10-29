@@ -31,6 +31,7 @@ from namespy.__main__ import (
     _report_server_ids,
     build_parser,
 )
+from namespy.cache import FailureCache
 from namespy.edns import nsid_option, serialize_options
 from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
@@ -381,6 +382,29 @@ async def test_a_plain_lookup_filters_glue_and_says_nothing_about_it(monkeypatch
 
     assert made[0][1].glue_policy is GluePolicy.STRICT
     assert "BELIEVED" not in capsys.readouterr().err
+
+
+def test_failure_caching_defaults_to_on():
+    """RFC 9520 suppression is what a plain run does; switching it off is opt-in."""
+    assert _args(["example.com"]).no_failure_cache is False
+
+
+async def test_the_no_failure_cache_switch_reaches_the_resolver(monkeypatch):
+    """A resolver built to watch a zone fail must be one that keeps asking it.
+
+    The switch means "remember nothing", which the resolver spells ``False``;
+    anything else in that slot means "own me a cache". A wiring mistake is
+    therefore invisible from the command line -- the lookup behaves exactly as it
+    did before the flag existed, and the operator concludes the zone is still
+    refusing to answer when it is their own resolver that stopped asking.
+    """
+    made = _stub_endpoints(monkeypatch, _answered)
+    assert await cli.cli_query(_args(["--no-failure-cache", "example.com"])) == 0
+    assert made[0][1].failure_cache is None
+
+    made = _stub_endpoints(monkeypatch, _answered)
+    assert await cli.cli_query(_args(["example.com"])) == 0
+    assert isinstance(made[0][1].failure_cache, FailureCache)
 
 
 async def test_cli_query_writes_the_trace_file(monkeypatch, tmp_path):

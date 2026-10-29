@@ -390,6 +390,17 @@ def build_parser():
         "exposure -- --trace marks the probes",
     )
     p.add_argument(
+        "--no-failure-cache",
+        dest="no_failure_cache",
+        action="store_true",
+        help="do not remember resolution failures (RFC 9520 off): keep asking a "
+        "zone that has stopped answering, once per query, for as long as it stays "
+        "dead. The default refuses a repeat query for up to five minutes so a dead "
+        "zone does not cost a fresh walk from the root each time -- right for "
+        "serving, wrong for watching a zone fail, and wrong for anything that "
+        "needs to see the retries",
+    )
+    p.add_argument(
         "--allow-out-of-bailiwick-glue",
         dest="allow_out_of_bailiwick_glue",
         action="store_true",
@@ -402,6 +413,15 @@ def build_parser():
     p.add_argument("-v", "--verbose", action="store_true", help="enable INFO-level logging")
     p.add_argument("--debug", action="store_true", help="enable DEBUG-level logging")
     return p
+
+
+def _failure_cache(args):
+    """``False`` if asked not to remember failures, else ``None`` for the default.
+
+    The distinction matters: to the resolver, ``None`` means "own me a cache" and
+    ``False`` means "do not remember anything" (RFC 9520 section 3.2 off).
+    """
+    return False if args.no_failure_cache else None
 
 
 def _glue_policy(args) -> GluePolicy:
@@ -470,6 +490,7 @@ async def cli_query(args) -> int:
             edns_options=_outbound_options(args),
             qname_min=args.qname_min,
             glue_policy=_glue_policy(args),
+            failure_cache=_failure_cache(args),
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -523,6 +544,7 @@ async def serve(args) -> int:
                 edns_options=_outbound_options(args),
                 qname_min=args.qname_min,
                 glue_policy=_glue_policy(args),
+                failure_cache=_failure_cache(args),
             ),
             local_addr=("0.0.0.0", 0),
         )

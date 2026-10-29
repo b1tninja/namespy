@@ -8,6 +8,35 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- Resolution failures are cached now (RFC 9520 §3.2, §3.3) — `FailureCache` and
+  `FailureEntry` in `namespy.cache`, consulted by `resolve_steps` before it sends
+  anything and owned by `RecursiveResolver` (`failure_cache=`: pass a cache to share
+  one between resolvers, leave it out for a default one, pass `False` to switch it
+  off — `False` rather than `None` because `None` means "give me the default"
+  everywhere else in that constructor, and a resolver built to *watch* a zone fail
+  has to keep asking it). A lookup that dies because a zone's servers never answered
+  records the **zone**, not the name that happened to ask, because the next query
+  will be for a different name under that zone: §3.3 asks that a non-responsive
+  zone's parent be limited "just as it would limit subsequent queries to the
+  non-responsive zone", and only a zone key can express that. A suppressed lookup
+  ends without a `Response` — which the server already answers SERVFAIL — with no
+  packet leaving the process. Failures that are properties of a name are keyed on
+  `(QNAME, QTYPE, QCLASS)` instead: an alias loop (§2.5), a spent hop budget, or a
+  lookup that had no server to ask at all. Two exclusions keep the cache from
+  inventing outages — a zone this lookup never queried, and one that answered
+  something usable along the way, which is what a finished QNAME-minimisation probe
+  walk looks like. Entries live between one second and five minutes (§3.2's band;
+  the floor is configurable, the ceiling is a MUST so it is not), double per repeat
+  failure, and are LRU-bounded so the memory §3.2's resource-exhaustion concern
+  fears is fixed by configuration rather than by how many garbage names someone can
+  invent. Suppression does not extend an entry, or a client hammering a dead name
+  would hold a recovered zone shut at the ceiling; a lookup that *succeeds* clears
+  what was remembered about that name and about every zone that spoke during it,
+  which is how recovery gets noticed rather than waited for. What is *not* cached is
+  an unresponsive server address, which §3.2 permits: inside one lookup the Slist
+  already cycles a zone's remaining servers, and across lookups an address key would
+  retire one of a zone's several healthy servers for minutes over a single dropped
+  datagram. `--no-failure-cache` is the way out from the command line.
 - EDNS(0) *options* — the code/length/value records that live inside OPT RDATA
   (RFC 6891 §6.1.2), which until now was written empty and read as an opaque
   blob. `namespy.edns` carries them; a query can now hold NSID (RFC 5001),

@@ -60,7 +60,7 @@ from socket import gaierror
 from typing import NamedTuple
 
 from . import enable_path_mtu_discovery
-from .cache import MemoryDnsCache, NegativeEntry, PositiveEntry
+from .cache import FailureCache, MemoryDnsCache, NegativeEntry, PositiveEntry
 from .edns import nsid_of, nsid_presentation
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .minimis import QnameMinimiser
@@ -1451,6 +1451,7 @@ def resolve_steps(
     max_alias_hops: int = MAX_ALIAS_HOPS,
     qname_min: bool = False,
     glue_policy: GluePolicy = GluePolicy.STRICT,
+    failures=None,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1463,6 +1464,22 @@ def resolve_steps(
     ``Answer``/``Done`` or ``Nxdomain``/``Nodata``/``Done`` on a hit. After
     a real authoritative response classifies as a terminal event, the
     result is written back to the cache.
+
+    If ``failures`` is provided (a :class:`namespy.cache.FailureCache`), the
+    same loop also refuses to *start* a query whose failure is already
+    remembered, and records the failures it hits (RFC 9520 §3.2). Two shapes are
+    recorded, because two things fail: a lookup that runs out of servers for a
+    zone it had reached and never heard back from notes the **zone**, so the
+    next lookup -- which will be for a different name under that zone, and would
+    otherwise climb all the way back down -- is stopped at the top (§3.3: "the
+    resolver MUST limit queries to the non-responsive zone's parent zone"); a
+    lookup that ends because the *name* is unusable (an alias loop, a spent hop
+    budget) notes the ``(qname, qtype, qclass)``. A zone that answered anything
+    useful is never marked dead, which is what keeps a spent QNAME-minimisation
+    probe walk -- servers answering too well, not too badly -- from poisoning a
+    healthy delegation. Suppression never refreshes an entry: a client hammering
+    a dead name must not be able to hold the failure open past the five-minute
+    ceiling. Left ``None``, the generator behaves as it always has.
 
     ``qname_min`` enables QNAME minimisation (RFC 9156): servers not known
     to be authoritative for the full QNAME are probed with progressively
@@ -1485,6 +1502,37 @@ def resolve_steps(
     alias_hops = 0
     seen_names = {sname.qname}
     minimiser = QnameMinimiser(sname.qname) if qname_min else None
+    # RFC 9520 §3.2 bookkeeping. `origin` is captured before the first re-anchor
+    # so that a failure reached through an alias can be remembered against the
+    # name the client actually asked about, not only the alias target it died on
+    # -- without it, a repeat query for the original name re-walks the whole
+    # delegation tree before the cache stops it one hop too late.
+    origin = sname.qname
+    #: Zones this lookup sent a query to, and zones that answered something
+    #: usable. A zone is declared dead only when it is in the first set and not
+    #: the second, which is RFC 9520 §2.1's "the servers are not answering" and
+    #: not merely "this lookup stopped needing them".
+    attempted = set()
+    answered = set()
+    #: Why each zone's candidate servers stopped being usable, in the order first
+    #: seen, so a zone failure reads as a diagnosis ("no response; rcode
+    #: SERVFAIL") rather than the bare fact that the list ran dry.
+    demotions: dict = {}
+
+    def _remember(reason):
+        """Note that this name cannot be resolved right now (RFC 9520 §3.2)."""
+        if failures is None:
+            return
+        failures.note_query(sname.qname, sname.qtype, sname.qclass, reason)
+        if origin != sname.qname:
+            failures.note_query(origin, sname.qtype, sname.qclass, reason)
+
+    def _note_demotion(entry, reason):
+        if entry is None:
+            return
+        reasons = demotions.setdefault(entry.zone, [])
+        if reason not in reasons:
+            reasons.append(reason)
 
     for _ in range(max_hops):
         if cache is not None:
@@ -1498,13 +1546,51 @@ def resolve_steps(
                     yield Nodata(hit.soa)
                 yield Done(_synthesize_response(sname, hit))
                 return
+        if failures is not None:
+            blocked = failures.match(sname.qname, sname.qtype, sname.qclass)
+            if blocked is not None:
+                # RFC 9520 §3.2: "When an incoming query matches a cached
+                # resolution failure, the resolver MUST NOT send any
+                # corresponding outgoing queries until after the cache entries
+                # expire." Nothing above this line touched the network and, since
+                # this returns, nothing below it will. The entry is deliberately
+                # *not* re-noted here: a client hammering a dead name would
+                # otherwise keep pushing its expiry out to the five-minute
+                # ceiling and hold a recovered zone shut.
+                yield Fail(_cached_failure_reason(blocked))
+                return
         entry = slist.best()
         if entry is None:
+            # Every candidate server has been demoted. RFC 9520 §2.1 names the
+            # condition -- a zone's authoritative servers not answering, with
+            # nothing left to try instead -- and §3.3 makes the remedy a
+            # zone-shaped one, because the next lookup will be for a *different*
+            # name under the same zone: "the resolver MUST limit queries to the
+            # non-responsive zone's parent zone (and to other ancestor zones)
+            # just as it would limit subsequent queries to the non-responsive
+            # zone." Only a zone key can express that, so it is the zone that is
+            # remembered, for as long as §3.2's backoff allows.
+            #
+            # Two exclusions, both to avoid inventing an outage:
+            #   * a zone this lookup never queried (an empty Slist -- no root
+            #     hints -- leaves `.` in scope, and poisoning the root turns a
+            #     local misconfiguration into a five-minute blackout);
+            #   * a zone that answered something usable along the way, which is
+            #     the case a spent QNAME-minimisation probe walk produces: the
+            #     servers answered, they simply were not referred onward.
+            # In both, the narrower query-keyed note is still worth recording --
+            # this exact name demonstrably did not resolve.
+            reason = "; ".join(demotions.get(slist.zone, ())) or "no servers"
+            if failures is not None and slist.zone in attempted and slist.zone not in answered:
+                failures.note_zone(slist.zone, reason)
+            elif failures is not None:
+                _remember(reason)
             yield Fail("no servers")
             return
         if not entry.addresses:
             addrs = yield NeedAddress(entry.ns)
             if not addrs:
+                _note_demotion(entry, "no address")
                 yield Demote(entry, "no address")
                 slist.demote(entry)
                 continue
@@ -1521,6 +1607,7 @@ def resolve_steps(
             questions = [DnsQuestion(probe, DnsQType.A, sname.qclass)]
         else:
             questions = sname.questions
+        attempted.add(entry.zone)
         response = yield SendQuery(entry, questions, probe=probe is not None)
         terminal = False
         alias_target = None
@@ -1542,15 +1629,51 @@ def resolve_steps(
                 # reach the cache keyed on the QNAME. Referrals (slist has
                 # already descended inside classify) and the volunteered-glue
                 # notes that annotate them fall through normally.
+                #
+                # The zone is recorded as having answered, and its demotion is
+                # deliberately *not* recorded: a server that answered a probe
+                # too well is not the "non-responsive zone" RFC 9520 section 3.3
+                # is written about, and a finished probe walk across every
+                # server of a healthy zone must not leave that zone marked dead.
+                answered.add(entry.zone)
                 yield Demote(entry, f"probe {probe} returned no referral")
                 slist.demote(entry)
                 break
+            if not isinstance(step, (Demote, Fail)):
+                # Anything a caller can act on is proof that this zone is
+                # talking -- a referral, an answer, an alias, glue offered. That
+                # proof outlives a later demotion of another server in the same
+                # lookup, which is what keeps the exclusion above honest.
+                answered.add(entry.zone)
             # Write to cache *before* yielding the terminal event so callers
             # (including tests) can observe a populated cache the moment the
             # Answer/Nxdomain/Nodata is visible — the generator pauses at
             # ``yield step`` and may never be resumed past Done.
             if cache is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
                 _write_cache(cache, sname, step, response)
+            if failures is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
+                # Recovery, and it has to be explicit rather than left to the clock.
+                # An answer is direct evidence that whatever was remembered about
+                # this name is stale and that every zone which spoke during this
+                # lookup is alive, so both the suppression and the strike counts go.
+                # Leaving the counts behind would let a zone that flapped once meet
+                # its next genuine outage already at the ceiling, which is the bad
+                # trade: slow to notice the second failure of something that has
+                # since recovered. RFC 9520 section 3.3's worry -- that cached
+                # failures make a resolver slow to see recovery -- is answered here,
+                # not by the five-minute ceiling alone.
+                failures.forget(sname.qname, sname.qtype, sname.qclass)
+                if origin != sname.qname:
+                    failures.forget(origin, sname.qtype, sname.qclass)
+                for zone in answered:
+                    failures.forget_zone(zone)
+            if isinstance(step, Fail):
+                # Recorded, not yielded yet: `classify` fails for a reason that
+                # belongs to the name rather than to a server -- an alias loop or
+                # a chain past the budget, from `_follow_aliases` -- so this is
+                # the query key's business, and RFC 9520 section 2.5 lists alias
+                # loops among the failures worth remembering.
+                _remember(step.reason)
             yield step
             if isinstance(step, (Done, Fail)):
                 # Fail is terminal for the same reason Done is: classify emits it
@@ -1560,6 +1683,7 @@ def resolve_steps(
                 terminal = True
                 break
             if isinstance(step, Demote):
+                _note_demotion(step.entry, step.reason)
                 slist.demote(step.entry)
             elif isinstance(step, Cname):
                 # Recorded, not acted on yet: classify also emits Cname when a
@@ -1575,9 +1699,11 @@ def resolve_steps(
             # RFC 1034 §3.6.2 forbids an alias resolving to itself "directly or
             # indirectly"; a server offering that is broken, and re-querying it
             # is how a resolver hangs rather than fails.
+            _remember(f"alias loop at {alias_target}")
             yield Fail(f"alias loop at {alias_target}")
             return
         if alias_hops >= max_alias_hops:
+            _remember(f"alias chain longer than {max_alias_hops}")
             yield Fail(f"alias chain longer than {max_alias_hops}")
             return
         seen_names.add(alias_target)
@@ -1589,7 +1715,20 @@ def resolve_steps(
             # A completed probe walk against the old name must not leave a
             # spent budget narrowing probes against the new one.
             minimiser = QnameMinimiser(sname.qname)
+    _remember("max hops")
     yield Fail("max hops")
+
+
+def _cached_failure_reason(entry) -> str:
+    """Render a remembered failure as the reason a trace and a log can use.
+
+    The two shapes read differently on purpose: a zone failure names the zone,
+    because that -- not the QNAME in front of the operator -- is the thing that
+    is not answering, and the strike count says whether this is a first
+    one-second refusal or a name that has been refused for five minutes.
+    """
+    subject = f"zone {entry.zone}" if entry.zone is not None else "this name"
+    return f"cached failure for {subject}: {entry.reason} (strike {entry.strikes})"
 
 
 def _synthesize_response(sname, hit):
@@ -1853,6 +1992,7 @@ class RecursiveResolver(Resolver):
         root_hints_path=None,
         dns_suffix=None,
         cache=None,
+        failure_cache=None,
         max_hops: int = MAX_HOPS,
         max_depth: int = MAX_DEPTH,
         max_alias_hops: int = MAX_ALIAS_HOPS,
@@ -1871,6 +2011,15 @@ class RecursiveResolver(Resolver):
             error rather than a licence to fetch: silently downloading during
             ``__init__`` also wrote a file into the current working directory.
         :param query_timeout: seconds per UDP attempt (and per TCP phase).
+        :param failure_cache: a :class:`~namespy.cache.FailureCache` holding the
+            failures this resolver is not to ask about again (RFC 9520). Left
+            ``None``, one is created for this resolver, which is what makes the
+            second query for a dead name free rather than merely slow. Pass
+            ``False`` to switch failure caching off entirely -- wanted when the
+            resolver exists to *observe* a broken zone, because a resolver that
+            has stopped asking is, from outside, indistinguishable from one that
+            is itself broken. Pass an existing cache to share one across
+            resolvers, or to choose the TTL bounds and capacity.
         :param edns_payload_size: UDP payload advertised by the EDNS(0) OPT
             record on every outbound query (RFC 6891 section 6.2.3). ``0`` or
             ``None`` sends no OPT at all -- the pre-EDNS behaviour, still
@@ -1935,6 +2084,16 @@ class RecursiveResolver(Resolver):
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
         self.cache = cache if cache is not None else MemoryDnsCache()
+        # RFC 9520 §3.2. `False`, rather than `None`, switches this off, because
+        # `None` already means "make me the default one" everywhere else in this
+        # constructor -- and a resolver built to watch a zone fail has to be able
+        # to keep asking it about the failure.
+        if failure_cache is False:
+            self.failure_cache = None
+        elif failure_cache is None:
+            self.failure_cache = FailureCache()
+        else:
+            self.failure_cache = failure_cache
         if dns_suffix is not None:
             self.dns_suffix = dns_suffix
 
@@ -2327,6 +2486,7 @@ class RecursiveResolver(Resolver):
                         child_slist,
                         self.cache,
                         glue_policy=self.glue_policy,
+                        failures=self.failure_cache,
                     )
                     sub_response = await self._drive(sub_gen, child_trace, depth + 1)
                     if not isinstance(sub_response, Response):
@@ -2394,6 +2554,7 @@ class RecursiveResolver(Resolver):
             max_alias_hops=self.max_alias_hops,
             qname_min=self.qname_min,
             glue_policy=self.glue_policy,
+            failures=self.failure_cache,
         )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):

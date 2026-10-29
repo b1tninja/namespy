@@ -140,9 +140,10 @@ cd D:\code\namespy
 ## Known gaps (deliberate, documented in README/CHANGELOG)
 
 - ~~EDNS(0) on outbound queries~~ — shipped (f15b751), and so are its option
-  TLVs and the per-server payload sizes that travel with them. The roadmap's P1
-  is now RFC 9520: caching a resolution failure, so a dead zone stops being
-  re-queried by every name beneath it. See the P1 row of
+  TLVs and the per-server payload sizes that travel with them. RFC 9520 shipped too:
+  `FailureCache` remembers a failed lookup — including a zone whose servers stopped
+  answering — and sends nothing upstream while the entry lives. Dead addresses are
+  deliberately not remembered; `--no-failure-cache` turns the whole thing off. See
   [`docs/roadmap.md`](roadmap.md).
 - QNAME minimisation: shipped opt-in (`qname_min` / `--qname-min`); the
   default-off is deliberate. serve-stale (RFC 8767), DNSSEC validation
@@ -157,7 +158,28 @@ cd D:\code\namespy
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Next task: EDNS option TLV + per-server payload adaptation (roadmap P1, highest priority)
+## Latest round: RFC 9520 failure caching (`FailureCache`)
+
+Shipped: a resolution failure is remembered and acted on. `FailureCache` in
+`namespy/cache/__init__.py` is consulted by `resolve_steps` before any query leaves
+the process and recorded at each place a lookup dies. `RecursiveResolver` owns one
+(`failure_cache=`,
+`--no-failure-cache` on the command line). A zone whose servers stopped answering is
+keyed on the zone — that is what makes the next name beneath it cost nothing, and
+what §3.3's parent-throttling means in this codebase — while an alias loop or a spent
+hop budget is keyed on `(QNAME, QTYPE, QCLASS)`. Patterns worth reusing:
+`test_failure_cache_resolver.py`'s `_drive(gen, responses)` for asserting the
+*absence* of a query — it returns every event the generator yielded, so "nothing
+left the process" is the absence of a `SendQuery` in that list — and
+`FailureCache(time_fn=...)` for TTL behaviour without sleeping. That closes the last
+P1 item in `docs/roadmap.md`, its RFC 9520 §3.1 row included: that ceiling is counted
+per transport ("A resolver MUST NOT retry a given query to a server address over a
+given DNS transport more than twice"), so a silent server costing one UDP datagram and
+one TCP attempt is conforming — it just had never been pinned. `test_silence_is_tried_once_per_transport_and_no_further`
+and `test_edns_refusal_and_silence_do_not_combine_into_three_attempts` in
+`test_resolver_truncation.py` do that now. What remains in the roadmap is P2 and below.
+
+## Previous round: EDNS option TLV + per-server payload adaptation
 
 QNAME minimisation shipped opt-in this round: probe walk + descent
 integration (`resolve_steps` takes `qname_min`), probe-aware handling of

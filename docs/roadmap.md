@@ -105,9 +105,9 @@ is one row per obligation.
 | Wildcard matching and synthesis of the closest encloser | 4592 §2.1–§2.2 | ⬜ | roadmap P2 — names carry an `is_wildcard` flag; no synthesis |
 | QNAME minimisation | 9156 §4 | ✅ | opt-in `qname_min` / `--qname-min`: §2.3 probe schedule (`test_minimis.py`) + descent integration with probe-aware demotion and budget degradation (`test_qname_min.py`); off by default |
 | Serve-stale on upstream failure | 8767 | ⬜ | roadmap P3 |
-| Never more than two retries to one server address over one transport before treating that address as unresponsive | 9520 §3.1 | 🟡 | two attempts are hard-coded in the EDNS-rejection loop, and one UDP try becomes at most one TCP re-ask; `test_answer_on_the_first_attempt_sends_exactly_one_query` pins the single-query happy path, but no test pins the ceiling on the timeout path |
-| A resolution failure cached for at least a second and never more than five minutes, so a repeat lookup of a dead zone sends nothing upstream until the entry expires | 9520 §3.2 | ⬜ | roadmap P1 — `cache/` stores positive and negative *answers* only, and an entry's `demoted` flag dies with the lookup that set it |
-| Queries to a non-responsive zone's parent limited as hard as queries to that zone | 9520 §3.3 | ⬜ | roadmap P1 — nothing remembers a dead zone between lookups, so every new name beneath it re-asks the parent from scratch |
+| Never more than two retries to one server address over one transport before treating that address as unresponsive | 9520 §3.1 | ✅ | the UDP loop in `query()` asks at most twice, and the second time only when an answer refused the OPT record; the timeout path adds one TCP attempt, which §3.1 allows as a different transport. `test_silence_is_tried_once_per_transport_and_no_further` pins a silent server at one UDP query and one TCP attempt, `test_edns_refusal_and_silence_do_not_combine_into_three_attempts` that the two paths do not stack into a retry chain, `test_answer_on_the_first_attempt_sends_exactly_one_query` the happy path, `test_edns_rejection_triggers_exactly_the_documented_fallback` the refusal |
+| A resolution failure cached for at least a second and never more than five minutes, so a repeat lookup of a dead zone sends nothing upstream until the entry expires | 9520 §3.2 | ✅ | `FailureCache`; `test_failure_cache.py` for the band, the backoff and the LRU bound, `test_failure_cache_resolver.py` for the resolver half — `test_the_next_name_in_a_dead_zone_asks_nothing` pins "sends nothing" as the absence of a `SendQuery`, and `test_suppressing_a_query_does_not_extend_the_failure` that suppression is a read rather than a re-note. Implementation choices (what is keyed, what is not, how long each lasts) are documented on the class, as §3.2 asks |
+| Queries to a non-responsive zone's parent limited as hard as queries to that zone | 9520 §3.3 | ✅ | The zone is the key, not the name: `test_a_zone_that_never_answers_is_remembered_as_a_zone` records a dead zone, and `test_the_next_name_in_a_dead_zone_asks_nothing` stops a *different* name beneath it from re-walking the tree to its parent. `test_a_zone_that_answered_is_not_marked_dead` and `test_an_unqueried_zone_is_never_marked_dead` hold the exclusions, and `test_a_dead_zone_does_not_reach_a_name_outside_it` the scope |
 
 ## 5. Cache poisoning resistance — RFC 5452, RFC 5625
 
@@ -177,7 +177,7 @@ of code built on namespy, not by implementation cost.
 
 | # | Item | Spec | Why it ranks here | Cost |
 |---|---|---|---|---|
-| **P1** | Negative caching of resolution failures: remember a dead server address and a dead zone, send nothing upstream while the entry lives, and throttle queries to the parent of a zone whose servers all failed | 9520 §3.2, §3.3 | a standards-track MUST that is open in code whose §2–§3 rows already claim standards-track conformance; today every lookup starts from nothing, so one unresponsive zone is re-hammered by every name beneath it, which is an outgoing amplification path with our name on it | medium |
+| ~~P1~~ | ~~Negative caching of resolution failures: remember a dead zone, send nothing upstream while the entry lives, and throttle queries to the parent of a zone whose servers all failed~~ shipped | 9520 §3.2, §3.3 | ✅ `FailureCache` in `namespy/cache/__init__.py`, consulted and recorded by `resolve_steps` and owned by `RecursiveResolver`. Dead *addresses* are deliberately not remembered — the Slist already cycles a zone's remaining servers inside one lookup, and an address key across lookups would retire one healthy server of a zone for minutes over a single dropped datagram; the class docstring records that choice and its cost. On by default; `failure_cache=False` / `--no-failure-cache` turns it off | — |
 | ~~P1~~ | ~~Bailiwick filter for out-of-zone glue~~ shipped | 5452 §6 | ✅ `classify` now accepts glue only for a name inside the answering zone or the zone it delegates | — |
 | ~~P1~~ | ~~EDNS options TLV parse/emit, then per-server payload adaptation~~ shipped | 6891 §6.1.2/§6.2.3, 5001, 7873, 7830 | ✅ options ride in OPT RDATA both ways; NSID is asked for, answered only on request and printed as hex; COOKIE and Padding carry their length rules; each responder's advertised size now caps what we offer it | — |
 | ~~P1~~ | ~~Server echoes OPT; EDNS-aware responses~~ shipped | 6891 §6.1.1/§6.2.4/§7 | ✅ the demo server now answers extended queries with its own OPT, refuses a second OPT with FORMERR, answers an unknown VERSION with BADVERS, and keeps §7 silence for unextended requestors | — |
@@ -188,19 +188,23 @@ of code built on namespy, not by implementation cost.
 | **P3** | IDNA/punycode | 5891/3492 | correctness for internationalised names; currently the caller's job | medium |
 | **P3** | Wildcard synthesis | 4592 | needed before results can claim RFC-identical semantics for `*.example` zones | medium |
 | **P3** | DNSSEC validation (4033/4034/4035, 5155) | — | the largest trust gap and the largest project: trust anchors, crypto (a dependency decision against the zero-dependency promise), proof checking; the algorithm set is 9904's, with 9905/9906 having removed entries from 4034/5155 | large |
-| **P3** | Serve-stale | 8767 | availability win; depends on the same cache bookkeeping the RFC 9520 entry above builds | medium |
+| **P3** | Serve-stale | 8767 | availability win; the staleness bookkeeping it needs is a sibling of what `FailureCache` already keeps, which is why it sat behind the RFC 9520 item and is now unblocked | medium |
 | **P3** | TCP connection reuse with `edns-tcp-keepalive` | 7828, 9210 | every truncated answer currently pays a fresh three-way handshake, and 7828 is what lets a connection be kept honestly rather than by guesswork | small |
 | **P3** | 0x20 encoding | 6841 | marginal over port+ID+question without DNSSEC; deliberately late | small |
 | **P4** | Opportunistic encryption of the leg to the authority servers | 9539, 9460/9461 | the encrypted transport this resolver can actually use — 7858/8484/9250/9953 are stub-to-resolver protocols and have nothing to attach to here; 9539 is Experimental and optional, so this ranks where it does on reach rather than on requirement | large |
 | — | Rate limiting / RRL for the server | 5358/9085 | ▫️ non-goal: loopback fixture, not a service | — |
 
-Two of the three original P1 items shipped and the third (QNAME minimisation)
-shipped opt-in. What replaced the top of the list is RFC 9520: it is the one open
-item whose absence is visible to people who have never run this code, because it
-is about how much traffic a resolver sends other people's nameservers. Every
-lookup that walks into a dead zone starts the hammering again from zero, and
-§3.2 forbids precisely that. The items below it change the answers this resolver
-gives; that one changes the load it puts on the rest of the DNS. Below it sit the
-cheap correctness items (SVCB codecs, Extended DNS Errors), then IDNA and
+Every P1 is now shipped: bailiwick, EDNS options and OPT echo outright, QNAME
+minimisation opt-in, and RFC 9520's failure cache last — the item that had
+replaced the others at the top, because it was the one whose absence was visible
+to people who had never run this code. It is about how much traffic a resolver
+sends other people's nameservers: before it, every lookup that walked into a dead
+zone started the hammering again from zero, and the next name beneath that zone
+re-asked its parent as though nothing had happened. Two of that RFC's three rows
+are ✅; the third (§3.1's retry ceiling) is still 🟡 for want of a test that pins
+the ceiling on the timeout path.
+
+Everything below changes the answers this resolver gives or the transports it can
+use: the cheap correctness items (SVCB codecs, Extended DNS Errors), then IDNA and
 wildcard synthesis, then DNSSEC, which remains both the largest trust gap and by
 far the largest project.

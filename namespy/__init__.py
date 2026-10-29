@@ -100,6 +100,8 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 # classes people actually want were only reachable through module paths.
 from .cache import (  # noqa: E402
     DnsCache,
+    FailureCache,
+    FailureEntry,
     MemoryDnsCache,
     NegativeEntry,
     PositiveEntry,
@@ -151,6 +153,8 @@ __all__ = [
     "DnsResponseCode",
     "DomainName",
     "EdnsOption",
+    "FailureCache",
+    "FailureEntry",
     "GluePolicy",
     "MemoryDnsCache",
     "NegativeEntry",
