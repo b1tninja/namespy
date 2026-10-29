@@ -26,7 +26,7 @@ numbers -- and sends none at all to a requestor that never asked, which RFC
 Options inside that OPT are handled by the same rule, applied in two
 directions. This server answers a query whose option it does not understand by
 ignoring it -- "Any OPTION-CODE values not understood by a responder or
-requestor MUST be silently ignored" (section 6.1.2) -- and answers one whose
+requestor MUST be ignored" (section 6.1.2) -- and answers one whose
 option is *misformed* with FORMERR, because section 7 asks for exactly that and
 insists the error response still carry an OPT, so a requestor can tell "this
 server has EDNS and disliked what you sent" from "this server has no EDNS". The
@@ -261,7 +261,7 @@ class DnsServer(asyncio.Protocol):
         Everything else the query carried is dropped on the floor, which is the
         documented treatment of an option a responder has no behaviour for
         ("Any OPTION-CODE values not understood by a responder or requestor MUST
-        be silently ignored", RFC 6891 section 6.1.2). Padding is the interesting
+        be ignored", RFC 6891 section 6.1.2). Padding is the interesting
         case, because here the code *is* understood and the answer is still no:
         RFC 7830 section 4 makes padding a MUST for a responder that is asked,
         while section 6 forbids the option outright on a transport that is not
@@ -298,7 +298,7 @@ class DnsServer(asyncio.Protocol):
         option with a length rule to break: RFC 7873 section 5.2.2 allows 8
         octets or 16 to 40 and nothing else. NSID is opaque and any length is
         legal, and an unregistered code is not evaluated at all -- section
-        6.1.2's "silently ignored" covers its payload too, so refusing a
+        6.1.2's "MUST be ignored" covers its payload too, so refusing a
         private-code option for its contents would be inventing a rule.
         """
         try:

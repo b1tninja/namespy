@@ -124,7 +124,17 @@ cd D:\code\namespy
 8. **Protocol behaviour cites its source** — `RFC 9267 section 5` style, in
    code and in `docs/rfc-map.md` (obligation → code → test). Update the row
    in the same commit as the behaviour. Re-check any citation you touch
-   against the live document (rfclib / rfc-editor) before editing it.
+   **against the body of the document — not a section index, and not your
+   memory of the wording.** Pull the text (`get_rfc`, the RFC-Editor mirror
+   this machine keeps under `D:\code\rfclibrary\data\mirror\rfc\`, or
+   rfc-editor.org) and find the sentence you quote *inside* the section you
+   name. A section number can be exactly right while the words inside the
+   quotation marks are a paraphrase: that is how RFC 6891's "MUST be ignored"
+   shipped here as "MUST be silently ignored", and how RFC 7873 §5.2.2's
+   "valid cookie lengths are 8 and 16 to 40 inclusive" circulated in wording
+   the RFC does not use. Wrapped lines defeat naive greps — search for a
+   fragment that survives the wrap ("valid cookie lengths"), never the whole
+   sentence, and confirm the surrounding heading is the one you cited.
 9. **Coverage floor is a ratchet**: raise it with tests, never ahead of them.
 
 ## Known gaps (deliberate, documented in README/CHANGELOG)

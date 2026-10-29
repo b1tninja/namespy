@@ -38,7 +38,7 @@ short enough to enforce and whose absence is visible on the wire:
 
 The registry is wider than this module and the rule for what is not in it is
 explicit (section 6.1.2): "Any OPTION-CODE values not understood by a responder
-or requestor MUST be silently ignored." So an unknown option is *kept* here --
+or requestor MUST be ignored." So an unknown option is *kept* here --
 it is data a debugger wants -- and no code path treats its presence as an
 error. A malformed one is the exception, and section 7 handles it: "If there is
 a problem with processing the OPT record itself, such as an option value that

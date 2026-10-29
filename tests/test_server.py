@@ -451,7 +451,7 @@ async def test_an_extended_rcode_for_an_unextended_client_becomes_servfail() -> 
 #
 # The OPT record's RDATA is a list of option TLVs (RFC 6891 section 6.1.2), and
 # that one section decides two opposite things about them: a code this server
-# does not know "MUST be silently ignored", while a value that is "badly
+# does not know "MUST be ignored", while a value that is "badly
 # formatted" or carries "out-of-range values" earns a FORMERR that must still
 # carry an OPT (section 7). RFC 5001 section 2.2 then supplies the asymmetry that
 # makes an NSID server testable in both directions -- the request is the option
@@ -522,7 +522,7 @@ async def test_an_identifier_written_by_the_requestor_is_ignored() -> None:
 
 
 async def test_an_option_this_server_does_not_know_is_ignored_not_refused() -> None:
-    """Section 6.1.2's "silently ignored" is an instruction about what to *do*, and
+    """Section 6.1.2's "MUST be ignored" is an instruction about what to *do*, and
     the doing includes not complaining: a private experimental code is a
     deployment choice, not a defect, and refusing it would make this server the
     thing that breaks a peer's rollout."""
@@ -541,9 +541,10 @@ async def test_a_misformed_option_is_formerr_and_still_carries_an_opt() -> None:
     """Section 7: "If there is a problem with processing the OPT record itself,
     such as an option value that is badly formatted ... a FORMERR MUST be
     returned. If this occurs, the response MUST include an OPT record." The second
-    sentence is the one a responder forgets: a FORMERR with no OPT is what section
-    6.2.2 tells a requestor to read as "this server does not implement EDNS",
-    which is the opposite of what happened here."""
+    sentence is the one a responder forgets: without an OPT the FORMERR is
+    indistinguishable from an unextended server, and section 6.2.2 has a requestor
+    that detects "the remote end does not support EDNS(0)" retry unextended rather
+    than learn that its own option was malformed."""
     server, resolver, transport = make_server()
     looked_up = []
 

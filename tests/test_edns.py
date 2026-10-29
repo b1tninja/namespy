@@ -391,7 +391,7 @@ def test_recursive_resolver_plumbs_the_knob() -> None:
 # RFC 6891 section 6.1.2 gives an option three fields -- OPTION-CODE,
 # OPTION-LENGTH, OPTION-DATA -- concatenates them with no padding, and covers
 # everything outside the registry in one sentence: "Any OPTION-CODE values not
-# understood by a responder or requestor MUST be silently ignored." Section 7
+# understood by a responder or requestor MUST be ignored." Section 7
 # then separates the *misformed* option from the merely unknown one and gives it
 # a RCODE of its own, which a parser can only trigger by refusing to trim what
 # it could not finish reading. RFC 5001 section 2.1 adds an asymmetry worth
@@ -421,7 +421,7 @@ def test_options_survive_the_wire_in_the_order_they_were_given() -> None:
 
 
 def test_an_unregistered_option_is_carried_rather_than_rejected() -> None:
-    """A private code is not a defect. "Silently ignored" in section 6.1.2
+    """A private code is not a defect. "MUST be ignored" in section 6.1.2
     governs what a responder *does* with an option, not what a reader keeps, and a
     library that dropped it would be editing somebody else's transaction -- while
     naming it by number, because inventing a mnemonic for an unregistered code is
@@ -478,8 +478,8 @@ def test_nsid_of_separates_being_asked_from_being_ignored() -> None:
     ],
 )
 def test_cookie_lengths_outside_the_table_are_out_of_range(length, legal) -> None:
-    """RFC 7873 section 5.2.2: "a valid COOKIE option length is 8 octets or 16 to
-    40 octets". The 9-to-15 gap is the interesting part -- it is a Server Cookie
+    """RFC 7873 section 5.2.2: "In summary, valid cookie lengths are 8 and 16 to 40
+    inclusive." The 9-to-15 gap is the interesting part -- it is a Server Cookie
     too short to be one, which presents as a truncation and is in fact out of
     range, so it earns section 7's FORMERR rather than a repair."""
     assert legal == cookie_length_valid(length)
