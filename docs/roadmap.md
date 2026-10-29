@@ -50,7 +50,9 @@ Spec anchors: RFC 1035, RFC 2181, RFC 9267, RFC 3597, RFC 4343, RFC 3688.
 
 ## 3. EDNS(0) — RFC 6891
 
-Shipped at `HEAD`; every row below is driven by `tests/test_edns.py`.
+Shipped at `HEAD`; the rows below are driven by `tests/test_edns.py`, the
+responder's own duties by `tests/test_server.py`, and what the CLI does with an
+identifier by `tests/test_cli.py`.
 
 | Obligation | Spec | Status | Where |
 |---|---|---|---|
@@ -63,11 +65,17 @@ Shipped at `HEAD`; every row below is driven by `tests/test_edns.py`.
 | BADVERS and NOTIMP also force the unextended re-ask; FORMERR *with* OPT does not | §6.2.2, §7 | ✅ | same matrix test, five parametrised cases |
 | OPT is never cached | §6.2.1 | ✅ | `test_opt_is_never_cached` |
 | OPT replaces rather than stacks; removable; whole feature disableable (constructor knob + `--no-edns`) | design | ✅ | `test_add_edns_replaces_rather_than_stacks`, `test_edns_can_be_disabled_whole` |
-| EDNS **options** (option-code/length TLVs): NSID (5001), COOKIE (7873), Padding (7830) | §6.1.2, 5001, 7873, 7830 | ⬜ | roadmap P1 — OPT RDATA is written empty and read opaquely |
-| Per-server payload adaptation to the responder's advertised CLASS | §6.2.3 (SHOULD) | ⬜ | roadmap P1 — advertised size is static today |
+| EDNS **options** (option-code/length/value TLVs) inside OPT RDATA, written and read in the order they were given | §6.1.2 | ✅ | `test_options_survive_the_wire_in_the_order_they_were_given`, `test_the_option_helpers_describe_the_codes_they_invent` (`test_edns.py`) |
+| An option code this code does not model is carried and ignored, never refused; a *misformed* one raises rather than being silently truncated | §6.1.2 | ✅ | `test_an_unregistered_option_is_carried_rather_than_rejected`, `test_a_half_written_option_raises_instead_of_stopping_early` (`test_edns.py`), `test_an_option_this_server_does_not_know_is_ignored_not_refused` (`test_server.py`) |
+| A misformed option in a *query* → FORMERR, and that answer still carries an OPT — a server that implements EDNS and found the request malformed must not look like one that does not implement it | §6.1.2, §7 | ✅ | `test_a_misformed_option_is_formerr_and_still_carries_an_opt` (`test_server.py`) |
+| NSID: asked for with a zero-length option, answered only when asked, ignored if a requestor hands one in | 5001 §2.1, §2.2 | ✅ | `test_nsid_of_separates_being_asked_from_being_ignored` (`test_edns.py`), `test_an_identifier_goes_only_to_a_query_that_asked_for_it`, `test_a_server_with_no_identity_never_sends_the_option`, `test_an_identifier_written_by_the_requestor_is_ignored` (`test_server.py`), `test_the_nsid_flag_is_the_empty_option_rfc_5001_asks_for` (`test_cli.py`) |
+| Identifiers presented as two hex digits per octet, never as the raw bytes | 5001 §2.4 | ✅ | `test_an_identifier_is_printed_as_hex_because_it_is_opaque` (`test_edns.py`), `test_server_identifiers_are_reported_as_hex`, `test_an_identifier_a_server_handed_back_is_printed_by_the_lookup`, `test_an_identifier_request_met_with_silence_says_so` (`test_cli.py`) |
+| COOKIE: 8 octets, or 16 through 40, are the only lengths the rules allow; anything else is out of range, and in a query it is FORMERR | 7873 §5.2.1, §5.2.2 | ✅ | `test_cookie_lengths_outside_the_table_are_out_of_range` (`test_edns.py`), `test_a_cookie_of_an_undreamt_of_length_is_refused_before_the_walk` (`test_server.py`) — a *server's* cookie is still not validated or switched: that needs per-client state this code keeps nowhere |
+| Padding is understood but never emitted, in either role, because every transport here is plaintext UDP | 7830 §4, §6 | ✅ | `test_padding_asked_for_over_plain_udp_is_not_honoured` (`test_server.py`) |
+| Per-server payload adaptation to the responder's advertised CLASS, floored at 512 | §6.2.3 (SHOULD), §6.2.4 | ✅ | `test_a_server_that_advertises_less_becomes_the_ceiling`, `test_the_resolver_remembers_who_answered_and_for_how_much`, `test_configured_options_go_out_on_every_query` (`test_edns.py`) |
 | Extended RCODE on the way out: an effective code above 15 is split — low nibble in the header, upper eight stamped into the OPT TTL | §6.1.3 | ✅ | `test_an_extended_rcode_is_stamped_into_the_opt_that_carries_it` (the hand-stamped wire case stays pinned by `test_badvers_round_trips`) |
 | Responder-side duties: OPT in the response to an OPT query, carrying *this* server's payload size | §6.1.1, §6.2.4 | ✅ | `test_opt_in_the_query_buys_an_opt_of_our_own_in_the_reply`, `test_an_upstream_opt_is_never_forwarded_as_our_own` (`test_server.py`) |
-| No OPT for a requestor that did not ask; an extended RCODE it cannot be shown becomes SERVFAIL | §7 | ✅ | `test_unextended_query_is_answered_without_an_opt`, `test_an_upstream_opt_does_not_extend_an_unextended_client`, `test_an_extended_rcode_for_an_unextended_client_becomes_servfail` |
+| No OPT for a requestor that did not ask; an extended RCODE it cannot be shown becomes SERVFAIL | §7 | ✅ | `test_unextended_query_is_answered_without_an_opt`, `test_an_extended_rcode_for_an_unextended_client_becomes_servfail` (whose upstream OPT is the "does not extend" half) |
 | More than one OPT in a query → FORMERR before any resolution; a VERSION we do not implement → BADVERS with version 0 | §6.1.1, §6.1.3 | ✅ | `test_a_query_with_two_opt_records_is_formerr_before_any_work`, `test_an_unimplemented_edns_version_answers_badvers` |
 
 ## 4. Resolution — RFC 1034 §5.3.3
@@ -149,7 +157,7 @@ of code built on namespy, not by implementation cost.
 | # | Item | Spec | Why it ranks here | Cost |
 |---|---|---|---|---|
 | ~~P1~~ | ~~Bailiwick filter for out-of-zone glue~~ shipped | 5452 §6 | ✅ `classify` now accepts glue only for a name inside the answering zone or the zone it delegates | — |
-| **P1** | EDNS options TLV parse/emit, then per-server payload adaptation | 6891 §6.1.2/§6.2.3, 5001 | unlocks NSID for debugging; shrinks the truncation/TCP detour that dominates big answers | small–medium |
+| ~~P1~~ | ~~EDNS options TLV parse/emit, then per-server payload adaptation~~ shipped | 6891 §6.1.2/§6.2.3, 5001, 7873, 7830 | ✅ options ride in OPT RDATA both ways; NSID is asked for, answered only on request and printed as hex; COOKIE and Padding carry their length rules; each responder's advertised size now caps what we offer it | — |
 | ~~P1~~ | ~~Server echoes OPT; EDNS-aware responses~~ shipped | 6891 §6.1.1/§6.2.4/§7 | ✅ the demo server now answers extended queries with its own OPT, refuses a second OPT with FORMERR, answers an unknown VERSION with BADVERS, and keeps §7 silence for unextended requestors | — |
 | **P2** | ~~QNAME minimisation~~ shipped opt-in | 9156 | ✅ probe walk + descent integration; flipping the default is a field-behaviour decision, not a code one | — |
 | **P2** | IDNA/punycode | 5891/3492 | correctness for internationalised names; currently the caller's job | medium |
@@ -160,6 +168,7 @@ of code built on namespy, not by implementation cost.
 | **P4** | DoT / DoH / DoQ | 7858/8484/9250 | transport security matters, but each is a new subsystem with its own failure modes | large |
 | — | Rate limiting / RRL for the server | 5358/9085 | ▫️ non-goal: loopback fixture, not a service | — |
 
-Two of the three original P1 items have shipped. What remains is the EDNS
-options TLV work — small and self-contained, and it closes an obligation the
-surrounding code already cites, which makes it the natural next release.
+All three original P1 items have shipped. What remains begins at P2: IDNA for
+internationalised names, wildcard synthesis before answers can claim
+RFC-identical semantics, and DNSSEC, which is both the largest trust gap and by
+far the largest project.

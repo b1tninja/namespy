@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 
+from .edns import nsid_option, nsid_presentation
 from .enums import (
     DnsOpCode,
     DnsQClass,
@@ -365,6 +366,23 @@ def build_parser():
         "512 octets and forces TCP for anything larger (RFC 6891)",
     )
     p.add_argument(
+        "--nsid",
+        action="store_true",
+        help="ask every server to identify itself (RFC 5001 NSID); each answer "
+        "that carries an identifier is printed as ';; NSID <addr> <hex>'. "
+        "Silence is normal -- a server that does not implement the option, or "
+        "declines to say, simply omits it",
+    )
+    p.add_argument(
+        "--advertise-nsid",
+        default=None,
+        metavar="NSID",
+        help="with --serve: the identifier (RFC 5001) to send back to a client "
+        "that asks for one. Never sent unasked, so this advertises nothing to "
+        "a server nobody is probing -- it is how an anycast instance says "
+        "which machine it is",
+    )
+    p.add_argument(
         "--qname-min",
         action="store_true",
         help="QNAME minimisation: downline servers get progressively deeper "
@@ -406,6 +424,39 @@ def _glue_policy(args) -> GluePolicy:
     return GluePolicy.PERMISSIVE
 
 
+def _outbound_options(args) -> tuple:
+    """The EDNS(0) options to put on every query this run sends.
+
+    One option is selectable from the command line, and asking for it is free:
+    RFC 5001 section 6.1 promises that a server which does not implement NSID
+    answers a query carrying it exactly as it would have answered one without
+    it. So this flag cannot lose you an answer; the worst it can do is teach
+    you nothing.
+    """
+    return (nsid_option(),) if getattr(args, "nsid", False) else ()
+
+
+def _report_server_ids(resolver) -> None:
+    """Print the identifiers the servers handed back, one line each.
+
+    Hex, two digits per octet, because RFC 5001 section 2.4 requires a user
+    interface to "read and write the contents of the NSID option as a sequence
+    of hexadecimal digits" -- the payload is opaque, and any prettier rendering
+    would be an interpretation nobody authorised.
+
+    Stderr, not stdout: ``--short`` promises RDATA and nothing else, and server
+    metadata arriving between records would break a script parsing an answer.
+    Saying so once when nothing came back is deliberate -- silence from this
+    function is indistinguishable from a flag that never took effect.
+    """
+    identities = resolver.server_ids
+    if not identities:
+        print(";; no server identified itself (RFC 5001 NSID)", file=sys.stderr)
+        return
+    for address in sorted(identities):
+        print(f";; NSID {address} {nsid_presentation(identities[address])}", file=sys.stderr)
+
+
 async def cli_query(args) -> int:
     loop = asyncio.get_running_loop()
     qname = DomainName(args.name)
@@ -415,6 +466,7 @@ async def cli_query(args) -> int:
             root_hints_path=args.root_hints,
             dns_suffix=args.dns_suffix,
             edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+            edns_options=_outbound_options(args),
             qname_min=args.qname_min,
             glue_policy=_glue_policy(args),
         ),
@@ -444,6 +496,9 @@ async def cli_query(args) -> int:
         if args.trace:
             _dump_last_resolution_md(resolver_protocol, path=args.trace_file)
 
+        if args.nsid:
+            _report_server_ids(resolver_protocol)
+
         return 0 if response is not None else 2
     finally:
         _transport.close()
@@ -464,6 +519,7 @@ async def serve(args) -> int:
                 root_hints_path=args.root_hints,
                 dns_suffix=args.dns_suffix,
                 edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+                edns_options=_outbound_options(args),
                 qname_min=args.qname_min,
                 glue_policy=_glue_policy(args),
             ),
@@ -474,7 +530,7 @@ async def serve(args) -> int:
         )
 
         _server_transport, _server_protocol = await loop.create_datagram_endpoint(
-            lambda: DnsServer(resolver_protocol),
+            lambda: DnsServer(resolver_protocol, nsid=args.advertise_nsid),
             local_addr=("127.0.0.1", 53),
         )
         logging.debug(

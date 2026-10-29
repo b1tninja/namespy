@@ -105,6 +105,7 @@ from .cache import (  # noqa: E402
     PositiveEntry,
     SqliteDnsCache,
 )
+from .edns import EdnsOption  # noqa: E402
 from .enums import (  # noqa: E402
     DnsOpCode,
     DnsQClass,
@@ -149,6 +150,7 @@ __all__ = [
     "DnsRecord",
     "DnsResponseCode",
     "DomainName",
+    "EdnsOption",
     "GluePolicy",
     "MemoryDnsCache",
     "NegativeEntry",

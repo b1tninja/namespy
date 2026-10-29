@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 341 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Suite | 415 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
 | Coverage | floor 80 enforced in `pyproject.toml` |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable); `tests/test_edns.py` pins it |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable) and **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes; `tests/test_edns.py` pins it |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -154,16 +154,36 @@ budget degradation to full names, `--qname-min` CLI, probes marked in
 `--trace`, CNAME chasing deliberately full-name. Patterns to reuse for the
 rest of this section: `test_qname_min.py` for fake-server descent tests.
 
-The remaining P1 items, in `docs/roadmap.md` order:
+The remaining work, in `docs/roadmap.md` order:
 
-1. **EDNS option TLV parse/emit + per-server payload adaptation** (RFC 6891
-   sections 6.1.2/6.2.3, NSID RFC 5001), then server-side OPT echo
-   (section 6.2.4) so `--serve` answers extended queries as an EDNS server
-   would.
-2. **Wildcard synthesis** (RFC 4592 section 2.2) — names carry
+1. **Wildcard synthesis** (RFC 4592 section 2.2) — names carry
    `is_wildcard` already; the closest-encloser proof and synthesized-TTL
    rule are missing, and until then answers from `*.example` zones are not
    RFC-identical.
+
+Shipped this round: EDNS option TLVs, and the payload sizes they travel with.
+`namespy/edns.py` owns the code/length/value records and the three option codes
+worth an opinion: NSID (RFC 5001), COOKIE (RFC 7873), Padding (RFC 7830).
+Requestor side, `add_edns(options=...)` writes them into OPT RDATA and
+`--nsid` asks every server the walk touches who it is, printed as hex per
+section 2.4. Resolver side, `_server_ids` records what each server answered and
+`_payload_by_server` what it advertised, and `_advertised_payload` offers a
+server the smaller of our default and the size it asked to be offered (RFC 6891
+sections 6.2.3/6.2.4, floored at 512 — a responder may ignore a smaller CLASS,
+so going below the historic default buys nothing). Server side,
+`--advertise-nsid` gives the demo server an identifier, `_reply_options` hands it
+out only to a query that asked with a zero-length NSID option (RFC 5001 section
+2.2), and `_edns_options_or_error` answers a misformed option with FORMERR *plus*
+an OPT — a FORMERR with no OPT is what section 6.2.2 reads as "no EDNS here",
+which must not be confused with "EDNS here, bad option". Two decisions are
+deliberate: a code nobody here models is ignored rather than refused (RFC 6891
+section 6.1.2), while a misformed one is a wire-format error in either direction
+— the parser raises instead of truncating, and on the query side that raise is
+what becomes the FORMERR; and padding is never emitted over plaintext UDP at all
+(RFC 7830 section 6), which is why the server declines a padding request rather
+than honouring section 4. Patterns to reuse: `test_edns.py` for TLV and resolver
+plumbing, `test_server.py`'s `make_server`/`answer_with`/`extended_query` for
+responder-side tests.
 
 Shipped since the last handoff: the bailiwick filter for out-of-zone glue
 (RFC 5452 section 6). A referral's address records now reach an `SlistEntry` only

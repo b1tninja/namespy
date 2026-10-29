@@ -33,6 +33,13 @@ import random
 import pytest
 
 from namespy.cache import MemoryDnsCache
+from namespy.edns import (
+    COOKIE_OPTION_CODE,
+    NSID_OPTION_CODE,
+    PADDING_OPTION_CODE,
+    EdnsOption,
+    nsid_of,
+)
 from namespy.enums import (
     DnsOpCode,
     DnsQClass,
@@ -438,6 +445,176 @@ async def test_an_extended_rcode_for_an_unextended_client_becomes_servfail() -> 
     reply = transport.replies[0]
     assert int(DnsResponseCode.SERVER_FAILURE) == int(reply.RCODE)
     assert reply.opt() is None
+
+
+# ----------------------------------------------- options inside that OPT RDATA
+#
+# The OPT record's RDATA is a list of option TLVs (RFC 6891 section 6.1.2), and
+# that one section decides two opposite things about them: a code this server
+# does not know "MUST be silently ignored", while a value that is "badly
+# formatted" or carries "out-of-range values" earns a FORMERR that must still
+# carry an OPT (section 7). RFC 5001 section 2.2 then supplies the asymmetry that
+# makes an NSID server testable in both directions -- the request is the option
+# with no payload, and the reply is the option with the server's own identity in
+# it, never the client's. RFC 7830 section 6 subtracts one behaviour: padding is
+# forbidden on a transport that is not encrypted, and plain UDP is all this
+# server has.
+
+
+def opt_with(rdata: bytes, payload_size: int = 1232) -> DnsRecord:
+    """An OPT record carrying *rdata* as its option list, so a damaged option can
+    be delivered inside an otherwise well-formed message."""
+    return DnsRecord(DomainName("."), OPT_RTYPE, payload_size, 0, rdata=rdata)
+
+
+def extended_query(options) -> Query:
+    return query_packet().add_edns(1232, options=options)
+
+
+async def test_an_identifier_goes_only_to_a_query_that_asked_for_it() -> None:
+    """RFC 5001 section 2.2: "A name server MUST NOT send an NSID option back to a
+    resolver which did not request it". A server configured with an identity is
+    the only kind that can fail this, which is why the fixture has one."""
+    server, resolver, transport = make_server(nsid=b"ns-a")
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(query_packet().add_edns(1232)), ADDR)
+    await drain(server)
+    unasked = transport.replies[0]
+    assert unasked.opt() is not None, "the request was extended, so section 6.1.1 still applies"
+    assert nsid_of(unasked.edns_options()) is None, "an OPT is not a request for an identity"
+
+    server.datagram_received(bytes(extended_query([EdnsOption(NSID_OPTION_CODE, b"")])), ADDR)
+    await drain(server)
+    assert b"ns-a" == nsid_of(transport.replies[1].edns_options())
+
+
+async def test_a_server_with_no_identity_never_sends_the_option() -> None:
+    """The default constructor advertises nothing, and answering a request with an
+    empty NSID would be worse than silence: RFC 5001 section 2.1 makes the empty
+    payload mean "this is the question", so a reply using it claims to be a
+    question while sitting in a response."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([EdnsOption(NSID_OPTION_CODE, b"")])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert reply.opt() is not None
+    assert nsid_of(reply.edns_options()) is None
+
+
+async def test_an_identifier_written_by_the_requestor_is_ignored() -> None:
+    """Section 2.2 again, second sentence: "The name server MUST ignore any NSID
+    payload data that might be present in the request message". Echoing it would
+    turn a debugging aid into an attacker-supplied string that a client's log
+    would then read back as the identity of this server."""
+    server, resolver, transport = make_server(nsid=b"ns-a")
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(
+        bytes(extended_query([EdnsOption(NSID_OPTION_CODE, b"client-wrote-this")])), ADDR
+    )
+    await drain(server)
+
+    assert b"ns-a" == nsid_of(transport.replies[0].edns_options()), "ignore, never echo"
+
+
+async def test_an_option_this_server_does_not_know_is_ignored_not_refused() -> None:
+    """Section 6.1.2's "silently ignored" is an instruction about what to *do*, and
+    the doing includes not complaining: a private experimental code is a
+    deployment choice, not a defect, and refusing it would make this server the
+    thing that breaks a peer's rollout."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([EdnsOption(0xFFF0, b"whatever")])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.NO_ERROR) == int(reply.RCODE)
+    assert () == reply.edns_options(), "ignored also means not echoed back"
+
+
+async def test_a_misformed_option_is_formerr_and_still_carries_an_opt() -> None:
+    """Section 7: "If there is a problem with processing the OPT record itself,
+    such as an option value that is badly formatted ... a FORMERR MUST be
+    returned. If this occurs, the response MUST include an OPT record." The second
+    sentence is the one a responder forgets: a FORMERR with no OPT is what section
+    6.2.2 tells a requestor to read as "this server does not implement EDNS",
+    which is the opposite of what happened here."""
+    server, resolver, transport = make_server()
+    looked_up = []
+
+    async def stub(packet):
+        looked_up.append(packet)
+        return stub_reply(packet)
+
+    resolver.resolve = stub
+
+    # The option claims eight octets of value and supplies two. The record itself
+    # is self-consistent -- RDLENGTH matches the bytes on the wire -- so nothing
+    # but a reading of the option list can notice, which is why the refusal has to
+    # come from the option check rather than the generic parse-failure path.
+    broken = Query(
+        ID=0xABCD,
+        questions=[DnsQuestion(HOST, DnsQType.A, DnsQClass.IN)],
+        additional_records=[opt_with(b"\x00\x03\x00\x08ns")],
+    )
+    server.datagram_received(bytes(broken), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.FORMAT_ERROR) == int(reply.RCODE)
+    assert [] == looked_up, "a request that cannot be read should not buy a recursive walk"
+    assert reply.opt() is not None, "section 7: the FORMERR of a bad option carries an OPT"
+
+
+@pytest.mark.parametrize(
+    ("octets", "acceptable"),
+    [(8, True), (9, False), (15, False), (16, True), (40, True), (41, False)],
+)
+async def test_a_cookie_of_an_undreamt_of_length_is_refused_before_the_walk(
+    octets, acceptable
+) -> None:
+    """RFC 7873 section 5.2.2 lists the COOKIE lengths a client may send -- 8, or 16
+    through 40 -- and section 5.2 answers anything else with FORMERR. The 9-to-15
+    band is the case worth pinning: such an option is not a short Server Cookie, it
+    is a length that cannot be one, and a server that accepted it would be
+    pretending to validate a cookie the client could never have produced."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    query = extended_query(
+        [EdnsOption(COOKIE_OPTION_CODE, bytes([n % 256 for n in range(octets)]))]
+    )
+    server.datagram_received(bytes(query), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert acceptable == (int(DnsResponseCode.NO_ERROR) == int(reply.extended_rcode))
+
+
+async def test_padding_asked_for_over_plain_udp_is_not_honoured() -> None:
+    """RFC 7830 section 4 tells a responder that "MUST add a PADDING Option" when
+    asked, and section 6 tells an implementation that it "MUST NOT use this option
+    if the DNS transport is not encrypted". This server's transport is UDP, so
+    section 4 could only be obeyed by breaking section 6, and the sentence about
+    encryption is the one that describes the situation this server is in. Refusing
+    the padding must not cost the client the rest of its options."""
+    server, resolver, transport = make_server(nsid=b"ns-a")
+    await answer_with(resolver, stub_reply)
+
+    query = extended_query(
+        [EdnsOption(PADDING_OPTION_CODE, b""), EdnsOption(NSID_OPTION_CODE, b"")]
+    )
+    server.datagram_received(bytes(query), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert reply.edns_option(PADDING_OPTION_CODE) is None, "plaintext is plaintext"
+    assert b"ns-a" == nsid_of(reply.edns_options()), "one refusal may not swallow the others"
 
 
 # ------------------------------------------------------- amplification defence

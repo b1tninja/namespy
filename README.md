@@ -53,9 +53,9 @@ namespy --serve                      # demo server on 127.0.0.1:53
 ```
 
 `python -m namespy` does the same without installing the console script, and
-`namespy --help` lists the rest (`--no-edns`, `--root-hints`, `--dns-suffix`,
-`--timeout`, `--trace-file`, `--qname-min`, `--allow-out-of-bailiwick-glue`,
-`-v`, `--debug`).
+`namespy --help` lists the rest (`--no-edns`, `--nsid`, `--root-hints`,
+`--dns-suffix`, `--timeout`, `--trace-file`, `--qname-min`,
+`--allow-out-of-bailiwick-glue`, `-v`, `--debug`).
 
 `--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
 useful for seeing exactly where a zone cut was crossed and which NS forced a
@@ -132,15 +132,23 @@ them change the security properties of anything built on top.
   verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
   are unauthenticated: anyone who can deliver a well-formed response that matches
   the question — same source address, same ID, echoed question — is believed.
-- **EDNS(0) is sent and understood, minimally.** Outbound queries advertise a
-  1232-octet UDP payload (RFC 6891 §6.1.2, disable with `--no-edns` or the
-  constructor knob), arriving OPT records yield `extended_rcode`, `ad`, `cd`
-  and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer triggers
-  the §6.2.2 unextended re-ask. The demo server answers an extended query with
-  an OPT of its own — never a forwarded one, always its own payload size — and
-  keeps §7's silence for a query that had none. What is missing is *options*:
-  no NSID, COOKIE or per-server payload adaptation yet. Truncation is fully
-  handled: a `TC` answer is re-asked over TCP instead of being believed
+- **EDNS(0) options are new, and only NSID is put to use.** Outbound queries
+  advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with `--no-edns`
+  or the constructor knob), arriving OPT records yield `extended_rcode`, `ad`,
+  `cd` and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer
+  *without* an OPT alongside it triggers the §6.2.2 unextended re-ask. Option
+  TLVs (§6.1.2) are carried in both directions: `--nsid` asks each server the
+  walk touches who it is and prints the answers as hex (RFC 5001 §2.4), and
+  what a server advertises becomes the ceiling on the next query sent to it
+  (§6.2.3, §6.2.4). COOKIE (RFC 7873) and Padding (RFC 7830) encode and decode
+  but are not yet *used*: there is no server-side cookie state to validate a
+  reply against — the server only refuses a COOKIE whose length is impossible
+  (§5.2.2) — and RFC 7830 §6 forbids padding over plaintext UDP, which is
+  all this code sends today. The demo server answers an extended query with an
+  OPT of its own — never a forwarded one, always its own payload size, and its
+  identifier only if it was given one with `--advertise-nsid` and only if the
+  query asked — and keeps §7's silence for a query that had none. Truncation is
+  fully handled: a `TC` answer is re-asked over TCP instead of being believed
   (RFC 1123 §6.1.3.2).
 - **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
   §11 requires of a implementation, but it means RFC 5890 A-labels must be

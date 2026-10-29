@@ -28,8 +28,10 @@ from namespy.__main__ import (
     _normalize_dig_plus_args,
     _parse_qclass,
     _parse_qtype,
+    _report_server_ids,
     build_parser,
 )
+from namespy.edns import nsid_option, serialize_options
 from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Response
@@ -521,3 +523,135 @@ def test_main_sets_log_level_from_flags(monkeypatch, argv, expected):
     monkeypatch.setattr(cli, "serve", fake_serve)
     cli.main(["--serve", *argv])
     assert configured["level"] == expected
+
+
+# ------------------------------------------------ asking servers to identify themselves
+#
+# RFC 5001 section 2.1 makes the request an NSID option carrying no payload,
+# section 6.1 guarantees that a server which does not implement it "will provide a
+# meaningless answer" rather than a broken one, and section 2.4 settles what a user
+# interface may do with what comes back: it "MUST read and write the contents of the
+# NSID option as a sequence of hexadecimal digits, two digits per payload octet".
+# So the flag costs nothing on the way out and cannot lose an answer; the report on
+# the way in is hex, on stderr, because stdout is the answer and ``--short``
+# promises RDATA and nothing beside it.
+
+
+def test_nothing_is_asked_of_the_servers_unless_the_operator_asks():
+    assert () == cli._outbound_options(_args(["example.com"]))
+    assert () == cli._outbound_options(_args(["--serve"]))
+
+
+def test_the_nsid_flag_is_the_empty_option_rfc_5001_asks_for():
+    assert (nsid_option(),) == cli._outbound_options(_args(["--nsid", "example.com"]))
+    assert (nsid_option(),) == cli._outbound_options(_args(["--nsid", "--serve"]))
+
+
+class _ServersThatAnswered:
+    """Just the part of a resolver the report reads: who said what."""
+
+    def __init__(self, identities):
+        self.server_ids = identities
+
+
+def test_server_identifiers_are_reported_as_hex(capsys):
+    _report_server_ids(_ServersThatAnswered({"198.51.100.53": b"ns-a", "2001:db8::1": b"\x00\x01"}))
+
+    err = capsys.readouterr().err
+    assert ";; NSID 198.51.100.53 6e732d61\n" in err
+    assert ";; NSID 2001:db8::1 0001\n" in err
+    assert "ns-a" not in err, "section 2.4: two hex digits per octet, never the bytes"
+
+
+def test_an_identifier_request_met_with_silence_says_so(capsys):
+    """Silence here is the ordinary outcome -- section 6.1 expects it from every
+    server that has not implemented the option -- so it cannot also be what a flag
+    that never took effect looks like."""
+    _report_server_ids(_ServersThatAnswered({}))
+    assert "no server identified itself" in capsys.readouterr().err
+
+
+async def test_the_nsid_flag_reaches_the_resolver_a_query_builds(monkeypatch, capsys):
+    """Parsed is not wired. The endpoint factory hands back the real
+    ``RecursiveResolver``, so this is the attribute an actual lookup would carry
+    into every one of its queries."""
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["--nsid", "example.com"])) == 0
+
+    assert (nsid_option(),) == made[0][1].edns_options
+    assert "no server identified itself" in capsys.readouterr().err
+
+
+async def test_a_plain_lookup_asks_nothing_and_reports_nothing(monkeypatch, capsys):
+    """The default run must stay byte-for-byte boring, stderr included."""
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["example.com"])) == 0
+
+    assert () == made[0][1].edns_options
+    assert "NSID" not in capsys.readouterr().err
+
+
+def _reply_naming_itself():
+    """A response whose OPT carries an NSID payload, as an answering server sends."""
+    return Response(
+        ID=0x1234,
+        QR=1,
+        questions=[DnsQuestion(DomainName("example.com."), DnsQType.A)],
+        additional_records=[
+            DnsRecord(
+                DomainName.root_label(),
+                DnsRType.OPT,
+                1232,
+                0,
+                rdata=serialize_options([nsid_option(b"ns-a")]),
+            )
+        ],
+    )
+
+
+async def test_an_identifier_a_server_handed_back_is_printed_by_the_lookup(monkeypatch, capsys):
+    """The two ends of the feature in one run: the memo the resolver fills from an
+    answer is the one the CLI reports, keyed by the address that answered."""
+
+    async def answered_by_a_talking_server(_query):
+        # Stand in for the reply path, which records the answer per server before
+        # the CLI is ever handed it; the stubbed resolve skips that step.
+        made[0][1]._note_server("198.51.100.53", _reply_naming_itself())
+        return _response_with_opt()
+
+    made = _stub_endpoints(monkeypatch, answered_by_a_talking_server)
+
+    assert await cli.cli_query(_args(["--nsid", "example.com"])) == 0
+
+    err = capsys.readouterr().err
+    assert ";; NSID 198.51.100.53 6e732d61" in err
+
+
+async def test_the_advertised_identifier_reaches_the_server_a_serve_builds(monkeypatch):
+    """The server is the one that decides whether to answer a request -- RFC 5001
+    section 2.2 forbids sending the identifier unasked -- so this is where the flag
+    has to land."""
+    made = []
+
+    async def idle_endpoint(factory, **_kwargs):
+        protocol = factory()
+        made.append(protocol)
+        return _FakeTransport(), protocol
+
+    async def skip_demo(_loop):
+        return None
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
+    )
+    monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+
+    task = asyncio.ensure_future(cli.serve(_args(["--serve", "--advertise-nsid", "ns-a"])))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()
+    assert await task == 0
+
+    assert b"ns-a" == made[-1].nsid, "the resolver endpoint is created before the server's"

@@ -8,6 +8,40 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- EDNS(0) *options* — the code/length/value records that live inside OPT RDATA
+  (RFC 6891 §6.1.2), which until now was written empty and read as an opaque
+  blob. `namespy.edns` carries them; a query can now hold NSID (RFC 5001),
+  COOKIE (RFC 7873) and Padding (RFC 7830), and `--nsid` asks every server the
+  walk touches to say who it is. What comes back is printed as hex, because
+  §2.4 of RFC 5001 asks for two digits per octet — an identifier is meant to be
+  pasted into a report, not recognised on sight — and a query that was asked to
+  identify servers but was met with silence says so, since RFC 5001 §6.1
+  predicts exactly that silence from every server that never implemented the
+  option. A server answers NSID only when the question was actually put to it
+  (§2.2), ignores an identifier a requestor tries to hand it (also §2.2), and
+  `--advertise-nsid` is what gives the demo server one to answer with. Each
+  responder's advertised payload size is now remembered and applied as the
+  ceiling on the next query sent to *that* server (RFC 6891 §6.2.3, §6.2.4):
+  the number is what governs how big a reply it may send without fragmenting
+  the datagram, so offering it more than it asked for bought nothing but a
+  possible fragment. Padding round-trips and names the block it pads, but is
+  never applied to a query on plain UDP — RFC 7830 §6 forbids it there, and
+  there is no encrypted transport in this codebase to apply it over. A
+  misformed option in a *query* is answered FORMERR, and that answer carries an
+  OPT: §6.2.2 counts a FORMERR with no OPT as the signature of a server that
+  does not implement EDNS at all, so a server that does implement it and found
+  the request malformed must not look like one that does not. A cookie option of
+  9 octets is refused the same way, and so is one of 41: RFC 7873 §5.2.2 says "a
+  valid COOKIE option length is 8 octets or 16 to 40 octets", so 9 through 15
+  cannot be a client cookie plus a server cookie of any legal size — accepting
+  one would be validating a nonce the requestor cannot reproduce. An option code
+  this code does not model is ignored instead (§6.1.2), because an experimental
+  code is somebody's deployment choice rather than a defect. A misformed one is
+  not forgiven in either direction: a declared length that runs past the end of
+  the RDATA raises instead of being quietly truncated, which is what lets the
+  server turn it into the FORMERR above.
+  Pinned by `tests/test_edns.py`, the EDNS section of `tests/test_server.py`,
+  and the NSID tests in `tests/test_cli.py`.
 - The demo server is now an EDNS(0) responder (RFC 6891 §6.1.1, §6.1.3, §6.2.4,
   §7). A query that carried an OPT gets one back carrying *this* server's
   payload size — never the one the recursive walk collected, since §6.1.1

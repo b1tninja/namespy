@@ -31,6 +31,7 @@ import logging
 import secrets
 import struct
 
+from .edns import EdnsOption, parse_options, serialize_options
 from .enums import (
     DnsOpCode,
     DnsQClass,
@@ -432,6 +433,30 @@ class DnsPacket:
         record = self.opt()
         return None if record is None else int(record.rclass)
 
+    def edns_options(self) -> tuple[EdnsOption, ...]:
+        """The EDNS(0) options carried by this message's OPT record.
+
+        Empty without an OPT, and empty with an option-less one -- which is the
+        common case, since RFC 6891 section 6.1.2's minimal OPT has no RDATA at
+        all. Order is the order on the wire, because RFC 7873 sections 5.2 and
+        5.3 make "closest to the DNS header" the tie-break for a repeated code.
+
+        Raises :exc:`~namespy.wire.DnsPacketParseError` when an option is
+        malformed. That is a distinguishable failure on purpose: RFC 6891
+        section 7 answers a badly formatted option with FORMERR *carrying an
+        OPT*, which is a different response from the one a parse failure
+        anywhere else in the message earns.
+        """
+        record = self.opt()
+        return () if record is None else parse_options(bytes(record.rdata))
+
+    def edns_option(self, code: int) -> EdnsOption | None:
+        """The first option with ``code``, or ``None`` -- see :meth:`edns_options`."""
+        for option in self.edns_options():
+            if option.code == code:
+                return option
+        return None
+
     @property
     def edns_version(self) -> int | None:
         """OPT's VERSION octet (RFC 6891 section 6.1.3), or ``None``.
@@ -447,7 +472,14 @@ class DnsPacket:
     #: equal to 512."
     EDNS_MINIMUM_PAYLOAD = 512
 
-    def add_edns(self, payload_size: int = 1232, *, version: int = 0, flags: int = 0):
+    def add_edns(
+        self,
+        payload_size: int = 1232,
+        *,
+        version: int = 0,
+        flags: int = 0,
+        options=(),
+    ):
         """Attach an EDNS(0) OPT record, replacing any previous one.
 
         The pseudo-record (RFC 6891 section 6.1.2) is deliberately minimal:
@@ -459,6 +491,12 @@ class DnsPacket:
         wire, the whole price of lifting the 512-octet answer ceiling of RFC
         1035 section 4.2.1.
 
+        *options* is where that RDATA stops being empty: an iterable of
+        :class:`~namespy.edns.EdnsOption`, serialised in the order given.
+        RFC 6891 puts no order on them, so the order supplied is the order
+        written -- which matters for the one code that cares, since RFC 7873
+        sections 5.2 and 5.3 count only the COOKIE option nearest the header.
+
         *payload_size* is clamped up to 512 per section 6.2.3; the caller —
         not this method — owns the opposite duty, not to advertise more than
         its stack can actually reassemble.
@@ -469,12 +507,15 @@ class DnsPacket:
         """
         payload_size = max(self.EDNS_MINIMUM_PAYLOAD, int(payload_size))
         ttl = ((int(version) & 0xFF) << 16) | (int(flags) & 0xFFFF)
+        rdata = serialize_options(options)
         # Rebuild rather than mutate the list in place: the constructor may
         # have been handed a list the caller still holds.
         self.additional_records = [
             record for record in self.additional_records if int(record.rtype) != OPT_RTYPE
         ]
-        self.additional_records.append(DnsRecord(DomainName("."), OPT_RTYPE, payload_size, ttl))
+        self.additional_records.append(
+            DnsRecord(DomainName("."), OPT_RTYPE, payload_size, ttl, rdata=rdata)
+        )
         self.ARCOUNT = len(self.additional_records)
         return self
 

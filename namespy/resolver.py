@@ -61,6 +61,7 @@ from typing import NamedTuple
 
 from . import enable_path_mtu_discovery
 from .cache import MemoryDnsCache, NegativeEntry, PositiveEntry
+from .edns import nsid_of, nsid_presentation
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .minimis import QnameMinimiser
 from .names import DomainName
@@ -179,6 +180,16 @@ class Resolver(asyncio.Protocol):
     #: query (RFC 6891 section 6.2.3); ``0`` or ``None`` sends no OPT at all.
     edns_payload_size = EDNS_PAYLOAD_SIZE
 
+    #: EDNS(0) options to attach to the OPT record of every outbound query --
+    #: :class:`~namespy.edns.EdnsOption` instances, or ``(code, value)`` pairs.
+    #: Asking for a Name Server Identifier (RFC 5001) is the intended use: an
+    #: empty :attr:`~namespy.edns.OPTION_NSID` option asks every server to
+    #: identify itself, and its answer is logged and recorded in
+    #: :attr:`server_ids`. Section 6 of that RFC makes silence the normal
+    #: outcome -- a server that does not implement the option simply omits it,
+    #: so asking is free.
+    edns_options = ()
+
     #: Which volunteered glue the classifier believes; see :class:`GluePolicy`.
     #: The safe member is also the class default, so a driver that never sets
     #: it -- and a test that builds a bare ``Resolver()`` -- filters strictly.
@@ -217,7 +228,7 @@ class Resolver(asyncio.Protocol):
             # selectively, so the responder never has to guess and the
             # 512-octet truncation regime becomes the fallback rather than
             # the default.
-            dns_packet.add_edns(self.edns_payload_size)
+            dns_packet.add_edns(self._advertised_payload(ip), options=self.edns_options)
         # RFC 7766 section 6 / RFC 5936: AXFR is a TCP-only operation, and a UDP
         # attempt would be answered with a truncated or refused reply rather
         # than a zone transfer.
@@ -272,6 +283,8 @@ class Resolver(asyncio.Protocol):
             queue[key] = (dns_packet, future)
             transport.sendto(bytes(dns_packet), sendto_addr)
             response = await self._await_udp(future, key, dns_packet, ip, queue=queue)
+            if response is not None:
+                self._note_server(ip, response)
             if response is None or attempt == 2 or not self._edns_rejected(dns_packet, response):
                 return response
             dns_packet.remove_edns()
@@ -280,6 +293,120 @@ class Resolver(asyncio.Protocol):
         # future edit that might otherwise let a fall-through return a future
         # that was never resolved.
         return None
+
+    #: Cap on the per-server EDNS memos (advertised payload size, NSID). A
+    #: resolver walking the delegation tree touches a lot of addresses, and
+    #: these are convenience notes rather than state anything depends on: once
+    #: a memo reaches a thousand servers, the oldest entries have long stopped
+    #: describing a path anyone is still taking.
+    _SERVER_MEMO_MAX = 1024
+
+    def _advertised_payload(self, ip) -> int:
+        """The UDP payload size to advertise to *ip* on this query.
+
+        Starts from :attr:`edns_payload_size` and shrinks it to whatever this
+        server has yet said it can receive -- RFC 6891 section 6.2.3 tells a
+        requestor to use "their largest configured or implemented values ...
+        in the absence of previous knowledge about the destination server",
+        which is an instruction to use the smaller number once that knowledge
+        exists, and section 6.2.4 treats a responder's advertised size as
+        stable enough to be re-used across closely spaced transactions.
+        Advertising more than the server will accept buys nothing: it invites
+        IP fragmentation, which is the one failure mode section 6.2.3 warns
+        "can cause fallback to occur".
+
+        The floor of 512 is applied by :meth:`DnsPacket.add_edns`, so a server
+        that advertises something absurd still gets a legal OPT record.
+        """
+        ours = int(self.edns_payload_size)
+        if not ours:
+            return 0
+        known = getattr(self, "_payload_by_server", None)
+        if not known:
+            return ours
+        theirs = known.get(str(ip))
+        return ours if theirs is None else min(ours, theirs)
+
+    def _note_server(self, ip, response) -> None:
+        """Record what this answer says about the server that sent it.
+
+        Two things are worth remembering, both learned from the OPT record of
+        an extended answer and both keyed by the address we sent to:
+
+        * its advertised UDP payload size (RFC 6891 section 6.2.4), which
+          :meth:`_advertised_payload` will honour on the next query;
+        * its Name Server Identifier, if we asked for one and it answered
+          (RFC 5001 section 4) -- which is how a resolver tracking an ancast
+          set or an overloaded pool learns *which* machine replied.
+
+        An answer without an OPT record teaches nothing and changes nothing: a
+        server that has fallen back to unextended DNS is still perfectly able
+        to receive an EDNS query, and the next one simply re-advertises our
+        full size.
+        """
+        advertised = response.requestor_payload_size
+        if advertised is not None:
+            # Section 6.2.3: "Values lower than 512 MUST be treated as equal
+            # to 512." The responder's number is held to the same reading.
+            memo = self._server_memo("_payload_by_server")
+            if len(memo) >= self._SERVER_MEMO_MAX:
+                memo.clear()
+            memo[str(ip)] = max(DnsPacket.EDNS_MINIMUM_PAYLOAD, int(advertised))
+
+        # A malformed option in a *response* is the server's problem, not
+        # ours: NSID is what we asked for, so the answer is to ignore it and
+        # carry on rather than to fail a lookup that has already succeeded.
+        try:
+            nsid = nsid_of(response.edns_options())
+        except DnsPacketParseError:
+            self.log.debug("resolver_nsid_unparsable(src=%s)", ip)
+            return
+        if nsid is None:
+            return
+        memo = self._server_memo("_server_ids")
+        if len(memo) >= self._SERVER_MEMO_MAX:
+            memo.clear()
+        if memo.get(str(ip)) != nsid:
+            self.log.info("resolver_server_id(dst=%s nsid=%s)", ip, nsid_presentation(nsid))
+        memo[str(ip)] = nsid
+
+    def _server_memo(self, attr: str) -> dict:
+        """The per-server memo named *attr*, created on first use.
+
+        Created lazily rather than in ``__init__`` because :class:`Resolver`
+        is an :class:`asyncio.Protocol` that tests and callers construct
+        without arguments, and because a memo defined as a *class* attribute
+        would be a single dict shared by every resolver in the process -- one
+        resolver would silently inherit what another had learned.
+        """
+        memo = getattr(self, attr, None)
+        if memo is None:
+            memo = self.__dict__[attr] = {}
+        return memo
+
+    @property
+    def server_ids(self) -> dict:
+        """Which server answered each way, keyed by the address queried.
+
+        Populated only when NSID was asked for -- see :attr:`edns_options` --
+        because a server that has not been invited to identify itself is
+        entitled to stay anonymous (RFC 5001 section 2.2). Values are the raw
+        octets; :func:`~namespy.edns.nsid_presentation` renders them in the
+        hex form section 2.4 requires of any display. A copy is returned: what
+        the resolver remembers is its own, and a caller that wants a running
+        tally should keep one.
+        """
+        return dict(self._server_memo("_server_ids"))
+
+    @property
+    def server_payload_sizes(self) -> dict:
+        """The UDP payload size each server last advertised (RFC 6891, 6.2.4).
+
+        Read this to see what the network will actually carry: a server that
+        answers with 512 gets 512 asked of it from here on, which is the
+        difference between re-probing a path and learning about it once.
+        """
+        return dict(self._server_memo("_payload_by_server"))
 
     @staticmethod
     def _edns_rejected(dns_packet, response) -> bool:
@@ -1731,6 +1858,7 @@ class RecursiveResolver(Resolver):
         max_alias_hops: int = MAX_ALIAS_HOPS,
         query_timeout: float = QUERY_TIMEOUT_S,
         edns_payload_size: int | None = EDNS_PAYLOAD_SIZE,
+        edns_options: Sequence = (),
         qname_min: bool = False,
         glue_policy: GluePolicy = GluePolicy.STRICT,
     ):
@@ -1749,6 +1877,13 @@ class RecursiveResolver(Resolver):
             occasionally wanted against ossified infrastructure, though the
             section 6.2.2 fallback already handles the servers that would
             otherwise need it.
+        :param edns_options: EDNS(0) options to send on every outbound query,
+            as :class:`~namespy.edns.EdnsOption` instances or ``(code, value)``
+            pairs. Asking for a Name Server Identifier -- ``edns_options=(
+            nsid_option(),)`` -- makes each server say which instance of itself
+            answered, and its reply is logged at INFO and kept in
+            :attr:`server_ids`. An empty tuple, the default, sends the same
+            bare OPT record this resolver has always sent.
         :param qname_min: enable QNAME minimisation (RFC 9156): servers not
             known to be authoritative for the full QNAME are probed with
             progressively deeper children instead of being handed the whole
@@ -1778,6 +1913,10 @@ class RecursiveResolver(Resolver):
         self.max_alias_hops = max(1, int(max_alias_hops))
         self.query_timeout = max(0.05, float(query_timeout))
         self.edns_payload_size = 0 if edns_payload_size is None else max(0, int(edns_payload_size))
+        # Frozen into a tuple: the value is read once per outbound query and a
+        # caller who mutates the list they passed in would otherwise be
+        # changing the wire format of queries already in flight.
+        self.edns_options = tuple(edns_options)
         self.qname_min = bool(qname_min)
         # Coerce here, at the door: GluePolicy("permissive") and
         # GluePolicy.PERMISSIVE both arrive, and anything else raises now rather

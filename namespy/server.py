@@ -23,23 +23,53 @@ limit and hides the upper eight bits of any RCODE above 15, so
 numbers -- and sends none at all to a requestor that never asked, which RFC
 6891 section 7 makes the correct answer rather than an oversight.
 
+Options inside that OPT are handled by the same rule, applied in two
+directions. This server answers a query whose option it does not understand by
+ignoring it -- "Any OPTION-CODE values not understood by a responder or
+requestor MUST be silently ignored" (section 6.1.2) -- and answers one whose
+option is *misformed* with FORMERR, because section 7 asks for exactly that and
+insists the error response still carry an OPT, so a requestor can tell "this
+server has EDNS and disliked what you sent" from "this server has no EDNS". The
+one option it implements is NSID (RFC 5001): an identity string configured at
+construction, returned only to a query that asked for it, never invented on its
+own. Padding (RFC 7830) is deliberately *not* honoured here: section 4 says a
+responder must pad when asked, section 6 says an implementation must not use
+the option over an unencrypted transport, and this server's transport is plain
+UDP -- the second MUST is the one that can be obeyed without lying about the
+encryption, so padding is dropped and the reply stays its natural size.
+
 .. rubric:: References
 
 * RFC 1035 section 4.1.1 (header), section 4.3 (server behaviour)
+* RFC 5001 section 2.2 (send NSID only when it was asked for, ignore any
+  payload the requestor put in the request form of the option)
 * RFC 5358 section 3 (why a recursing server is an amplification instrument),
   section 4 (BCP 140: give recursive service to intended clients only)
 * RFC 5625 section 6.2 (do not listen on interfaces you do not control), section
   6.3 (intrinsically malformed traffic MAY be dropped rather than answered)
 * RFC 6891 section 6.1.1 (one OPT per message, OPT is never forwarded, an OPT
-  request must be answered with an OPT), section 6.1.3 (BADVERS for a VERSION
-  this server does not implement), section 7 (an OPT-free request must be
-  answered without OPT)
+  request must be answered with an OPT), section 6.1.2 (option format; unknown
+  codes must be ignored), section 6.1.3 (BADVERS for a VERSION this server does
+  not implement), section 7 (an OPT-free request must be answered without OPT;
+  an option that is badly formatted or out of range must be answered FORMERR,
+  with an OPT)
+* RFC 7830 sections 4, 6 (a responder must pad when asked -- and must not use
+  the option at all on an unencrypted transport, which plain UDP is)
+* RFC 7873 section 5.2 (COOKIE lengths, and the FORMERR for an illegal one)
 """
 
 import asyncio
 import logging
 
 from . import enable_path_mtu_discovery
+from .edns import (
+    COOKIE_OPTION_CODE,
+    NSID_OPTION_CODE,
+    EdnsOption,
+    cookie_length_valid,
+    find_option,
+    nsid_of,
+)
 from .enums import DnsOpCode, DnsQR, DnsResponseCode
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, Response
 from .resolver import EDNS_PAYLOAD_SIZE, RecursiveResolver
@@ -81,12 +111,33 @@ class DnsServer(asyncio.Protocol):
     :param max_concurrent_lookups: cap on outstanding recursive lookups.
     """
 
-    def __init__(self, resolver, max_concurrent_lookups: int = MAX_CONCURRENT_LOOKUPS):
+    def __init__(
+        self,
+        resolver,
+        max_concurrent_lookups: int = MAX_CONCURRENT_LOOKUPS,
+        nsid=None,
+    ):
+        """
+        :param nsid: the RFC 5001 name-server identifier to advertise when a
+            query asks for it — :class:`bytes`, or text to be encoded as UTF-8,
+            or :const:`None` for a server that never sends the option.
+
+            Opaque on the wire, and it should stay that way: RFC 5001 section 2
+            wants it to identify "the instance of the name server", which is why
+            a hostname or a rack name is the usual answer and why nothing here
+            tries to parse it. Leaving it unset is the conservative default --
+            section 2.2 forbids sending the option unasked, and a server with no
+            identity to declare has nothing to leak about which machine in a
+            anycast set answered.
+        """
         if not isinstance(resolver, RecursiveResolver):
             raise TypeError(f"resolver must be a RecursiveResolver, got {type(resolver).__name__}")
         self.resolver = resolver
         self.log = LOGGER
         self.max_concurrent_lookups = max(1, int(max_concurrent_lookups))
+        if isinstance(nsid, str):
+            nsid = nsid.encode("utf-8")
+        self.nsid = None if nsid is None else bytes(nsid)
         # asyncio holds only a weak reference to a task, so a task created here
         # without being stored can be collected before it finishes.
         self._tasks: set[asyncio.Task] = set()
@@ -186,12 +237,82 @@ class DnsServer(asyncio.Protocol):
                 self.log.debug("server_unextended_rcode_downgrade(rcode=%s)", intended)
                 response.RCODE = int(DnsResponseCode.SERVER_FAILURE)
             return
-        response.add_edns(RESPONDER_PAYLOAD_SIZE, version=EDNS_VERSION_SUPPORTED)
+        response.add_edns(
+            RESPONDER_PAYLOAD_SIZE,
+            version=EDNS_VERSION_SUPPORTED,
+            options=self._reply_options(request),
+        )
         if intended > MAX_UNEXTENDED_RCODE:
             # Put the effective code back where the dropped OPT used to keep it.
             # Serialisation splits it again -- header nibble here, upper eight
             # in the record we just added (RFC 6891 section 6.1.3).
             response.RCODE = intended
+
+    def _reply_options(self, request) -> list:
+        """The options this server puts in its own OPT for this request.
+
+        Only NSID, and only when it was asked for. RFC 5001 section 2.2 is
+        unambiguous in both directions: "A name server MUST NOT send an NSID
+        option back to a resolver which did not request it", and "The name
+        server MUST ignore any NSID payload data that might be present in the
+        query message" -- so the *presence* of the option is the request, and
+        whatever the client put in it is discarded rather than echoed.
+
+        Everything else the query carried is dropped on the floor, which is the
+        documented treatment of an option a responder has no behaviour for
+        ("Any OPTION-CODE values not understood by a responder or requestor MUST
+        be silently ignored", RFC 6891 section 6.1.2). Padding is the interesting
+        case, because here the code *is* understood and the answer is still no:
+        RFC 7830 section 4 makes padding a MUST for a responder that is asked,
+        while section 6 forbids the option outright on a transport that is not
+        encrypted. This server's transport is plain UDP, so honouring section 4
+        would mean obeying one MUST by breaking another; section 6 is the
+        sentence that speaks to the situation this server is actually in, and it
+        is the one kept. A future DNS-over-TLS front end is where padding belongs.
+        """
+        options = []
+        try:
+            asked = nsid_of(request.edns_options()) if request is not None else None
+        except DnsPacketParseError:
+            # Already refused upstream by `_edns_options_or_error`, but the reply
+            # to that refusal comes through here, and section 7 requires that
+            # reply to carry an OPT -- so a second reading of the same broken
+            # option has to answer "nothing asked for", not raise.
+            asked = None
+        if self.nsid is not None and asked is not None:
+            options.append(EdnsOption(NSID_OPTION_CODE, self.nsid))
+        return options
+
+    def _edns_options_or_error(self, dns_packet, addr) -> bool:
+        """Whether ``dns_packet``'s options survive a first reading.
+
+        RFC 6891 section 7: "If there is a problem with processing the OPT
+        record itself, such as an option value that is badly formatted or that
+        includes out-of-range values, a FORMERR MUST be returned. If this
+        occurs, the response MUST include an OPT record." The second sentence is
+        why this cannot be folded into the generic parse failure path -- that
+        one answers with no OPT at all, which would tell the requestor this
+        server has no EDNS rather than that it disliked the option it read.
+
+        The only lengths checked are COOKIE's, because it is the only modelled
+        option with a length rule to break: RFC 7873 section 5.2.2 allows 8
+        octets or 16 to 40 and nothing else. NSID is opaque and any length is
+        legal, and an unregistered code is not evaluated at all -- section
+        6.1.2's "silently ignored" covers its payload too, so refusing a
+        private-code option for its contents would be inventing a rule.
+        """
+        try:
+            options = dns_packet.edns_options()
+        except DnsPacketParseError as exc:
+            self.log.debug("server_bad_edns_option(src=%s err=%s)", addr[0], exc)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            return False
+        cookie = find_option(options, COOKIE_OPTION_CODE)
+        if cookie is not None and not cookie_length_valid(len(cookie.data)):
+            self.log.debug("server_bad_cookie_length(src=%s length=%s)", addr[0], len(cookie.data))
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            return False
+        return True
 
     async def respond_to_packet(self, dns_packet, addr):
         if DnsQR.QUERY != dns_packet.QR:
@@ -230,6 +351,15 @@ class DnsServer(asyncio.Protocol):
             # tells the requestor how far down this server actually goes.
             self.log.debug("server_edns_version(src=%s:%s version=%s)", addr[0], addr[1], version)
             self._error(dns_packet, addr, DnsResponseCode.BADVERS)
+            return
+
+        if not self._edns_options_or_error(dns_packet, addr):
+            # Options belong to the OPT, so they are judged with it: after the
+            # version check, because options defined for a VERSION this server
+            # does not implement cannot be interpreted at all, and before the
+            # resolver is touched, because a datagram that cannot be answered
+            # should not purchase a recursive walk. A request with no OPT has
+            # no options to judge and passes straight through.
             return
 
         async with self._slots:
