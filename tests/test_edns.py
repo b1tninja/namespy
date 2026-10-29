@@ -198,8 +198,9 @@ def test_query_carries_an_edns0_opt_record() -> None:
 
 
 def test_add_edns_replaces_rather_than_stacks() -> None:
-    # RFC 6891 section 6.1.1: "At most one OPT RR MUST occur in a message";
-    # a second advertisement must swap the first, not join it.
+    # RFC 6891 section 6.1.1: "When an OPT RR is included within any DNS message,
+    # it MUST be the only OPT RR in that message"; a second advertisement must
+    # swap the first, not join it.
     query = Query().add_edns(1232).add_edns(512)
     assert 1 == len([r for r in query.additional_records if int(r.rtype) == 41])
     assert 512 == query.requestor_payload_size

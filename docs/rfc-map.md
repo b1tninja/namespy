@@ -153,10 +153,10 @@ RFC 2308 §5 would have us cache a NODATA against the zone SOA, so one malformed
 alias set would hide a live name for the length of the zone's MINIMUM.
 
 DNAME (RFC 6672) is handled in the same walk: a DNAME at or above QNAME
-redirects the whole subtree, and the synthesized name is QNAME's labels below
-the owner prepended to the DNAME's target (§2.3). The owner itself is never
-redirected — §2.3 says "the owner name of a DNAME RR is not redirected itself"
-— so the enclosing-owner scan uses the strict subdomain test
+redirects the whole subtree, and the substitution replaces the suffix labels of
+QNAME that match the owner with the labels in the DNAME's RDATA (§2.2). The
+owner itself is never redirected — §2.3 says "the owner name of a DNAME is not
+redirected itself" — so the enclosing-owner scan uses the strict subdomain test
 (`is_subdomain_of(owner, include_self=False)`).
 
 ## 7. Glueless delegation (§5.3.3 step 2 priorities)
