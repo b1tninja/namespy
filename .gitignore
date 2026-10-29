@@ -44,3 +44,11 @@ htmlcov/
 *.pcap
 *.cap
 
+# Where this session puts patches, junit dumps, candidate commit messages and
+# one-off scripts. Untracked by design, and ignored rather than merely left
+# alone: `ruff check .` honours this file, so an unignored scratch directory
+# made a clean tree report findings that no CI job can ever see. Safe to ignore
+# packaging-wise because the wheel lists its contents explicitly (pyproject
+# `packages` / `artifacts`) rather than inheriting them from here.
+.artifacts/
+
