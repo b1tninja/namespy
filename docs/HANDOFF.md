@@ -129,8 +129,11 @@ cd D:\code\namespy
 
 ## Known gaps (deliberate, documented in README/CHANGELOG)
 
-- ~~EDNS(0) on outbound queries~~ — shipped (f15b751). Remaining EDNS work
-  is options TLV + per-server payload adaptation (roadmap P1).
+- ~~EDNS(0) on outbound queries~~ — shipped (f15b751), and so are its option
+  TLVs and the per-server payload sizes that travel with them. The roadmap's P1
+  is now RFC 9520: caching a resolution failure, so a dead zone stops being
+  re-queried by every name beneath it. See the P1 row of
+  [`docs/roadmap.md`](roadmap.md).
 - QNAME minimisation: shipped opt-in (`qname_min` / `--qname-min`); the
   default-off is deliberate. serve-stale (RFC 8767), DNSSEC validation
   (RFC 4033/4034/4035), IDN/punycode (RFC 5891), DoT/DoH (RFC 7858/8484)

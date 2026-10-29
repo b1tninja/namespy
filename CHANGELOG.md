@@ -15,9 +15,10 @@ nothing has been tagged or published yet, so `master` is the only version.
   walk touches to say who it is. What comes back is printed as hex, because
   §2.4 of RFC 5001 asks for two digits per octet — an identifier is meant to be
   pasted into a report, not recognised on sight — and a query that was asked to
-  identify servers but was met with silence says so, since RFC 5001 §6.1
-  predicts exactly that silence from every server that never implemented the
-  option. A server answers NSID only when the question was actually put to it
+  identify servers but was met with silence says so, since RFC 6891 §6.1.2
+  requires that an option code a responder does not understand be ignored, and a
+  server that never implemented the option is exactly that responder. A
+  server answers NSID only when the question was actually put to it
   (§2.2), ignores an identifier a requestor tries to hand it (also §2.2), and
   `--advertise-nsid` is what gives the demo server one to answer with. Each
   responder's advertised payload size is now remembered and applied as the
@@ -28,12 +29,14 @@ nothing has been tagged or published yet, so `master` is the only version.
   never applied to a query on plain UDP — RFC 7830 §6 forbids it there, and
   there is no encrypted transport in this codebase to apply it over. A
   misformed option in a *query* is answered FORMERR, and that answer carries an
-  OPT: §6.2.2 counts a FORMERR with no OPT as the signature of a server that
-  does not implement EDNS at all, so a server that does implement it and found
-  the request malformed must not look like one that does not. A cookie option of
-  9 octets is refused the same way, and so is one of 41: RFC 7873 §5.2.2 says "a
-  valid COOKIE option length is 8 octets or 16 to 40 octets", so 9 through 15
-  cannot be a client cookie plus a server cookie of any legal size — accepting
+  OPT: §7 requires it, because "the response MUST include an OPT record" when the
+  failure was in the OPT itself — "to allow the requestor to distinguish between
+  servers that do not implement EDNS and format errors within EDNS". A server
+  that does implement EDNS and found the request malformed must not look like one
+  that does not. A cookie option of 9 octets is refused the same way, and so is
+  one of 41: RFC 7873 §5.2.2 says "valid cookie lengths are 8 and 16 to 40
+  inclusive", so 9 through 15 cannot be a client cookie plus a server cookie of
+  any legal size — accepting
   one would be validating a nonce the requestor cannot reproduce. An option code
   this code does not model is ignored instead (§6.1.2), because an experimental
   code is somebody's deployment choice rather than a defect. A misformed one is

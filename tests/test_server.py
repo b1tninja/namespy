@@ -597,12 +597,14 @@ async def test_a_cookie_of_an_undreamt_of_length_is_refused_before_the_walk(
 
 
 async def test_padding_asked_for_over_plain_udp_is_not_honoured() -> None:
-    """RFC 7830 section 4 tells a responder that "MUST add a PADDING Option" when
-    asked, and section 6 tells an implementation that it "MUST NOT use this option
-    if the DNS transport is not encrypted". This server's transport is UDP, so
-    section 4 could only be obeyed by breaking section 6, and the sentence about
-    encryption is the one that describes the situation this server is in. Refusing
-    the padding must not cost the client the rest of its options."""
+    """RFC 7830 section 4: "Responders MUST pad DNS responses when the respective
+    DNS query included the 'Padding' option, unless doing so would violate the
+    maximum UDP payload size." Section 6 then withdraws the option: implementations
+    "MUST NOT use this option if the DNS transport is not encrypted". This server's
+    transport is UDP, so section 4 could only be obeyed by breaking section 6, and
+    the sentence about encryption is the one that describes the situation this
+    server is in. Refusing the padding must not cost the client the rest of its
+    options."""
     server, resolver, transport = make_server(nsid=b"ns-a")
     await answer_with(resolver, stub_reply)
 

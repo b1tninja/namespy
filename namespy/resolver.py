@@ -336,7 +336,7 @@ class Resolver(asyncio.Protocol):
         * its advertised UDP payload size (RFC 6891 section 6.2.4), which
           :meth:`_advertised_payload` will honour on the next query;
         * its Name Server Identifier, if we asked for one and it answered
-          (RFC 5001 section 4) -- which is how a resolver tracking an ancast
+          (RFC 5001 section 1) -- which is how a resolver tracking an anycast
           set or an overloaded pool learns *which* machine replied.
 
         An answer without an OPT record teaches nothing and changes nothing: a

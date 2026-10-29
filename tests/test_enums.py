@@ -11,7 +11,7 @@ the query-only pseudo-types must exist nowhere else.
 .. rubric:: References
 
 * RFC 1035 section 3.2.3 (QTYPE/QCLASS wildcards), section 6 (``AXFR``)
-* RFC 6891 section 6.1.3 (extended RCODE), section 6.3 (``OPT`` is not stored)
+* RFC 6891 section 6.1.3 (extended RCODE), section 6.1.1 (``OPT`` is not stored)
 * RFC 3597 section 3 (unknown types must not be treated as errors)
 """
 
@@ -56,7 +56,9 @@ def test_opt_is_in_the_type_space_but_is_pseudo_data() -> None:
 
     IANA lists 41 in the RR TYPEs registry with a pseudo-record annotation, so a
     receiver has to recognise it -- :meth:`namespy.packet.DnsPacket.opt` cannot
-    work otherwise. RFC 6891 section 6.3 then forbids storing it, which is why it
+    work otherwise. RFC 6891 section 6.1.1 then forbids storing it ("OPT RRs
+    MUST NOT be cached, forwarded, or stored in or loaded from master files"),
+    which is why it
     is excluded from the cache key path rather than from the enum.
     """
     assert int(DnsQType.OPT) == 41

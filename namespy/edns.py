@@ -98,10 +98,12 @@ NSID_OPTION_CODE = 3
 #: OPTION-CODE 10, "DNS Cookie" (RFC 7873 section 8).
 COOKIE_OPTION_CODE = 10
 
-#: OPTION-CODE 12, "EDNS Padding" (RFC 7830 section 5).
+#: OPTION-CODE 12, "EDNS Padding" (RFC 7830 section 3 assigns it; section 5 is
+#: the IANA record).
 PADDING_OPTION_CODE = 12
 
-#: The Client Cookie is always this long (RFC 7873 section 5.1).
+#: The Client Cookie is always this long (RFC 7873 section 4, Figure 1: "Client
+#: Cookie (fixed size, 8 bytes)").
 COOKIE_CLIENT_OCTETS = 8
 
 #: Smallest legal COOKIE option: a Client Cookie alone, the form a client sends
@@ -109,7 +111,7 @@ COOKIE_CLIENT_OCTETS = 8
 COOKIE_MIN_OCTETS = COOKIE_CLIENT_OCTETS
 
 #: A Client Cookie plus the smallest possible Server Cookie (RFC 7873
-#: section 5.1).
+#: section 4, Figure 2 -- the Server Cookie is "variable size, 8 to 32 bytes").
 COOKIE_MIN_SERVER_TOTAL_OCTETS = COOKIE_CLIENT_OCTETS + 8
 
 #: A Client Cookie plus the largest Server Cookie, and so the largest COOKIE
@@ -278,8 +280,8 @@ def nsid_presentation(data: bytes) -> str:
 def cookie_length_valid(length: int) -> bool:
     """Whether a COOKIE option of ``length`` octets is legal.
 
-    RFC 7873 section 5.2.2: "a valid COOKIE option length is 8 octets or 16 to
-    40 octets". Eight is a Client Cookie with no Server Cookie -- the bootstrap
+    RFC 7873 section 5.2.2: "In summary, valid cookie lengths are 8 and 16 to 40
+    inclusive." Eight is a Client Cookie with no Server Cookie -- the bootstrap
     case -- and the 16-to-40 band is that plus a Server Cookie of 8 to 32.
     Anything else is out of range, and RFC 6891 section 7 wants FORMERR for an
     option value "that includes out-of-range values".
@@ -290,7 +292,8 @@ def cookie_length_valid(length: int) -> bool:
 
 
 def client_cookie_of(data: bytes) -> bytes:
-    """The Client Cookie part of a COOKIE option's data (RFC 7873 section 5.1)."""
+    """The Client Cookie part of a COOKIE option's data (RFC 7873 section 4,
+    Figure 1: the option always opens with eight octets of it)."""
     return data[:COOKIE_CLIENT_OCTETS]
 
 
@@ -302,9 +305,10 @@ def server_cookie_of(data: bytes) -> bytes:
 def pad_option(size: int) -> EdnsOption:
     """A PADDING option of ``size`` octets, all zero.
 
-    RFC 7830 section 3: "The value of the 'Padding' option SHOULD consist of
-    zero-valued (0x00) octets" -- other octets still parse, they just make the
-    packet less compressible, which is the opposite of what padding is for.
+    RFC 7830 section 3: "The PADDING octets SHOULD be set to 0x00." Other values
+    MAY be used -- and "PADDING octets of any value MUST be accepted in the
+    messages received" -- but non-zero octets are the case the RFC reserves for
+    worrying about compression before encryption, which is not this problem.
 
     Reach for this on an encrypted transport. Section 6: "implementations MUST
     NOT use this option if the DNS transport is not encrypted", because padding

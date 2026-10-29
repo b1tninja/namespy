@@ -265,7 +265,7 @@ def test_badvers_round_trips() -> None:
     parsed, _ = DnsPacket.parse(bytes(response))
     assert 16 == parsed.extended_rcode
     # The wire form splits the effective code: the header carries only the
-    # low nibble (RFC 6891 section 6.1.2 -- that is why 16 needs EDNS at
+    # low nibble (RFC 6891 section 6.1.3 -- that is why 16 needs EDNS at
     # all); extended_rcode above is the value that survives reassembly.
     assert DnsResponseCode.NO_ERROR == parsed.RCODE
     assert 0 == parsed.edns_version
@@ -508,9 +508,9 @@ async def test_configured_options_go_out_on_every_query() -> None:
 async def test_the_resolver_remembers_who_answered_and_for_how_much() -> None:
     """Both memos are keyed by the address queried, because that is what the two
     facts describe: RFC 6891 section 6.2.4 makes a responder's advertised size a
-    statement about *that* server's stack, and RFC 5001 section 4 exists so an
-    anycast set can be told apart. A reply with no OPT teaches nothing and must
-    not overwrite what was learned."""
+    statement about *that* server's stack, and RFC 5001 was written so an
+    anycast set can be told apart -- section 1 is that argument. A reply with no
+    OPT teaches nothing and must not overwrite what was learned."""
     resolver = make_resolver(edns_options=(nsid_option(),))
     task, first_query, future = await start_query(resolver)
     reply = answer_for(

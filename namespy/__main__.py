@@ -428,10 +428,11 @@ def _outbound_options(args) -> tuple:
     """The EDNS(0) options to put on every query this run sends.
 
     One option is selectable from the command line, and asking for it is free:
-    RFC 5001 section 6.1 promises that a server which does not implement NSID
-    answers a query carrying it exactly as it would have answered one without
-    it. So this flag cannot lose you an answer; the worst it can do is teach
-    you nothing.
+    RFC 6891 section 6.1.2 requires that "any OPTION-CODE values not understood
+    by a responder or requestor MUST be ignored", so a server that never
+    implemented NSID answers a query carrying it exactly as it would have
+    answered one without it. So this flag cannot lose you an answer; the worst it
+    can do is teach you nothing.
     """
     return (nsid_option(),) if getattr(args, "nsid", False) else ()
 
