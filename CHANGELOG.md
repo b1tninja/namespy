@@ -248,8 +248,11 @@ nothing has been tagged or published yet, so `master` is the only version.
   `MQTYPE_RECOMMENDED_QTX_LIMIT`, which is what both the server's `max_qtypes` and the
   demo server's `--max-qtypes` default to — one constant, so an undecided library and an
   undecided command line cannot disagree about what they got. The knob is a real dial
-  because §4's paragraph is a policy rather than a cap: `None` leaves only §3.1's own
-  127-QTx ceiling, and zero answers the option while buying none of the lookups, which is
+  because §4's paragraph is a policy rather than a cap: `None` leaves only the ceiling an
+  EDNS option has in any case — §3.1 gives OPTION-LENGTH no count field of its own, so
+  the list is bounded by RFC 6891's 16-bit option length, which `EdnsOption` already
+  enforces, and by the UDP payload the query advertises, which runs out far sooner —
+  and zero answers the option while buying none of the lookups, which is
   a refusal of *this much work* and sounds nothing like the silence that means the
   extension is absent. The demo server enforces §3.3 (malformed → FORMERR, with
   an OPT per RFC 6891 §7) and, given a well-formed query, combines: each QTx is resolved

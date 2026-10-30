@@ -214,8 +214,10 @@ A + AAAA + HTTPS trio down the same tree. §4's four-QTx guideline is exported a
 `MQTYPE_RECOMMENDED_QTX_LIMIT`, which is both the default of `DnsServer(max_qtypes=...)`
 and the default of the CLI's `--max-qtypes` — one constant, so the two cannot drift
 about what an undecided operator gets. An operator may raise it, or pass `None` to leave
-§3.1's own cap — the 127 QTx values a one-octet length field permits — as the only bound
-on the list. Zero is worth naming because it is not a smaller version of the same
+the list bounded only by what an EDNS option can hold at all: §3.1 gives OPTION-LENGTH no
+count field of its own, so it is RFC 6891's 16-bit option length (which `EdnsOption`
+enforces) and the advertised UDP payload that cap the list, not any number RFC 10029
+states. Zero is worth naming because it is not a smaller version of the same
 refusal: it answers the option and combines nothing, which is a server declining this
 much work, while silence is a server that cannot do the extension at all. Passing the
 flag is what keeps the CLI honest here — an absent `--max-qtypes` wired through as
