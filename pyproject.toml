@@ -39,6 +39,24 @@ dev = [
   # root hints without first being able to build one.
   "build",
 ]
+# Named for the capability rather than the feature on purpose. DNSSEC validation is
+# what asked for it, but a dependency called "dnssec" would have to be renamed the
+# first time anything else needed arithmetic -- a TLSA association check (RFC 6698)
+# or a signature over anything at all -- and renaming a published extra is a
+# breaking change for every downstream that installed it.
+#
+# The floor is high and deliberately so: the project's own security policy is that
+# "at any given time, we will provide security support for the main branch as well as
+# the most recent release", and it statically links OpenSSL into its wheels, which has
+# produced a recurring class of advisory ("Vulnerable OpenSSL included in cryptography
+# wheels", three in the last two years) whose fix is to upgrade. A floor three years
+# old would be a floor into unsupported code, which is worse than no floor at all.
+#
+# There is no ceiling. An upper bound in an optional extra of a *library* cannot
+# protect anyone -- the application resolves the final set -- and it guarantees
+# conflicts the moment something else in the environment needs a newer line. The
+# newest release is what CI exercises, which is where a breakage would be noticed.
+crypto = ["cryptography>=50.0.2"]
 
 [project.urls]
 Homepage = "https://github.com/b1tninja/namespy"

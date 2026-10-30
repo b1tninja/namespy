@@ -13,7 +13,8 @@
 
 An asyncio DNS library: a wire codec that survives malformed input, an iterative
 resolver that follows RFC 1034 section 5.3.3 literally, and a `dig`-flavoured
-inspector. No runtime dependencies.
+inspector. No runtime dependencies — one optional extra, `namespy[crypto]`, for the
+signature arithmetic DNSSEC validation will need.
 
 - **Python:** 3.12+ · **one name everywhere:** `pip install namespy`,
   `import namespy`, `namespy example.com`
@@ -41,6 +42,12 @@ pip install -e ".[dev]"
 ```
 
 Not published to PyPI yet, so install from the repository.
+
+`pip install -e ".[crypto]"` adds `cryptography`, and only that. It is an extra rather than a
+requirement because the resolver works without it — it answers unauthenticated, which is a
+different failure from not answering — and because `import namespy` must stay dependency-free
+whether or not the extra is present. `namespy.crypto.crypto_available()` reports which
+install you are in; nothing else in the tree is allowed to ask.
 
 ## Try it
 
@@ -152,7 +159,9 @@ them change the security properties of anything built on top.
   DS digest, type bit maps and the NSEC3 hash included (`namespy/dnssec.py`; RFC 4034
   §2–§5, Appendix B, RFC 5155) — that being the half that needs no cryptographic
   dependency. What is missing is the canonical-RRset rule of §6.2, the signatures
-  themselves, and a trust anchor to check them against.
+  themselves, and a trust anchor to check them against. The arithmetic has a home now —
+  the `namespy[crypto]` extra and the probe in `namespy/crypto.py`, which also encodes
+  RFC 9904's table of what a validator must implement — but nothing calls it yet.
 - **EDNS(0) options are partial: NSID, Extended DNS Errors and MQTYPE are put to
   use.**
   Outbound queries advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with

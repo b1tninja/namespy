@@ -319,6 +319,75 @@ on an `assert`. Roadmap §6 gained its proof-record row, §10's 8020 row now nam
 that lets a denial carry its proofs — and only after those, the dependency decision for
 signature verification, which is the one choice here that cannot be undone quietly.
 
+### Follow-up: choosing the cryptographic dependency (and bounding it)
+
+The open decision on the roadmap — "the one choice here that cannot be undone quietly" — is
+taken: **`cryptography`, behind a capability-named `crypto` extra**, with `namespy/crypto.py` as
+the only module permitted to find it. Verification is still not implemented; what landed is the
+boundary and the policy it has to satisfy, so the choice can be reviewed before it is load-bearing.
+
+**Why the extra is called `crypto` and not `dnssec`.** Renaming a published extra breaks every
+downstream that installed the old name, and DNSSEC is not the only thing that will ever want
+arithmetic here — a TLSA association check (RFC 6698) or any future signature work lands in the
+same place. Naming the boundary after its first customer guarantees a breaking change later.
+
+**What the research turned up, so it is not redone.** RFC 9904 Table 2 (Nov 2025) sets "Implement
+for DNSSEC Validation" to MUST for 5, 7, 8, 10 and 13 — including the two SHA-1-based RSA numbers
+RFC 9905 deprecated *for signing*. A validator still has to verify them, because the zones signed
+with them are still out there. That fact alone eliminates every EdDSA-only or modern-only
+candidate, and it is why `IMPLEMENT_FOR_VALIDATION` and `SIGNATURE_ALGORITHMS` are two tables with
+a test checking they agree: the policy is the RFC's, the capability is the library's, and a gap
+between them is something to report to the user rather than a zone to fail on silently.
+
+- **`cryptography` (chosen).** 50.0.2 at this writing; Python Cryptographic Authority under the
+  PSF, published security policy with a 48-hour acknowledgement and support for "the main branch
+  as well as the most recent release". Covers the whole MUST set plus Ed25519/Ed448. abi3 wheels
+  for Windows, macOS, manylinux and musllinux across five architectures, with trusted publishing
+  and provenance attestation on every file; Rust (≥1.83) is needed only to compile from source,
+  and the floor version installed from a wheel on Windows/3.13 with no toolchain at all.
+  Its advisory history is honest reading: of ~19 advisories, three are "Vulnerable OpenSSL
+  included in cryptography wheels" — the recurring cost of statically linking OpenSSL, whose fix
+  is to upgrade, which is why the floor sits at a current release. One High (Feb 2026) is missing
+  subgroup validation for **SECT** curves: unreachable from DNSSEC, since algorithms 13 and 14
+  name P-256 and P-384 (prime-order, cofactor 1) — but the reason our layer, not the library,
+  decides which curve an algorithm number may mean. None of them touch verification itself.
+- **`python-ecdsa` (rejected).** Its own PyPI page says "this library should not be used in
+  production settings", it has no RSA — so it cannot do 5, 7, 8 or 10 — and its releases carry no
+  provenance. Not close.
+- **`pycryptodome` (rejected, with less margin).** Capable and self-contained (own C code, NIST +
+  Wycheproof vectors, blinded constant-time paths, Ed448 present), but single-maintainer and
+  without the governance or provenance posture above. The fallback if `cryptography` ever stops
+  working on a target platform.
+- **`PyNaCl` (rejected on scope).** libsodium has no RSA and no NIST P-256, so the MUST set is
+  unreachable. Its PyPI page would not load during this pass (bot-blocked), so this rests on
+  libsodium's documented feature set rather than a quotation.
+- **Pure Python (rejected).** For RSA the exponentiation is the easy part; the hazard is PKCS#1
+  v1.5 `DigestInfo` parsing, where the historical forgery bugs live, and RFC 3110 §3¶7 states the
+  padding rule in a way that invites a lenient reader ("the FF octet MUST be repeated the maximum
+  number of times such that the value being exponentiated is one octet shorter than n"). Writing
+  that check by hand is the wrong trade against a promise that was always about *weight*, not about
+  never having a dependency.
+
+**The cost, measured here.** A floor constrains other people's environments: this dev box already
+had `ubi-reader`, which caps `cryptography<47`, so it and `namespy[crypto]` cannot coexist. That
+is the price of demanding a supported line, and still cheaper than no floor — which lets pip
+install a release that stopped receiving security fixes. There is no ceiling for the same reason:
+a cap in an optional extra of a library protects nobody and guarantees resolver conflicts.
+
+**Homework the verification leg inherits**, all of it encoding rather than arithmetic: RFC 6605 §4
+gives ECDSA signatures as fixed-width r‖s, not DER, so `decode_dss_signature` /
+`encode_dss_signature` is the bridge (exercised by the new test); a DNSKEY holds an uncompressed
+point with the `0x04` tag removed, and `from_encoded_point` is the constructor to use because it
+refuses an off-curve point with `ValueError("Invalid EC key")` — asserted, not assumed; RFC 8080 §4
+stores EdDSA keys and signatures as raw octets; RFC 3110 §3¶10 permits leading zero bytes in an RSA
+signature field, so the codec must not require it to be exactly the key length; and §2's "1 or 3
+octets" exponent length plus its prohibition on leading zero octets is still unenforced in
+`RData_DNSKEY`, with one verified erratum on RFC 3110 §3 to read first.
+
+**Verified**: `ruff check .` and `ruff format --check .` clean, `mypy namespy` exits 0, and the
+claim that `import namespy` pulls in no third-party module is now proven in a subprocess — the
+only place it can actually be checked.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

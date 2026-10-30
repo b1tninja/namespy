@@ -429,6 +429,45 @@ nothing has been tagged or published yet, so `master` is the only version.
   registered codec, and writing one exposed an RRSIG header format spelled `!HBBIIHI` where
   `!HBBIIIH` is right — same 18 octets, and it read the Key Tag into the Inception Time. The
   field-order test now says so in its docstring.
+- The cryptographic dependency decision, taken and bounded rather than deferred: a
+  `crypto` extra in `pyproject.toml` pointing at `cryptography>=50.0.2`, and
+  `namespy/crypto.py` as the one module allowed to find it. Named for the capability and
+  not for DNSSEC on purpose — a feature-named extra has to be renamed the first time
+  anything else needs arithmetic, and renaming a published extra breaks everyone who
+  installed it. `import namespy` still imports no third-party module at all, which a test
+  now proves in a fresh interpreter rather than asserting about.
+  What the probe carries is the *policy*, not the arithmetic. `IMPLEMENT_FOR_VALIDATION` is
+  RFC 9904 Table 2's "Implement for DNSSEC Validation" column — including the pair that
+  surprises, RSASHA1 (5) and RSASHA1-NSEC3-SHA1 (7), which RFC 9905 deprecated for *signing*
+  while Table 2 keeps them MUST for *validation*, because a resolver that refuses them cannot
+  read the zones still signed with them. `SIGNATURE_ALGORITHMS` pairs each number with its
+  primitive and digest per RFC 3110 / RFC 5702 / RFC 6605 / RFC 8080, and a test asserts the
+  two tables agree: every MUST number has a primitive, and no MUST NOT number sneaks in.
+  `require_backend("verify an RRSIG")` refuses with the exact extra to install, because
+  "no crypto" is a line an operator reads in a log; `MissingCryptoError` is a `RuntimeError`
+  and not an `ImportError` so the resolver can treat it as a policy refusal — answer
+  unauthenticated and say why — rather than a broken install.
+  `MAX_RSA_KEY_BITS` is 4096 (RFC 3110 §2) and marked as not-yet-enforced on purpose: the
+  backend documents "denial of service via parsing untrusted key material" as outside what it
+  treats as a security issue, which is a reasonable line for a general-purpose library and
+  precisely the reason a resolver reading DNSKEYs off the wire needs its own. The marker test
+  moves when the enforcement lands, the way `NxdomainPolicy.VALIDATED` marks validation.
+  **Why this library, in short:** it is the only candidate that covers the whole MUST set in
+  one dependency, is governed by the Python Cryptographic Authority with a published security
+  policy (48-hour acknowledgement; security support for "the main branch as well as the most
+  recent release"), ships abi3 wheels for Windows/macOS/manylinux/musllinux across five
+  architectures with build provenance attested on every file, and documents the three
+  integration points DNSSEC needs — `decode_dss_signature` for the fixed-width r‖s that RFC
+  6605 §4 uses instead of DER, `from_encoded_point` for the tag-stripped point a DNSKEY
+  carries, and raw-byte Ed25519/Ed448 loading per RFC 8080. All three are now exercised by a
+  test in the new CI job, including that an off-curve point is refused rather than trusted.
+  `python-ecdsa` was rejected on its own instruction ("should not be used in production
+  settings") and for having no RSA at all — which leaves it unable to do 5, 7, 8 or 10;
+  `pycryptodome` is capable and self-contained but is a single-maintainer project without the
+  provenance posture; `PyNaCl` has no RSA and no NIST P-256, so it cannot cover the MUST set
+  either. Implementing verification in pure Python was considered for the RSA numbers and
+  rejected: the hazard there is not the modular arithmetic but the PKCS#1 v1.5
+  `DigestInfo` parsing, which is where the historical forgery bugs live.
 
 
 ### Fixed

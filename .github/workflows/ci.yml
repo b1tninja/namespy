@@ -47,6 +47,26 @@ jobs:
       # checker stops being read.
       - run: mypy namespy
 
+  # The optional backend, exercised where it exists. The Test matrix deliberately runs
+  # without it -- that is the configuration most people install, and the no-backend path is
+  # what must stay clean -- so without this job the [crypto] extra would ship untested and
+  # the integration points its verification code will rest on would be assumptions.
+  crypto_extra:
+    name: Crypto extra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      # Resolving the extra is itself the check: it fails if the floor cannot be satisfied
+      # by a wheel on a supported platform, which is the failure mode an optional
+      # dependency has that no unit test can see.
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev,crypto]"
+      - run: python -c "import cryptography, namespy.crypto as c; b=c.require_backend('probe'); print(b.name, b.version)"
+      - run: python -m pytest -q tests/test_crypto_backend.py
+
   test:
     name: Test py${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
