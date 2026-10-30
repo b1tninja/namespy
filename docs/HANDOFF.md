@@ -19,8 +19,8 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 826 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
-| Coverage | 88.9% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
+| Suite | 833 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Coverage | 89% measured with `pytest -q --cov` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
 | Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
@@ -276,6 +276,43 @@ what a walk does with it: the option on the real question and never on a minimis
 the three fallbacks, the cache rules including the one that must never fire, and demotion
 when a server on the path contradicts itself. Twelve more in `tests/test_cli.py` hold the
 flag and its rendering. `bundle.py` is at 100% coverage too.
+
+### Follow-up: the two halves, on one wire
+
+The asking side shipped with every test on one side of the exchange writing the bytes the
+other side read — which proves nothing about whether the two agree. `tests/test_mqtype_interop.py`
+now runs a real `RecursiveResolver` against a real `DnsServer`:
+
+- The splice is at the **transport**, not at `query()`. `_Loopback` replaces the client's
+  socket with a queue; a pump task hands the bytes to `DnsServer.datagram_received` and feeds
+  the reply back through `Resolver.datagram_received` under the *peer address the query went
+  to*. That last part is not a detail: `_pending_key` implements RFC 5452 §9.1 (address + ID +
+  question), so the client's matching discipline is still under test with the wire simulated.
+  Splicing at `query()` instead would have had the test build the packet itself, which means
+  re-implementing the encoder it is supposed to be proving.
+- The server's upstream is stubbed at `resolver.resolve` (the same seam `test_server.py`
+  uses) and the client's whole world is one seeded root, so a bundled lookup is one datagram
+  and a declined one is three — which is what the tests count.
+- **It caught a real defect immediately.** Ten fixtures used `b"\x00\x00\x00\x01"` as HTTPS
+  RDATA: priority 0, target `.`, one stray octet — malformed under RFC 9460 §2.2, which is why
+  the client was discarding an otherwise perfect reply. They survived because those records
+  never went through the wire codec. The lesson is general: a hand-built `DnsRecord` is not a
+  parsed one, and any fixture that claims to hold RDATA should be able to survive
+  `bytes(record)` and come back.
+
+`--trace` gained the visibility the CLI report already had. `SendQuery.extra_qtypes` was
+already on the effect, and the re-ask traces already existed — they were just thrown away when
+`resolve_bundle` restored the bundling descent, so the file showed one descent for a run that
+had sent three. Bundling hops now render as `(mqtype +2)` and each re-ask is a child trace
+(`_walk(..., trace=)`, the same mechanism glue sub-resolution uses). Note the contract the test
+pins: **the child's title is set by `_walk`, not by the caller**, because qualification happens
+inside the walk — a child titled from the caller's relative name would disagree with the
+query on the wire.
+
+Also fixed here: `docs/rfc-map.md` still claimed EDNS(0) was decoded but never sent, and its
+code-mapping table had no row for any of the last four features. When a feature lands, its row
+belongs in that table in the same commit — that document is where a contributor looks to find
+out whether a rule is deliberately absent.
 
 ## Previous round: Extended DNS Errors (RFC 8914)
 

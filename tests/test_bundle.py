@@ -134,7 +134,7 @@ def test_everything_that_was_listed_and_delivered_is_combined():
             answers=[
                 record(QNAME, A, V4.packed),
                 record(QNAME, AAAA, V6.packed),
-                record(QNAME, HTTPS, b"\x00\x00\x00\x01"),
+                record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2"),
             ],
             options=[mqtype_response_option([AAAA, HTTPS])],
         )
@@ -143,7 +143,9 @@ def test_everything_that_was_listed_and_delivered_is_combined():
     assert result.combined == (AAAA, HTTPS)
     assert result.still_needed == ()
     assert result.state_of(AAAA) is BundleState.COMBINED
-    assert [bytes(r.rdata) for r in result.records_for(HTTPS)] == [b"\x00\x00\x00\x01"]
+    assert [bytes(r.rdata) for r in result.records_for(HTTPS)] == [
+        b"\x00\x01\x00\x00\x01\x00\x03\x02h2"
+    ]
     assert result.types[0].qtype == AAAA, "the order the client asked, not the server's"
 
 
@@ -298,7 +300,10 @@ def test_a_type_listed_but_never_asked_is_ignored_not_harvested():
     and it is not harvested, because there is no request for it to answer."""
     result = read(
         combined(
-            answers=[record(QNAME, A, V4.packed), record(QNAME, HTTPS, b"\x00\x00\x00\x01")],
+            answers=[
+                record(QNAME, A, V4.packed),
+                record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2"),
+            ],
             options=[mqtype_response_option([HTTPS, int(DnsQType.TXT)])],
         )
     )
@@ -326,7 +331,7 @@ def test_the_work_list_shrinks_as_the_standalone_queries_land():
     result = read(combined(options=[mqtype_response_option([AAAA])]))
     assert result.still_needed == (HTTPS,)
 
-    answer = combined(answers=[record(QNAME, HTTPS, b"\x00\x00\x00\x01")])
+    answer = combined(answers=[record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2")])
     settled = result.reasked(
         HTTPS, state=BundleState.COMBINED, records=answer.answers, response=answer
     )

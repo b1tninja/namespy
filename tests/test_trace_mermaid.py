@@ -65,6 +65,34 @@ def test_to_mermaid_emits_sequence_diagram_with_zone_lanes():
     assert "Note over C: done" in out
 
 
+def test_a_hop_that_bundled_says_so_and_one_that_did_not_says_nothing():
+    """The trace is the only place a ``--mqtype`` lookup can be read afterwards, and the
+    question an operator asks of it is the one this marker answers: did the descent bundle,
+    or did it fall back and fetch each type separately?
+
+    The two renderings have to stay distinguishable, because the fallback looks like success
+    from the answer alone -- every type comes back -- and only the trace says whether it was
+    bought with one bundled query or with a query apiece. The ordinary hop is asserted in the
+    same breath: a feature nobody asked for must not leave a mark on the output, which is how
+    ``--nsid`` and ``--qname-min`` have always behaved here.
+    """
+    sname = Sname(DomainName("example.com"), DnsQType.A)
+    entry = SlistEntry(
+        DomainName("."),
+        DomainName("a.root-servers.net"),
+        [ipaddress.IPv4Address("198.41.0.4")],
+    )
+    trace = Trace(sname)
+    trace.record(SendQuery(entry, sname.questions, extra_qtypes=(28, 65)))
+    trace.record(SendQuery(entry, sname.questions))
+    trace.record(SendQuery(entry, sname.questions, probe=True))
+
+    out = trace.to_mermaid()
+    assert out.count("example.com A (mqtype +2)") == 1, "counted, not spelled out"
+    assert "C->>Z0: example.com A\n" in out, "the unbundled hop is untouched"
+    assert "example.com A (probe)" in out, "and the probe marker still renders"
+
+
 def test_to_mermaid_negative_responses_render_as_notes():
     sname = Sname(DomainName("missing.example.com"), DnsQType.A)
     trace = Trace(sname)

@@ -430,7 +430,7 @@ ALL_THREE = {
         answers=[
             record(QNAME, A, V4.packed),
             record(QNAME, AAAA, V6.packed),
-            record(QNAME, HTTPS, b"\x00\x00\x00\x01"),
+            record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2"),
         ],
         options=[mqtype_response_option([AAAA, HTTPS])],
     )
@@ -449,7 +449,9 @@ async def test_one_walk_answers_what_used_to_take_three():
     assert result.combined == (AAAA, HTTPS)
     assert result.still_needed == ()
     assert result.state_of(AAAA) is BundleState.COMBINED
-    assert [bytes(r.rdata) for r in result.records_for(HTTPS)] == [b"\x00\x00\x00\x01"]
+    assert [bytes(r.rdata) for r in result.records_for(HTTPS)] == [
+        b"\x00\x01\x00\x00\x01\x00\x03\x02h2"
+    ]
 
 
 async def test_what_arrives_in_the_shadow_of_an_answer_is_cached():
@@ -478,7 +480,9 @@ async def test_a_partial_bundle_is_finished_off_without_the_option():
                 answers=[record(QNAME, A, V4.packed), record(QNAME, AAAA, V6.packed)],
                 options=[mqtype_response_option([AAAA])],
             ),
-            HTTPS: lambda q: bundled(q, answers=[record(QNAME, HTTPS, b"\x00\x00\x00\x01")]),
+            HTTPS: lambda q: bundled(
+                q, answers=[record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2")]
+            ),
         }
     )
     result = await resolver.resolve_bundle(**ask(AAAA, HTTPS))
@@ -499,7 +503,9 @@ async def test_a_server_that_has_never_heard_of_it_costs_what_it_always_costed()
         {
             A: lambda q: bundled(q, answers=[record(QNAME, A, V4.packed)]),
             AAAA: lambda q: bundled(q, answers=[record(QNAME, AAAA, V6.packed)]),
-            HTTPS: lambda q: bundled(q, answers=[record(QNAME, HTTPS, b"\x00\x00\x00\x01")]),
+            HTTPS: lambda q: bundled(
+                q, answers=[record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2")]
+            ),
         }
     )
     result = await resolver.resolve_bundle(**ask(AAAA, HTTPS))
@@ -637,7 +643,9 @@ async def test_an_invalid_answer_is_discarded_before_it_reaches_the_cache():
                 options=doubled_response_options(),
             ),
             AAAA: lambda q: bundled(q, answers=[record(QNAME, AAAA, V6.packed)]),
-            HTTPS: lambda q: bundled(q, answers=[record(QNAME, HTTPS, b"\x00\x00\x00\x01")]),
+            HTTPS: lambda q: bundled(
+                q, answers=[record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2")]
+            ),
         }
     )
     result = await resolver.resolve_bundle(**ask(AAAA, HTTPS))
@@ -667,7 +675,9 @@ async def test_the_extras_are_asked_when_the_failure_cache_lets_them_be():
                 options=doubled_response_options(),
             ),
             AAAA: lambda q: bundled(q, answers=[record(QNAME, AAAA, V6.packed)]),
-            HTTPS: lambda q: bundled(q, answers=[record(QNAME, HTTPS, b"\x00\x00\x00\x01")]),
+            HTTPS: lambda q: bundled(
+                q, answers=[record(QNAME, HTTPS, b"\x00\x01\x00\x00\x01\x00\x03\x02h2")]
+            ),
         },
         failure_cache=False,
     )
@@ -765,6 +775,59 @@ async def test_the_trace_shows_the_walk_that_did_the_bundling():
     )
     await resolver.resolve_bundle(**ask(AAAA, ask_separately=True))
     assert int(resolver.last_trace.sname.qtype) == A, "the primary's walk, not the re-ask's"
+
+
+async def test_a_re_asked_type_is_traced_as_a_child_of_the_bundling_walk():
+    """``--trace`` is written once, from ``last_trace``, so a re-ask that built a trace of
+    its own was an invisible query: the file showed one descent for a lookup that had sent
+    two, which is exactly backwards for the question the trace now has to answer -- did this
+    bundle, or did it fall back and fetch each type separately?
+
+    Both halves of the fix matter and both are asserted. Adopt the re-ask into the parent and
+    ``last_trace`` stops being the bundling descent; leave it out and the operator counts one
+    query where there were three, which is the misleading direction, because the run looks
+    cheaper than it was.
+    """
+    resolver, _stub, _cache = zone(
+        {
+            A: lambda q: bundled(q, answers=[record(QNAME, A, V4.packed)]),
+            AAAA: lambda q: bundled(q, answers=[record(QNAME, AAAA, V6.packed)]),
+        }
+    )
+    await resolver.resolve_bundle(**ask(AAAA))
+    trace = resolver.last_trace
+
+    assert [e for e in trace.events if isinstance(e, SendQuery) and e.extra_qtypes], (
+        "the descent that asked for the bundle is the one recorded"
+    )
+    assert len(trace.children) == 1, "the re-ask hangs off it rather than vanishing"
+    reask = trace.children[0]
+    assert int(reask.sname.qtype) == AAAA
+    assert not any(isinstance(e, SendQuery) and e.extra_qtypes for e in reask.events), (
+        "section 3.5's standalone query goes without the option"
+    )
+
+
+async def test_a_re_ask_is_titled_with_the_name_that_actually_went_out():
+    """A child trace is created before its walk has qualified the name, so its title has to
+    come from the walk rather than from the caller's guess at it.
+
+    Otherwise a lookup of ``www.example`` renders a diagram announcing ``www.example AAAA``
+    over a query that left the machine as ``www.example. AAAA`` -- the one artefact a reader
+    consults to see what was asked, quietly disagreeing with the wire.
+    """
+    resolver, _stub, _cache = zone(
+        {
+            A: lambda q: bundled(q, answers=[record(QNAME, A, V4.packed)]),
+            AAAA: lambda q: bundled(q, answers=[record(QNAME, AAAA, V6.packed)]),
+        }
+    )
+    await resolver.resolve_bundle(
+        Query(questions=[DnsQuestion(DomainName("www.example"), DnsQType.A)], RD=True), (AAAA,)
+    )
+
+    child = resolver.last_trace.children[0]
+    assert str(child.sname.qname) == "www.example.", "the absolute name, as queried"
 
 
 async def test_a_negative_without_a_proof_of_the_name_is_not_cached():

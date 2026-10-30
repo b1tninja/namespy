@@ -2760,13 +2760,19 @@ class RecursiveResolver(Resolver):
             )
         return first
 
-    async def _walk(self, dns_packet, extra_qtypes=()):
+    async def _walk(self, dns_packet, extra_qtypes=(), trace=None):
         """Drive one walk from the roots; return ``(response, terminal sname)``.
 
         The SNAME comes back because it mutates on the way down. After a CNAME it holds
         the name the answer is really about, which is the name the extras' records are
         owned by and therefore the name a bundle must be harvested against -- asking
         AAAA for an aliased name gets the target's AAAA, exactly as asking A does.
+
+        *trace* records this walk into somebody else's tree instead of starting a fresh
+        ``last_trace``. Only :meth:`resolve_bundle` uses it: a re-ask is a lookup in its own
+        right, but it exists because the bundle did not answer a type, and a trace that
+        showed only the bundling descent would leave a reader counting one query when the
+        run sent four.
         """
         question = self._sole_question(dns_packet)
 
@@ -2775,7 +2781,16 @@ class RecursiveResolver(Resolver):
         # to absolute by appending :attr:`dns_suffix` (or just the root).
         qname = question.name.qualify(dns_suffix=self.dns_suffix)
         sname = Sname(qname, question.qtype, question.qclass)
-        self.last_trace = Trace(sname)
+        if trace is None:
+            self.last_trace = Trace(sname)
+        else:
+            # The child was made before this walk knew what it would ask, so the title is
+            # filled in here rather than by the caller re-deriving the qualification rules:
+            # a diagram that read "resolve example AAAA" for a query that went out as
+            # "example.com. AAAA" is a small lie in the one place a reader goes for the
+            # truth about a descent.
+            trace.sname = sname
+            self.last_trace = trace
         slist = self.sbelt.copy_for(sname)
         gen = resolve_steps(
             sname,
@@ -2895,7 +2910,13 @@ class RecursiveResolver(Resolver):
             single = Query(
                 questions=[DnsQuestion(question.name, entry.qtype, question.qclass)], RD=True
             )
-            answer, _terminal = await self._walk(single)
+            answer, _terminal = await self._walk(
+                # Recorded as a child of the bundling descent rather than as a fresh
+                # last_trace: the two belong together, and ``--trace`` is where a reader
+                # finds out that the bundle was only half a bundle.
+                single,
+                trace=bundle_trace.child(Sname(question.name, entry.qtype, question.qclass)),
+            )
             if not isinstance(answer, Response):
                 # Unfinished, so it stays NEEDED. A work list is allowed to say that: a
                 # type nobody answered is not a type with no records.

@@ -2,8 +2,9 @@
 
 A `Trace` is the recorded yield stream of a `resolve_steps` generator. The
 async driver in `namespy.resolver` calls `record(step)` on the trace for
-every yielded effect, and asks for a `child(sname)` whenever a glueless
-sub-resolution starts. `to_mermaid()` renders the recorded events as a
+every yielded effect, and asks for a `child(sname)` whenever a sub-lookup
+starts -- a glueless address chase, or one of the standalone re-asks that an
+RFC 10029 bundle leaves behind. `to_mermaid()` renders the recorded events as a
 Mermaid `sequenceDiagram` with one lane per zone-cut visited; nested
 sub-resolutions are appended below the parent diagram (Mermaid sequence
 diagrams do not nest).
@@ -39,8 +40,9 @@ class Trace:
         Output is a ``sequenceDiagram`` per trace: the client is always
         participant ``C``, and each zone visited gets ``Z0``, ``Z1``, ... in the
         order first queried, which mirrors the descent a reader is trying to
-        follow. Sub-traces (glueless address lookups) are appended as separate
-        diagrams rather than nested, because Mermaid has no composition for that.
+        follow. Sub-traces -- a glueless address chase, or a type the bundle left to a
+        query of its own -- are appended as separate diagrams rather than nested, because
+        Mermaid has no composition for that.
         """
         header = ["sequenceDiagram", "    participant C as client"]
         participants = {}
@@ -72,6 +74,14 @@ class Trace:
                 qtype = ev.questions[0].qtype if ev.questions else None
                 qtype_name = getattr(qtype, "name", str(qtype))
                 marker = " (probe)" if getattr(ev, "probe", False) else ""
+                # Counted, not named: this module deliberately dispatches on class names so
+                # it never has to import the resolver, and the type *names* would mean an
+                # import of the registry that knows them. The count is also the fact worth
+                # seeing -- which hops bundled, and how much they asked for -- while the
+                # list itself is already in the query's EDNS option if a reader wants it.
+                bundled = getattr(ev, "extra_qtypes", ()) or ()
+                if bundled:
+                    marker += f" (mqtype +{len(bundled)})"
                 body.append(f"    C->>{pid}: {qname} {qtype_name}{marker}")
                 last_zone_id[0] = pid
             elif cn == "Referral":

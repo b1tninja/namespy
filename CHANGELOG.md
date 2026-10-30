@@ -316,7 +316,42 @@ nothing has been tagged or published yet, so `master` is the only version.
   FORMERR carrying an OPT, drop EDNS entirely if it comes back FORMERR without one.
   `tests/test_bundle.py` (28), `tests/test_resolver_mqtype.py` (28) and twelve in
   `tests/test_cli.py` hold the reader, the threading, the three fallbacks and the rendering;
-  `bundle.py` is at 100% coverage.
+  `bundle.py` is at 100% coverage. And because each of those suites only ever talked to a
+  response this project wrote by hand, `tests/test_mqtype_interop.py` (4) wires the real
+  client to the real responder over a real datagram — the client encodes, the server parses,
+  combines, and answers, and the client's harvester reads the result — for the combined,
+  declined, and partly-completed cases. It found the malformed fixtures below on the first run.
+- A bundled hop is now visible in `--trace`. `SendQuery` has carried `extra_qtypes` since the
+  option shipped, but `to_mermaid()` only ever marked probes, so `last_resolution.md` showed a
+  line-for-line identical diagram whether a descent had bundled three types into one query or
+  fetched each with its own — and it still would, because the fallback answers every type
+  either way and only the trace can tell. Each bundling hop now reads `example.com. A
+  (mqtype +2)`, counted rather than named because this module dispatches on class names
+  precisely so it never has to import the resolver. The standalone re-asks, which had been
+  invisible — each built a trace that `resolve_bundle` then discarded when it restored the
+  bundling descent — are attached as child traces and render as their own diagrams, so the
+  file says what was asked and how many times. A lookup that did not bundle renders exactly as
+  before, marker absent, which is what the existing mermaid tests pin.
+
+### Fixed
+
+- **Ten test fixtures held an HTTPS record that cannot be parsed.** The octets
+  `b"\x00\x00\x00\x01"` were used as HTTPS RDATA across `test_bundle.py` and
+  `test_resolver_mqtype.py`: priority 0, target `.`, then one stray octet — and RFC 9460
+  §2.2's first malformed condition is that "the end of the RDATA occurs within a SvcParam",
+  which is exactly what a lone trailing octet is. Nothing noticed because no test round-tripped
+  those records through the wire codec; the first thing that did was the new client-to-server
+  interop test, and what it caught was the *client* discarding a complete, correct reply
+  because the record inside it was malformed. They now carry a real minimal record (priority 1,
+  target `.`, `alpn=h2`).
+- **`docs/rfc-map.md` said EDNS(0) was decoded but not sent.** Outbound OPT has been sent for
+  several rounds — advertised payload, `extended_rcode`, `ad`/`cd`, the §6.2.2 unextended
+  re-ask, and NSID, EDE and MQTYPE options in use — while §11 still told a reader that outbound
+  queries carried no OPT and that the payload ceiling was therefore 512 octets and the RCODEs
+  still 4 bits. The bullet now describes what is actually partial about it (which options are
+  put on the wire, and why COOKIE and Padding are not), and §10 gained the code-mapping rows
+  those features never got: option TLVs and per-server payload sizes, Extended DNS Errors,
+  MQTYPE in both directions, SVCB parameters, and the QNAME minimisation schedule.
 
 ### Changed
 

@@ -239,6 +239,12 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 | Cached resolution failures (RFC 9520 §3.2, §3.3) | `FailureCache` + `FailureEntry` (`namespy/cache/__init__.py`), consulted and recorded in `resolve_steps`, owned by `RecursiveResolver.failure_cache` |
 | Truncation → TCP retry (RFC 1123 §6.1.3.2) | `Resolver._await_udp()` → `Resolver._query_tcp()` |
 | No-cache-on-truncation (RFC 1035 §7.4) | `_write_cache()` early return |
+| EDNS(0) option TLVs, and the payload size each server gets told (RFC 6891 §6.1.2, §6.2.3, §6.2.4) | `EdnsOption` / `parse_options()` / `serialize_options()` (`namespy/edns.py`), `Resolver._advertised_payload()` |
+| Extended DNS Errors, composed and consumed (RFC 8914) | `ExtendedDNSError`, `extended_dns_error_option()`, `extended_errors_of()` (`namespy/edns.py`); emitted by `DnsServer._error()`, read into the failure-cache reasons and the CLI's `; EDE:` lines |
+| MQTYPE, answering (RFC 10029 §3.3–§3.4) | `namespy/mqtype.py`, `DnsServer._mqtype_request()` and `DnsServer._combine_mqtype()` |
+| MQTYPE, asking (RFC 10029 §3.2, §3.5) | `namespy/bundle.py` (`query_option_for()`, `collect_bundle()`), `RecursiveResolver.resolve_bundle()` |
+| SVCB / HTTPS service parameters (RFC 9460) | `SvcParams` (`namespy/svcb.py`), registered as the RDATA codec in `namespy/rdata.py` |
+| QNAME minimisation probe schedule (RFC 9156 §2.3, §3) | `namespy/minimis.py`, driven from `resolve_steps` where it builds each probe's name |
 | Trace tree | [`namespy/trace.py`](../namespy/trace.py) `Trace` |
 | Mermaid output | `Trace.to_mermaid()` |
 
@@ -246,11 +252,17 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 
 Deliberately unimplemented, each with the spec that would drive it:
 
-- **EDNS(0) is decoded but not sent.** `DnsPacket` reads an OPT record and
-  exposes `extended_rcode`, `ad`, `cd` and `requestor_payload_size`
-  (RFC 6891 §6.1.2-6.1.3), but outbound queries carry no OPT. That leaves the
-  UDP payload ceiling at 512 octets (§6.2.3) and caps us at the 4-bit RCODEs.
-  Truncation is a direct consequence of that ceiling, and is now handled: a
+- **EDNS(0) is sent as well as decoded, but only some of its options are used.**
+  Outbound queries advertise an OPT record — 1232 octets, `--no-edns` or the
+  constructor knob to stop — a received OPT yields `extended_rcode`, `ad`, `cd`
+  and `requestor_payload_size` (RFC 6891 §6.1.3), and a FORMERR or BADVERS answer
+  that arrives without an OPT alongside it earns the §6.2.2 unextended re-ask. Of
+  the registered options, NSID (RFC 5001), Extended DNS Errors (RFC 8914) and
+  MQTYPE (RFC 10029) are used in both directions; COOKIE (RFC 7873) and Padding
+  (RFC 7830) decode and encode but are deliberately not put on the wire — there is
+  no server-side cookie state to validate a reply against, and §6 of RFC 7830
+  withdraws Padding from plaintext UDP, which is every transport here. Truncation
+  is a direct consequence of whatever ceiling the path allows, and is handled: a
   `TC` answer is re-asked over TCP rather than believed (RFC 1123 §6.1.3.2).
 - **QNAME minimisation** (RFC 9156) is available but not the default: pass
   `qname_min=True` (or `--qname-min`) to send each server only the labels the
