@@ -246,6 +246,7 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 | SVCB / HTTPS service parameters (RFC 9460) | `SvcParams` (`namespy/svcb.py`), registered as the RDATA codec in `namespy/rdata.py` |
 | The NXDOMAIN cut (RFC 8020 §2) | `NxdomainPolicy`, `NxdomainCut`, `_nxdomain_cut()` (`namespy/resolver.py`); the QTYPE-free `DnsCache.nxdomain_at()` in both backends (`namespy/cache/__init__.py`, `namespy/cache/sqlite.py`); rendered by `Trace.to_mermaid()` and the CLI's `;; NXDOMAIN cut:` line, switched by `--no-nxdomain-cut` |
 | DNSKEY and DS without cryptography (RFC 4034 §2, §5, App. B) | `key_tag()`, `ds_digest()`, `DigestType`, `canonical_owner_octets()`, `key_material()`/`digest_material()` (`namespy/dnssec.py`); `RData_DNSKEY` and `RData_DS` registered as RDATA codecs in `namespy/rdata.py` |
+| Denial-of-existence records: RRSIG, NSEC, NSEC3, NSEC3PARAM (RFC 4034 §3–§4, RFC 5155 §3–§4, §10.3) | `encode_type_bitmap()`, `decode_type_bitmap()`, `nsec3_hash()`, `encode_base32hex()`/`decode_base32hex()`, `iterations_within_limit()`, `NSEC3_OPT_OUT_FLAG`, `Nsec3HashAlgorithm` (`namespy/dnssec.py`); `RData_RRSIG` with `within_validity()`, `RData_NSEC`, `RData_NSEC3` with `hash_owner()`/`opt_out`, `RData_NSEC3PARAM` (`namespy/rdata.py`) |
 | QNAME minimisation probe schedule (RFC 9156 §2.3, §3) | `namespy/minimis.py`, driven from `resolve_steps` where it builds each probe's name |
 | Trace tree | [`namespy/trace.py`](../namespy/trace.py) `Trace` |
 | Mermaid output | `Trace.to_mermaid()` |

@@ -21,7 +21,7 @@ gh run list -L 5                  # what CI thinks about it
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
 | Suite | 919 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
 | Coverage | 89% measured with `pytest -q --cov` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -265,6 +265,59 @@ erratum 1062 matters, since 4034's list of types whose RDATA names get downcased
 RFC 3597 §7 carries the real set — then the wildcard reconstruction from RRSIG's Labels field
 (§3.1.3), and only then the verification dependency decision. `NxdomainPolicy.VALIDATED` and
 RFC 8020 §2¶5's MUST both clear on the proof-record codecs.
+
+### Follow-up: the DNSSEC proof records (RFC 4034 §3–§4, RFC 5155 §3–§4, §10.3)
+
+`RData_RRSIG` (46), `RData_NSEC` (47), `RData_NSEC3` (50) and `RData_NSEC3PARAM` (51) in
+`namespy/rdata.py`, with what they share moved to `namespy/dnssec.py`: the type bit map
+encoder/decoder (§4.1.2, reused unchanged by §3.1.8), the NSEC3 hash (§5), base32hex
+(§3.3), and §10.3's iteration ceiling as a predicate. Chosen because the codecs are what
+everything else in DNSSEC waits on and because, like the first leg, none of it needs a
+dependency: SHA-1 is `hashlib`, the bitmap is arithmetic, and a signature is opaque octets.
+
+**Appendix A of RFC 5155 is a test suite the authors wrote on purpose** — "They can also be
+used as test vectors for the hash algorithm" — and its twelve hashes are what the new
+`test_dnssec_proofs.py` is built on. They cover three traps at once. The alphabet:
+**verified erratum 3544** corrects §3.3's "base32" to base32hex, and RFC 4648 §7 warns the two
+are not the same encoding; `base64.b32encode` would have produced labels that exist in no
+zone. The recursion: §3.1.3's *iterations* is "the number of additional times", so the name is
+hashed once regardless and twelve means thirteen invocations — the off-by-one yields a hash
+that matches nothing, silently. And the canonical input: §6.2 item 4 keeps the `*` label, which
+is why `*.w.example.` has its own hash and why `canonical_owner_octets` is now shared with the
+DS digest instead of being named for it.
+
+**`within_validity` is the one rule in `RRSIG` that is not just unpacking.** §3.1.5¶2 allows an
+Expiration numerically below its Inception and mandates RFC 1982 arithmetic for these fields, so
+the comparison goes through `RData_SOA.serial_ahead` — the same serial arithmetic the repo
+already trusted for SOA updates. An integer `inception <= now <= expiration` would have been the
+obvious implementation and would have been wrong for signatures that straddle the 2106 wrap.
+
+**The sweep earned its keep again.** Registering four codecs made `test_rdata_wrapping.py`
+demand a payload for each, and writing the RRSIG one surfaced a header format of `!HBBIIHI`
+where `!HBBIIIH` is correct: the same 18 octets, with the Key Tag read into the Inception Time
+and the last field taken from wherever the name started. Nothing else in the suite would have
+noticed until a resolver cached a signature that printed a 1970 expiry.
+
+**Not claimed, in order of what now unblocks what.** The §6.2 canonical-RRset rule and the
+Labels-field wildcard reconstruction (§3.1.3) are verification-side and still absent — and
+**erratum 1062** matters there, since 4034's list of types whose RDATA names get downcased is
+incomplete and RFC 3597 §7 carries the real one. Proof *checking* is absent: `NSEC3` exposes
+`hash_owner()` for a name, but deciding whether a name falls between this record and
+`next_hashed_owner` is §7/§8 work, where **errata 3441 and 4622** both change what a server must
+include for empty non-terminals and NSEC3 owner names. RFC 8020 §2¶5's MUST still cannot be
+met, and the reason is now specific: the proof records decode, but `DnsCache` stores only the
+SOA of a negative answer, so there is nothing to echo when DO is set — storing them is that
+row's remaining scope. `NxdomainPolicy.VALIDATED` therefore still refuses to construct, and its
+test is still the marker that has to change when validation lands.
+
+**Verified**: 978 passed (+59), `ruff check .` and `ruff format --check .` clean,
+`mypy namespy` exits 0, and `python -O -m pytest -q` passes, so none of the new reasoning rests
+on an `assert`. Roadmap §6 gained its proof-record row, §10's 8020 row now names the reason
+§2¶5 is still open, and `docs/rfc-map.md` §10 maps the new symbols.
+
+**Next**: canonical RRset ordering, then NSEC/NSEC3 proof construction, then the cache change
+that lets a denial carry its proofs — and only after those, the dependency decision for
+signature verification, which is the one choice here that cannot be undone quietly.
 
 ## Previous round: MQTYPE (RFC 10029)
 

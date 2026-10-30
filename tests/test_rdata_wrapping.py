@@ -10,6 +10,7 @@ import ipaddress
 import struct
 
 from namespy import DnsPacket, DnsRClass, DnsRecord, DnsRType, DomainName, Response
+from namespy.dnssec import decode_base32hex
 from namespy.rdata import RData, RData_SOA, RData_TXT, all_rdata_classes
 
 #: SOA timers in wire order, so the payloads below read as fields not hex.
@@ -126,6 +127,24 @@ def test_every_registered_codec_round_trips_through_a_wrapped_record():
         # §2), so a sweep payload has to be a record a real zone could publish.
         int(DnsRType.DNSKEY): bytes([1, 0, 3, 5]) + b"\x01\x02",
         int(DnsRType.DS): struct.pack("!HBB", 60485, 5, 1) + bytes(20),
+        # The proof records. RRSIG is RFC 5155 Appendix A's signature over the NSEC3
+        # RRset at example. (Key Tag 40430, signer example.), truncated to a one-octet
+        # signature because the codec treats it as opaque; NSEC3 uses that appendix's own
+        # first chain entry, whose next hashed owner name is the SHA-1 hash published for
+        # "ns1.example". Every payload here is therefore a record a signed zone really
+        # serves, which is what makes this sweep worth having.
+        int(DnsRType.RRSIG): struct.pack("!HBBIIIH", 50, 7, 2, 3600, 1429574399, 1129852800, 40430)
+        + bytes(DomainName("example."))
+        + b"\x01",
+        int(DnsRType.NSEC): bytes(DomainName("next.example.")) + b"\x00\x01\x60",
+        int(DnsRType.NSEC3): (
+            struct.pack("!BBHB", 1, 1, 12, 4)
+            + bytes.fromhex("aabbccdd")
+            + bytes([20])
+            + decode_base32hex("2t7b4g4vsa5smi47k61mv5bv1a22bojr")
+            + bytes.fromhex("000722010000000290")
+        ),
+        int(DnsRType.NSEC3PARAM): bytes.fromhex("0100000c04aabbccdd"),
     }
     untested = set(all_rdata_classes()) - set(payloads)
     assert not untested, f"add a round-trip payload for: {sorted(untested)}"

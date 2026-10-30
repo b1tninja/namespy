@@ -40,6 +40,7 @@ a single ``HTTPS`` record (type 65, RFC 9460) fatal to the whole listener.
 
 from __future__ import annotations
 
+import datetime
 import ipaddress
 import struct
 from collections.abc import Iterable
@@ -51,13 +52,21 @@ from .dnssec import (
     DNSKEY_FLAG_ZONE_KEY,
     DNSKEY_HEAD_OCTETS,
     DNSKEY_PROTOCOL_VALUE,
+    NSEC3_OPT_OUT_FLAG,
     DigestType,
+    decode_base32hex,
+    decode_base64_field,
+    decode_hex_field,
+    decode_type_bitmap,
     digest_material,
     ds_digest,
+    encode_base32hex,
     encode_base64_field,
     encode_hex_field,
+    encode_type_bitmap,
     key_material,
     known_digest_octets,
+    nsec3_hash,
     unsigned_field,
 )
 from .dnssec import (
@@ -79,7 +88,11 @@ __all__ = [
     "RData_HTTPS",
     "RData_MX",
     "RData_NS",
+    "RData_NSEC",
+    "RData_NSEC3",
+    "RData_NSEC3PARAM",
     "RData_PTR",
+    "RData_RRSIG",
     "RData_SOA",
     "RData_SRV",
     "RData_SVCB",
@@ -1153,6 +1166,524 @@ class RData_DS(RData):
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, RData_DS):
+            return self.to_wire() == other.to_wire()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.type_name, self.to_wire()))
+
+
+# --------------------------------------------------- proof records (RFC 4034 §3, §4)
+
+
+#: RFC 4034 §3.1's fixed header, in field order: Type Covered (H), Algorithm (B),
+#: Labels (B), Original TTL (I), Expiration (I), Inception (I), Key Tag (H) -- 18 octets
+#: ahead of the Signer's Name. The three 32-bit fields have to be three I's: spelling
+#: this "!HBBIIHI" keeps the size at 18 and silently reads the Key Tag into Inception,
+#: which is the kind of bug a sweep payload catches and a hand-written one does not.
+_RRSIG_HEAD_FMT = "!HBBIIIH"
+
+#: §3.2¶6: the 14-digit form is exactly one character longer than the widest decimal a
+#: 32-bit field can take, which is how a reader tells the two renderings apart.
+_RRSIG_DATE_FMT = "%Y%m%d%H%M%S"
+
+
+def _rrsig_time(value: int) -> str:
+    """One RRSIG time field as YYYYMMDDHHmmSS in UTC (RFC 4034 §3.2¶6).
+
+    The decimal form is equally legal, but the date form is what signed zones and zone
+    diffs carry, and a resolver printing raw seconds is harder to read against either.
+    The field is 32 bits, so the latest representable instant is 2106-02-07 and
+    :mod:`datetime` cannot overflow on it.
+    """
+    moment = datetime.datetime.fromtimestamp(int(value), datetime.UTC)
+    return moment.strftime(_RRSIG_DATE_FMT)
+
+
+class RData_RRSIG(RData):
+    """``RRSIG`` RDATA -- the signature over one RRset (RFC 4034 §3.1).
+
+    Nine fields, and only two of them are the signature. The rest exist so a validator
+    can find the key and rebuild the exact octets it signed: Type Covered and the Signer's
+    Name say which RRset, Key Tag narrows the DNSKEYs to try (§3.1.6), Original TTL and
+    Labels say what the TTL and owner name looked like before the wire changed them
+    (§3.1.3, §3.1.4), and the two time fields bound how long the answer stays good.
+
+    **Nothing here verifies a signature.** That needs each algorithm's arithmetic, and for
+    RSA and DSA a dependency this package does not carry; the codec is useful without it,
+    because these fields are what a resolver caches, prints, and hands to a validator
+    later. The one rule this class does enforce is the validity window, since that is
+    field comparison rather than cryptography (§3.1.5, :meth:`within_validity`).
+
+    The Signer's Name is read as an uncompressed name: RFC 4034 §3.1.7 requires that it
+    "must not be compressed", which is one reason these codecs go through
+    :func:`_read_name` rather than a compression-aware reader.
+    """
+
+    RType = DnsRType.RRSIG
+
+    def __init__(
+        self,
+        type_covered: int,
+        algorithm: int,
+        labels: int,
+        original_ttl: int,
+        expiration: int,
+        inception: int,
+        key_tag: int,
+        signer_name,
+        signature,
+        *,
+        wire: bytes | None = None,
+    ) -> None:
+        self.type_covered = unsigned_field(type_covered, bits=16, name="RRSIG type covered")
+        self.algorithm = unsigned_field(algorithm, bits=8, name="RRSIG algorithm")
+        self.labels = unsigned_field(labels, bits=8, name="RRSIG labels")
+        self.original_ttl = unsigned_field(original_ttl, bits=32, name="RRSIG original TTL")
+        self.expiration = unsigned_field(expiration, bits=32, name="RRSIG expiration")
+        self.inception = unsigned_field(inception, bits=32, name="RRSIG inception")
+        self.key_tag = unsigned_field(key_tag, bits=16, name="RRSIG key tag")
+        self.signer_name = (
+            signer_name if isinstance(signer_name, DomainName) else DomainName(signer_name)
+        )
+        # §2.2 lets whitespace appear anywhere inside the Base64, which is what
+        # decode_base64_field exists to absorb; digest_material would be the wrong
+        # helper here, since a DS digest is written in hex and a signature is not.
+        blob = signature
+        if not isinstance(blob, (bytes, bytearray)):
+            blob = decode_base64_field(blob, what="RRSIG signature")
+        if not blob:
+            raise ValueError("RRSIG signature is empty")
+        self.signature = bytes(blob)
+        super().__init__(self.to_wire(), wire=wire)
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        head = struct.calcsize(_RRSIG_HEAD_FMT)
+        if len(blob) < head:
+            raise DnsPacketParseError(
+                f"RRSIG RDATA is {len(blob)} octet(s), must be at least {head}",
+                data=buffer,
+                offset=offset,
+            )
+        (
+            type_covered,
+            algorithm,
+            labels,
+            original_ttl,
+            expiration,
+            inception,
+            key_tag,
+        ) = struct.unpack_from(_RRSIG_HEAD_FMT, blob, 0)
+        end = offset + len(blob)
+        signer_name, cursor = _read_name(buffer, offset + head, end, where="RRSIG Signer's Name")
+        return cls(
+            type_covered,
+            algorithm,
+            labels,
+            original_ttl,
+            expiration,
+            inception,
+            key_tag,
+            signer_name,
+            blob[cursor - offset :],
+            wire=blob,
+        )
+
+    def to_wire(self) -> bytes:
+        return (
+            struct.pack(
+                _RRSIG_HEAD_FMT,
+                self.type_covered,
+                self.algorithm,
+                self.labels,
+                self.original_ttl,
+                self.expiration,
+                self.inception,
+                self.key_tag,
+            )
+            + bytes(self.signer_name)
+            + self.signature
+        )
+
+    @property
+    def covered_type(self) -> str:
+        """The RR type this signature covers: mnemonic, else ``TYPE`` form (§3.2¶2)."""
+        return type_name_of(self.type_covered)
+
+    def to_presentation(self) -> str:
+        """``NSEC3 7 2 3600 20150420235959 20051021000000 40430 example. OsGOkm26...``
+
+        Field order and rendering are RFC 4034 §3.2: the covered type as a mnemonic with
+        the RFC 3597 ``TYPE`` form when unknown, the times in the 14-digit UTC form, the
+        signature in Base64. The algorithm prints as a decimal -- §3.2¶3 also allows a
+        mnemonic, but a number survives a signer using an algorithm this code has no name
+        for.
+        """
+        return " ".join(
+            (
+                self.covered_type,
+                str(self.algorithm),
+                str(self.labels),
+                str(self.original_ttl),
+                _rrsig_time(self.expiration),
+                _rrsig_time(self.inception),
+                str(self.key_tag),
+                str(self.signer_name),
+                encode_base64_field(self.signature),
+            )
+        )
+
+    def within_validity(self, moment: float | None = None) -> bool:
+        """Whether *moment* falls inside this signature's stated lifetime.
+
+        RFC 4034 §3.1.5¶1 is strict about the consequence -- the RRSIG "MUST NOT be used
+        for authentication" outside the window -- but ¶2 is the trap: an RRSIG may carry an
+        Expiration numerically *below* its Inception near the 32-bit wrap or for a
+        long-lived signature, so "all comparisons involving these fields MUST use Serial
+        number arithmetic" (RFC 1982). Comparing them as integers would reject a valid
+        signature for roughly half of 2105-2106, which is far enough away to be forgotten
+        and close enough to be someone's problem. :meth:`RData_SOA.serial_ahead` already
+        implements that arithmetic for SOA serials, so it is reused rather than rewritten.
+
+        As with any RFC 1982 comparison this is meaningful only within 2**31 seconds of the
+        fields, a limit §3.1.5¶2 states itself: these fields "cannot refer to dates more
+        than 68 years in either the past or the future".
+        """
+        if moment is None:
+            moment = datetime.datetime.now(datetime.UTC).timestamp()
+        now = int(moment) & 0xFFFFFFFF
+
+        def at_or_after(candidate: int, boundary: int) -> bool:
+            return candidate == boundary or RData_SOA.serial_ahead(candidate, boundary)
+
+        return at_or_after(now, self.inception) and at_or_after(self.expiration, now)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RData_RRSIG):
+            return self.to_wire() == other.to_wire()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.type_name, self.to_wire()))
+
+
+class RData_NSEC(RData):
+    """``NSEC`` RDATA -- Next Domain Name and Type Bit Maps (RFC 4034 §4.1).
+
+    The older denial-of-existence record: it names the next owner name in canonical order
+    and lists every type that exists at this one, so a canonical walk from the query name
+    proves absence. That same property is what makes a zone enumerable, which is why
+    RFC 5155 hashed the names into NSEC3; NSEC is still widely served, and RFC 8020's
+    ancestor-SOA rule has to be able to read it either way.
+
+    Types are held as numbers, ascending and deduplicated, and re-encoded through
+    :func:`encode_type_bitmap`. §4.1.2's ordering and trailing-zero MUSTs leave exactly one
+    legal encoding for a given set, so comparing the rebuilt bytes is sound.
+    """
+
+    RType = DnsRType.NSEC
+
+    def __init__(self, next_domain, types, *, wire: bytes | None = None) -> None:
+        self.next_domain = (
+            next_domain if isinstance(next_domain, DomainName) else DomainName(next_domain)
+        )
+        self.types = tuple(sorted({int(value) for value in types}))
+        super().__init__(self.to_wire(), wire=wire)
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        end = offset + len(blob)
+        next_domain, cursor = _read_name(buffer, offset, end, where="NSEC Next Domain Name")
+        try:
+            types = decode_type_bitmap(blob[cursor - offset :])
+        except ValueError as exc:
+            raise DnsPacketParseError(str(exc), data=buffer, offset=cursor) from None
+        return cls(next_domain, types, wire=blob)
+
+    @property
+    def type_bitmap(self) -> bytes:
+        """The Type Bit Maps field as it will go on the wire (§4.1.2)."""
+        return encode_type_bitmap(self.types)
+
+    def has_type(self, rtype: int) -> bool:
+        """Whether this record claims *rtype* exists at the owner name."""
+        return int(rtype) in self.types
+
+    def to_wire(self) -> bytes:
+        return bytes(self.next_domain) + self.type_bitmap
+
+    def to_presentation(self) -> str:
+        """``next.name. A MX RRSIG NSEC`` -- name then type mnemonics (RFC 4034 §4.2)."""
+        listed = " ".join(type_name_of(value) for value in self.types)
+        return str(self.next_domain) if not listed else f"{self.next_domain} {listed}"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RData_NSEC):
+            return self.to_wire() == other.to_wire()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.type_name, self.to_wire()))
+
+
+class RData_NSEC3(RData):
+    """``NSEC3`` RDATA -- hash parameters, hashed successor, Type Bit Maps (RFC 5155 §3.2).
+
+    The same job as NSEC with the names hashed, so a passer-by cannot read the zone out of
+    the chain. The four leading fields are not decoration: they are *this record's* hash
+    parameters, because the NSEC3 RRs of a zone must agree on them and because a validator
+    re-derives a name's hash from the very record it is using to prove absence (§5).
+
+    Reading stays forgiving about what it does not understand -- an unknown hash algorithm
+    parses, since the rest of the record is worth caching and printing -- while
+    :meth:`hash_owner` refuses rather than inventing a hash function (§11 names SHA-1 and
+    nothing else today).
+
+    Lengths are checked against what the *algorithm* produces, not merely against §3.1.6's
+    1..255 field bound: a 7-octet SHA-1 fits that field perfectly well and is a truncated
+    proof, which is not something to carry quietly into a cache.
+    """
+
+    RType = DnsRType.NSEC3
+
+    #: Octets a known hash algorithm produces (RFC 5155 §11: SHA-1, so far).
+    _HASH_OCTETS: ClassVar[dict[int, int]] = {1: 20}
+
+    #: Hash Alg + Flags + Iterations + Salt Length, ahead of the variable part.
+    _HEAD_OCTETS = 5
+
+    def __init__(
+        self,
+        hash_algorithm: int,
+        flags: int,
+        iterations: int,
+        salt,
+        next_hashed_owner,
+        types,
+        *,
+        wire: bytes | None = None,
+    ) -> None:
+        self.hash_algorithm = unsigned_field(hash_algorithm, bits=8, name="NSEC3 hash algorithm")
+        self.flags = unsigned_field(flags, bits=8, name="NSEC3 flags")
+        self.iterations = unsigned_field(iterations, bits=16, name="NSEC3 iterations")
+        if isinstance(salt, (bytes, bytearray)):
+            self.salt = bytes(salt)
+        else:
+            self.salt = b"" if salt in ("", "-") else decode_hex_field(salt, what="NSEC3 salt")
+        if isinstance(next_hashed_owner, (bytes, bytearray)):
+            self.next_hashed_owner = bytes(next_hashed_owner)
+        else:
+            self.next_hashed_owner = decode_base32hex(next_hashed_owner)
+        expected = self._HASH_OCTETS.get(self.hash_algorithm)
+        if expected is not None and len(self.next_hashed_owner) != expected:
+            raise ValueError(
+                f"NSEC3 next hashed owner name is {len(self.next_hashed_owner)} octet(s); "
+                f"hash algorithm {self.hash_algorithm} produces {expected}"
+            )
+        self.types = tuple(sorted({int(value) for value in types}))
+        super().__init__(self.to_wire(), wire=wire)
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        if len(blob) < cls._HEAD_OCTETS:
+            raise DnsPacketParseError(
+                f"NSEC3 RDATA is {len(blob)} octet(s), must be at least {cls._HEAD_OCTETS}",
+                data=buffer,
+                offset=offset,
+            )
+        hash_algorithm, flags, iterations, salt_length = struct.unpack_from("!BBHB", blob, 0)
+        cursor = cls._HEAD_OCTETS
+        salt = blob[cursor : cursor + salt_length]
+        if len(salt) < salt_length:
+            raise DnsPacketParseError(
+                f"NSEC3 salt of {salt_length} octet(s) runs past the end of its RDATA",
+                data=buffer,
+                offset=offset + cursor,
+            )
+        cursor += salt_length
+        if cursor >= len(blob):
+            raise DnsPacketParseError(
+                "NSEC3 RDATA ends before its Hash Length field",
+                data=buffer,
+                offset=offset + cursor,
+            )
+        hash_length = blob[cursor]
+        cursor += 1
+        if hash_length < 1:
+            raise DnsPacketParseError(
+                "NSEC3 Hash Length is 0; §3.1.6 bounds it at 1..255 octets",
+                data=buffer,
+                offset=offset + cursor - 1,
+            )
+        hashed = blob[cursor : cursor + hash_length]
+        if len(hashed) < hash_length:
+            raise DnsPacketParseError(
+                f"NSEC3 hashed owner name of {hash_length} octet(s) runs past its RDATA",
+                data=buffer,
+                offset=offset + cursor,
+            )
+        cursor += hash_length
+        try:
+            types = decode_type_bitmap(blob[cursor:])
+        except ValueError as exc:
+            raise DnsPacketParseError(str(exc), data=buffer, offset=offset + cursor) from None
+        return cls(hash_algorithm, flags, iterations, salt, hashed, types, wire=blob)
+
+    @property
+    def opt_out(self) -> bool:
+        """Whether the Opt-Out flag is set (RFC 5155 §3.1.2.1).
+
+        A set flag means this span may cover unsigned delegations, so a proof landing
+        inside it establishes "insecure" rather than "does not exist" -- a difference that
+        changes the answer a resolver gives. §3.1.2 adds that undefined flags "must be
+        zero"; as with the DNSKEY reserved bits that is a rule about senders, so unknown
+        bits are preserved on :attr:`flags` for a validator to object to rather than
+        silently cleared or rejected here.
+        """
+        return bool(self.flags & NSEC3_OPT_OUT_FLAG)
+
+    @property
+    def type_bitmap(self) -> bytes:
+        """The Type Bit Maps field as it will go on the wire (RFC 5155 §3.1.8)."""
+        return encode_type_bitmap(self.types)
+
+    def has_type(self, rtype: int) -> bool:
+        """Whether this record claims *rtype* exists at the original owner name."""
+        return int(rtype) in self.types
+
+    def hash_owner(self, owner) -> bytes:
+        """The hash *owner* would need in order to sit at this record's owner name.
+
+        Computed with this record's own algorithm, iterations and salt -- which is what
+        those fields are for (§5). Matching it against the first label of the record's
+        owner name is how a validator finds the NSEC3 RR for a name; deciding whether a
+        name falls *between* this record and :attr:`next_hashed_owner` is the proof step,
+        and is not claimed here.
+        """
+        return nsec3_hash(
+            owner,
+            iterations=self.iterations,
+            salt=self.salt,
+            hash_algorithm=self.hash_algorithm,
+        )
+
+    def to_wire(self) -> bytes:
+        return (
+            struct.pack("!BBHB", self.hash_algorithm, self.flags, self.iterations, len(self.salt))
+            + self.salt
+            + bytes([len(self.next_hashed_owner)])
+            + self.next_hashed_owner
+            + self.type_bitmap
+        )
+
+    def to_presentation(self) -> str:
+        """``1 1 12 aabbccdd 2t7b4g4vsa5smi47k61mv5bv1a22bojr MX DNSKEY NS SOA ...``
+
+        RFC 5155 §3.3: neither length field is represented, an empty salt is ``-`` rather
+        than nothing, and the hashed owner name is unpadded base32hex -- base32*hex*, per
+        verified erratum 3544 correcting the document's own wording (see
+        :func:`~namespy.dnssec.encode_base32hex`).
+        """
+        parts = [str(self.hash_algorithm), str(self.flags), str(self.iterations)]
+        parts.append("-" if not self.salt else encode_hex_field(self.salt))
+        parts.append(encode_base32hex(self.next_hashed_owner))
+        parts.extend(type_name_of(value) for value in self.types)
+        return " ".join(parts)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RData_NSEC3):
+            return self.to_wire() == other.to_wire()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.type_name, self.to_wire()))
+
+
+class RData_NSEC3PARAM(RData):
+    """``NSEC3PARAM`` RDATA -- the hash parameters a zone uses (RFC 5155 §4.1).
+
+    Held at the zone apex, and the same four fields an NSEC3 record starts with. It is the
+    record an operator reads to learn a zone's salt and iteration count, and the one to
+    watch when a zone rotates its salt: §9.2 warns that changing it invalidates cached
+    NSEC3 proofs much as a re-sign does.
+
+    It carries no key material and proves nothing by itself -- §4.1¶3 notes the information
+    "could also be derived from the NSEC3 RR" anyway -- so its presence is not evidence that
+    a zone is signed and must not be read as such.
+    """
+
+    RType = DnsRType.NSEC3PARAM
+
+    _HEAD_OCTETS = 5
+
+    def __init__(
+        self,
+        hash_algorithm: int,
+        flags: int,
+        iterations: int,
+        salt,
+        *,
+        wire: bytes | None = None,
+    ) -> None:
+        self.hash_algorithm = unsigned_field(
+            hash_algorithm, bits=8, name="NSEC3PARAM hash algorithm"
+        )
+        self.flags = unsigned_field(flags, bits=8, name="NSEC3PARAM flags")
+        self.iterations = unsigned_field(iterations, bits=16, name="NSEC3PARAM iterations")
+        if isinstance(salt, (bytes, bytearray)):
+            self.salt = bytes(salt)
+        else:
+            self.salt = b"" if salt in ("", "-") else decode_hex_field(salt, what="NSEC3PARAM salt")
+        super().__init__(self.to_wire(), wire=wire)
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        if len(blob) < cls._HEAD_OCTETS:
+            raise DnsPacketParseError(
+                f"NSEC3PARAM RDATA is {len(blob)} octet(s), must be at least {cls._HEAD_OCTETS}",
+                data=buffer,
+                offset=offset,
+            )
+        hash_algorithm, flags, iterations, salt_length = struct.unpack_from("!BBHB", blob, 0)
+        salt = blob[cls._HEAD_OCTETS : cls._HEAD_OCTETS + salt_length]
+        if len(salt) < salt_length:
+            raise DnsPacketParseError(
+                f"NSEC3PARAM salt of {salt_length} octet(s) runs past the end of its RDATA",
+                data=buffer,
+                offset=offset + cls._HEAD_OCTETS,
+            )
+        if len(blob) > cls._HEAD_OCTETS + salt_length:
+            extra = len(blob) - cls._HEAD_OCTETS - salt_length
+            raise DnsPacketParseError(
+                f"NSEC3PARAM RDATA carries {extra} unexpected octet(s) after the salt",
+                data=buffer,
+                offset=offset + cls._HEAD_OCTETS + salt_length,
+            )
+        return cls(hash_algorithm, flags, iterations, salt, wire=blob)
+
+    @property
+    def opt_out(self) -> bool:
+        """The Opt-Out flag, read exactly as in an NSEC3 RR (RFC 5155 §4.1.1)."""
+        return bool(self.flags & NSEC3_OPT_OUT_FLAG)
+
+    def to_wire(self) -> bytes:
+        return (
+            struct.pack("!BBHB", self.hash_algorithm, self.flags, self.iterations, len(self.salt))
+            + self.salt
+        )
+
+    def to_presentation(self) -> str:
+        """``1 0 12 aabbccdd`` -- §4.2, and RFC 5155 Appendix A's own apex line."""
+        salt = "-" if not self.salt else encode_hex_field(self.salt)
+        return f"{self.hash_algorithm} {self.flags} {self.iterations} {salt}"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RData_NSEC3PARAM):
             return self.to_wire() == other.to_wire()
         return NotImplemented
 

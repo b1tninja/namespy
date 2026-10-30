@@ -398,6 +398,37 @@ nothing has been tagged or published yet, so `master` is the only version.
   a key with the wrong Protocol or a missing Zone Flag is kept and reported
   (`may_verify_rrsets`), not dropped at parse time, because §2.1.2 puts that judgement at
   verification and an operator needs to see which rule the zone broke.
+- The second leg of DNSSEC (RFC 4034 §3–§4, RFC 5155) — the proof records decode.
+  `RData_RRSIG`, `RData_NSEC`, `RData_NSEC3` and `RData_NSEC3PARAM` in `namespy/rdata.py`,
+  on shared ground in `namespy/dnssec.py`: `encode_type_bitmap`/`decode_type_bitmap`
+  (§4.1.2's window blocks, whose ordering and trailing-zero MUSTs leave exactly one legal
+  encoding per set of types, so equality on rebuilt bytes is sound), `nsec3_hash` (§5's
+  `IH(salt, x, k)` recursion), `encode_base32hex`/`decode_base32hex`, and
+  `iterations_within_limit` (§10.3's ceiling table). Still no new dependency: the NSEC3 hash
+  is `hashlib.sha1`, the algorithm §11 registers, and the bitmap is arithmetic.
+  **Verified erratum 3544** is why the base32 helper is not `base64.b32encode`. RFC 5155 §3.3
+  prints "base32" where RFC 4648 §7 base32hex is meant — the two alphabets share no character
+  below `K`, so a hash written the other way produces a label that exists in no zone, and the
+  failure would read as a zone with no NSEC3 chain rather than as an encoding bug. All twelve
+  of Appendix A's hashes reproduce exactly (`test_nsec3_hash_reproduces_the_published_vectors`),
+  which pins the recursion at the same time — §3.1.3's *iterations* counts additional hashes,
+  so `iterations: 12` is thirteen invocations, one short of what a careless reading gives —
+  plus §6.2 item 4's rule that a wildcard hashes with its `*` label intact
+  (`*.w.example.` has its own entry) and the entry whose first label is itself a hash.
+  `RData_RRSIG` computes nothing but does enforce §3.1.5: `within_validity` compares the two
+  time fields with RFC 1982 serial arithmetic, reusing what `RData_SOA.serial_ahead` already
+  had for SOA serials, because §3.1.5¶2 states that an Expiration numerically *below* its
+  Inception is legal and "all comparisons involving these fields MUST use Serial number
+  arithmetic" — `test_rrsig_validity_survives_the_32_bit_wrap` holds that, since a plain
+  integer comparison would quietly reject live signatures for half of 2105–2106.
+  Reading stays forgiving and writing stays strict, as with `DNSKEY`/`DS`: an NSEC3 with hash
+  algorithm 2 parses, round-trips and prints, but `hash_owner()` refuses rather than inventing
+  a hash function, and a Hash Length of 7 for SHA-1 is rejected on receipt even though §3.1.6's
+  field permits it, because a truncated hash is a proof that proves nothing.
+  **The repo's own sweep caught a live bug**: `test_rdata_wrapping.py` demands a payload per
+  registered codec, and writing one exposed an RRSIG header format spelled `!HBBIIHI` where
+  `!HBBIIIH` is right — same 18 octets, and it read the Key Tag into the Inception Time. The
+  field-order test now says so in its docstring.
 
 
 ### Fixed
