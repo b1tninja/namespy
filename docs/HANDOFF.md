@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 870 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Suite | 919 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
 | Coverage | 89% measured with `pytest -q --cov` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -211,8 +211,8 @@ a promise not to ask again — and only the first of the two can answer the clie
 `mypy namespy` exits 0. `docs/roadmap.md` gained its 8020 §2 row; `docs/rfc-map.md` §10 the
 code-mapping row.
 
-**Next**: the zero-dependency DNSSEC record codecs (4034/4035 RRSIG, DNSKEY, DS, and the proof
-records NSEC/NSEC3) — the first leg of validation, and the thing `VALIDATED` is waiting on. Checking
+**Next**: the DNSSEC record codecs (§2¶5's NSEC/NSEC3 echo is one of them), the thing
+`VALIDATED` is waiting on. Checking
 the RFC while writing this turned up the one obligation here that is *not* shipped: §2¶5 says a
 resolver "MUST return these NSEC or NSEC3 records in the response to the triggering query if the
 query had the DNSSEC OK (DO) bit set". It is unreachable rather than missing — there are no proof
@@ -220,6 +220,51 @@ records to return until the codec exists — but it is the reason the roadmap ro
 §2¶1–¶4 and §2¶6–¶8 rather than to the section. §5¶1 is the known cost of the whole feature, and
 the RFC's own answer to it ("This document assumes that such a setup is rare and does not need to
 be supported") is why `NEVER` exists rather than a per-zone exception.
+
+### Follow-up: the first DNSSEC leg (RFC 4034 §2, §5, App. B)
+
+`namespy/dnssec.py` (new) plus `RData_DNSKEY` / `RData_DS` in `namespy/rdata.py`, registered on
+48 and 43. Chosen because it is the part of DNSSEC with no dependency in it: the public key is
+opaque (§2.1.4 defers its format to documents this package does not implement), the key tag is a
+16-bit checksum, and the DS digest is `hashlib` over "owner name | DNSKEY RDATA" (§5.1.4). The
+dependency decision — RSA/ECDSA/EdDSA for verification — is still ahead of it, untouched.
+
+**The vectors are the RFC's, which is the whole reason to trust the arithmetic.** §5.4 prints a
+DNSKEY *and its DS*: key tag **60485**, SHA-1 digest **2BB183AF5F22588179A53B0A98631FAD1A292118**.
+Both come out of this code unchanged, in one test, validating the §2.1 layout, §5.1.4's bare
+concatenation, and §6.2's downcasing at once. Where no vector exists — the key tag has none for
+arbitrary RDATA — the test transcribes Appendix B's C reference a second time and compares.
+
+**Two verified errata change numbers here, and both are pinned.** 4552 rewrites Appendix B's
+prose about carries: accumulate at 32-bit precision keeping the carries, fold once, drop only the
+carry that the fold itself produces — and the erratum adds that this is "often the same as
+reduction modulo 65535, **but not always**", so the shortcut is not used and
+`test_key_tag_is_not_reduction_modulo_65535` carries the smallest input where they differ. 193
+fixes §B.1's parenthetical for algorithm 1 (RSA/MD5) to "3rd to last and 2nd to last" octets,
+which is what its own normative phrase meant; the vector is built so the two readings differ.
+
+**Two things the tests caught before commit, both worth repeating.** The constructors took
+`bytes(public_key)` — so the RFC's own Base64 text raised `TypeError: string argument without an
+encoding`, and the example that documents the format could not be parsed by the code that
+implements it; `key_material()` / `digest_material()` now take octets *or* the master-file text
+each field's presentation form specifies (§2.2, §5.3). And `DigestType(15)` raised "not a valid
+DigestType", which sends a reader to look for a typo in their zone file when the truth is that
+this package has no hasher for 15 — `ds_digest` now refuses by number and names what it does
+support. Note the direction the asymmetry runs: **reading is more forgiving than writing**. A DS
+with an unknown digest type parses, round-trips and prints; a DNSKEY with Protocol 4 is kept and
+reported by `may_verify_rrsets` rather than dropped at parse time, because §2.1.2 puts that
+judgement at verification and an operator needs to see which rule the zone broke.
+
+**The repo's own sweep did its job.** `test_rdata_wrapping.py` asserts every registered codec has
+a round-trip payload, and it failed the moment the two were added — the new types had to be given
+payloads there, which also means they are now covered by the message-level encode/parse/encode
+comparison alongside A, SOA and SVCB.
+
+**Next**: RRSIG and NSEC/NSEC3 (4034 §3–§4, 5155), then the canonical-RRset rule of §6.2 — where
+erratum 1062 matters, since 4034's list of types whose RDATA names get downcased is incomplete and
+RFC 3597 §7 carries the real set — then the wildcard reconstruction from RRSIG's Labels field
+(§3.1.3), and only then the verification dependency decision. `NxdomainPolicy.VALIDATED` and
+RFC 8020 §2¶5's MUST both clear on the proof-record codecs.
 
 ## Previous round: MQTYPE (RFC 10029)
 

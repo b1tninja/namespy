@@ -120,6 +120,12 @@ def test_every_registered_codec_round_trips_through_a_wrapped_record():
         # encoding rule requires and which this sweep compares byte for byte.
         int(DnsRType.SVCB): bytes.fromhex("000100000300020035"),
         int(DnsRType.HTTPS): bytes.fromhex("001003666f6f076578616d706c6503636f6d00000300020035"),
+        # RFC 4034 §2.1 (DNSKEY: Flags, Protocol, Algorithm, key) and §5.1 (DS: Key
+        # Tag, Algorithm, Digest Type, Digest). The DS digest is 20 octets because its
+        # digest type is 1, SHA-1: the codec enforces that length (§5.1.4, RFC 4509
+        # §2), so a sweep payload has to be a record a real zone could publish.
+        int(DnsRType.DNSKEY): bytes([1, 0, 3, 5]) + b"\x01\x02",
+        int(DnsRType.DS): struct.pack("!HBB", 60485, 5, 1) + bytes(20),
     }
     untested = set(all_rdata_classes()) - set(payloads)
     assert not untested, f"add a round-trip payload for: {sorted(untested)}"

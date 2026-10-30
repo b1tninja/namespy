@@ -45,6 +45,24 @@ import struct
 from collections.abc import Iterable
 from typing import ClassVar
 
+from .dnssec import (
+    DNSKEY_FLAG_REVOKED,
+    DNSKEY_FLAG_SEP,
+    DNSKEY_FLAG_ZONE_KEY,
+    DNSKEY_HEAD_OCTETS,
+    DNSKEY_PROTOCOL_VALUE,
+    DigestType,
+    digest_material,
+    ds_digest,
+    encode_base64_field,
+    encode_hex_field,
+    key_material,
+    known_digest_octets,
+    unsigned_field,
+)
+from .dnssec import (
+    key_tag as key_tag_of,
+)
 from .enums import DnsRType
 from .names import DomainName
 from .svcb import HTTPS_AUTO_MANDATORY, IntOrStr, SvcbCandidate, SvcParams
@@ -56,6 +74,8 @@ __all__ = [
     "RData_AAAA",
     "RData_CNAME",
     "RData_DNAME",
+    "RData_DNSKEY",
+    "RData_DS",
     "RData_HTTPS",
     "RData_MX",
     "RData_NS",
@@ -888,3 +908,253 @@ class RData_HTTPS(RData_SVCB):
     def default_alpn(self) -> tuple[bytes, ...]:
         """The ALPN set an RR with neither ``alpn`` nor ``no-default-alpn`` offers."""
         return self._DEFAULT_ALPN
+
+
+# ------------------------------------------------------------ DNSSEC (RFC 4034)
+
+
+class RData_DNSKEY(RData):
+    """``DNSKEY`` RDATA -- Flags, Protocol, Algorithm, Public Key (RFC 4034 §2.1).
+
+    The public key is stored as opaque octets and deliberately never interpreted:
+    §2.1.4 says only that "The format depends on the algorithm of the key being
+    stored and is described in separate documents", and those documents (RFC 3110,
+    RFC 5155, RFC 6605, RFC 8080) are exactly where the dependency question lives.
+    Everything that does not need them -- the flags, the key tag, the DS a key turns
+    into -- is computed here.
+
+    Nothing in this class rejects a key it finds unusable, because the RFCs put those
+    judgements at verification time: §2.1.2 says a Protocol other than 3 makes the RR
+    "treated as invalid *during signature verification*", and §2.1.1¶3 says the
+    reserved flag bits "MUST be ignored upon receipt". A resolver that dropped such a
+    record while parsing could not tell an operator which rule the zone broke, so it
+    is kept, and :attr:`may_verify_rrsets` states the consequence instead.
+    """
+
+    RType = DnsRType.DNSKEY
+
+    def __init__(
+        self,
+        flags: int,
+        protocol: int,
+        algorithm: int,
+        public_key,
+        *,
+        wire: bytes | None = None,
+    ) -> None:
+        self.flags = unsigned_field(flags, bits=16, name="DNSKEY flags")
+        self.protocol = unsigned_field(protocol, bits=8, name="DNSKEY protocol")
+        self.algorithm = unsigned_field(algorithm, bits=8, name="DNSKEY algorithm")
+        key = key_material(public_key)
+        if not key:
+            raise ValueError("DNSKEY public key is empty")
+        self.public_key = key
+        super().__init__(self.to_wire(), wire=wire)
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        if len(blob) <= DNSKEY_HEAD_OCTETS:
+            raise DnsPacketParseError(
+                f"DNSKEY RDATA is {len(blob)} octet(s), must exceed the "
+                f"{DNSKEY_HEAD_OCTETS}-octet Flags/Protocol/Algorithm header",
+                data=buffer,
+                offset=offset,
+            )
+        flags, protocol, algorithm = struct.unpack_from("!HBB", blob, 0)
+        return cls(flags, protocol, algorithm, blob[DNSKEY_HEAD_OCTETS:], wire=blob)
+
+    def to_wire(self) -> bytes:
+        return struct.pack("!HBB", self.flags, self.protocol, self.algorithm) + self.public_key
+
+    def to_presentation(self) -> str:
+        """``256 3 5 AQPSKmyn...`` (RFC 4034 §2.2).
+
+        Decimals for the three numeric fields, one Base64 token for the key. §2.3's
+        own example wraps that token across five lines; this does not, because a
+        single run survives being pasted into a shell and stays legal either way.
+        """
+        return (
+            f"{self.flags} {self.protocol} {self.algorithm} {encode_base64_field(self.public_key)}"
+        )
+
+    @property
+    def key_tag(self) -> int:
+        """This key's DNSSEC key tag (RFC 4034 Appendix B), for RRSIG and DS matching.
+
+        Computed from the RDATA rather than from ``self.algorithm`` on its own,
+        because that is how §B defines the function -- and it means an RR whose flags
+        or key were edited after construction cannot report a tag for bytes it no
+        longer carries.
+        """
+        return key_tag_of(self.to_wire())
+
+    @property
+    def is_zone_key(self) -> bool:
+        """Bit 7 (§2.1.1): a zone key, as opposed to some other kind of DNSKEY."""
+        return bool(self.flags & DNSKEY_FLAG_ZONE_KEY)
+
+    @property
+    def is_secure_entry_point(self) -> bool:
+        """Bit 15 (§2.1.1): the RFC 3757 hint that this key anchors a zone.
+
+        A hint, and §2.1.1 is emphatic that it stays one -- "validators MUST NOT
+        alter their behavior during the signature validation process in any way based
+        on the setting of this bit". It matters when publishing a KSK, not when
+        checking a signature made by one.
+        """
+        return bool(self.flags & DNSKEY_FLAG_SEP)
+
+    @property
+    def is_revoked(self) -> bool:
+        """Bit 8 (RFC 5011 §3): the owner has said this key should be withdrawn.
+
+        Trust-anchor bookkeeping rather than signature arithmetic. RFC 5011 §2.1
+        makes the bit decisive for a key the resolver added as an anchor of its own
+        accord, and §2.1's note that such a key "has a different fingerprint" is a
+        reminder that revoking changes the DS pointing at the key instead of making
+        the old DS wrong.
+        """
+        return bool(self.flags & DNSKEY_FLAG_REVOKED)
+
+    @property
+    def may_verify_rrsets(self) -> bool:
+        """Whether RFC 4034 permits this key to verify an RRSIG over an RRset.
+
+        Three instructions add up to this predicate: a key with the Zone Flag clear
+        "MUST NOT be used to verify RRSIGs that cover RRsets" (§2.1.1¶1), one with SEP
+        set and the Zone Flag clear is refused in the same words (§2.1.1¶2), and a
+        Protocol other than 3 makes the record "treated as invalid during signature
+        verification" (§2.1.2).
+
+        The REVOKE bit is not in here, and that is a decision rather than an
+        omission. RFC 5011 uses it to retire a trust anchor across a hold-down period
+        during which the key still signs its own RRset perfectly well; treating the
+        bit as "not a key" would have a resolver call a zone broken at the exact
+        moment its operator is doing the right thing about key rotation.
+        """
+        return self.is_zone_key and self.protocol == DNSKEY_PROTOCOL_VALUE and bool(self.public_key)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RData_DNSKEY):
+            return self.to_wire() == other.to_wire()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.type_name, self.to_wire()))
+
+
+class RData_DS(RData):
+    """``DS`` RDATA -- Key Tag, Algorithm, Digest Type, Digest (RFC 4034 §5.1).
+
+    The record that lets the chain of trust cross a zone cut: the parent holds a hash
+    of the child's key rather than the key itself, so the child signs below the cut
+    with material the parent never sees. §5.1 makes the first three fields a copy of
+    the DNSKEY being pointed at and the fourth a hash of the owner name and RDATA
+    together (§5.1.4).
+
+    The digest is opaque here for the same reason a public key is opaque in
+    :class:`RData_DNSKEY`: this package can *produce* one and compare one, but has
+    nothing to authenticate it against until validation exists.
+    """
+
+    RType = DnsRType.DS
+
+    #: Key Tag (2) + Algorithm (1) + Digest Type (1), ahead of the digest.
+    _HEAD_OCTETS = 4
+
+    def __init__(
+        self,
+        key_tag: int,
+        algorithm: int,
+        digest_type: int,
+        digest,
+        *,
+        wire: bytes | None = None,
+    ) -> None:
+        self.key_tag = unsigned_field(key_tag, bits=16, name="DS key tag")
+        self.algorithm = unsigned_field(algorithm, bits=8, name="DS algorithm")
+        self.digest_type = unsigned_field(digest_type, bits=8, name="DS digest type")
+        value = digest_material(digest)
+        if not value:
+            raise ValueError("DS digest is empty")
+        self.digest = value
+        super().__init__(self.to_wire(), wire=wire)
+
+    @classmethod
+    def for_dnskey(cls, owner, dnskey: RData_DNSKEY, digest_type=DigestType.SHA256):
+        """The DS a parent publishes to introduce *dnskey* (RFC 4034 §5.1.4, §5.4).
+
+        The three identifying fields are copied from the key rather than derived
+        separately: §5.1.1 and §5.1.2 say the DS "lists the key tag / the algorithm
+        number of the DNSKEY RR referred to", so a DS that disagrees with the key it
+        names is a mistake, never a legitimate record.
+
+        SHA-256 is the default because it is what a parent is expected to publish
+        today; the mandatory-to-implement digest in RFC 4034's own Appendix A.2 was
+        SHA-1, and the parameter exists because that has already changed once.
+        """
+        return cls(
+            dnskey.key_tag,
+            dnskey.algorithm,
+            int(digest_type),
+            ds_digest(owner, dnskey.to_wire(), digest_type),
+        )
+
+    @classmethod
+    def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
+        blob = cls.rdata_octets(buffer, offset, length)
+        if len(blob) <= cls._HEAD_OCTETS:
+            raise DnsPacketParseError(
+                f"DS RDATA is {len(blob)} octet(s), must exceed the "
+                f"{cls._HEAD_OCTETS}-octet Key Tag/Algorithm/Digest Type header",
+                data=buffer,
+                offset=offset,
+            )
+        tag, algorithm, digest_type = struct.unpack_from("!HBB", blob, 0)
+        digest = blob[cls._HEAD_OCTETS :]
+        expected = known_digest_octets(digest_type)
+        if expected is not None and len(digest) != expected:
+            raise DnsPacketParseError(
+                f"DS digest of type {digest_type} is {len(digest)} octet(s), must be {expected}",
+                data=buffer,
+                offset=offset + cls._HEAD_OCTETS,
+            )
+        return cls(tag, algorithm, digest_type, digest, wire=blob)
+
+    def to_wire(self) -> bytes:
+        return struct.pack("!HBB", self.key_tag, self.algorithm, self.digest_type) + self.digest
+
+    def to_presentation(self) -> str:
+        """``60485 5 1 2BB183AF...`` (RFC 4034 §5.3, matching §5.4's example).
+
+        §5.3 allows the algorithm as a mnemonic; decimals are what it also permits
+        and what survives a diff.
+        """
+        return f"{self.key_tag} {self.algorithm} {self.digest_type} {encode_hex_field(self.digest)}"
+
+    def refers_to(self, dnskey: RData_DNSKEY, owner) -> bool:
+        """Whether this DS names *dnskey* -- the claim RFC 4034 §5.3.1 asks a
+        validator to check before it treats a key as introduced.
+
+        The cheap fields are compared first because that is how a validator prunes
+        candidates, but a tag match proves nothing on its own: Appendix B¶2 says
+        "Implementations MUST NOT assume that the key tag uniquely identifies a
+        DNSKEY RR". So the tag and algorithm only decide whether to hash; the hash
+        decides the answer. An unsupported digest type is ``False`` rather than an
+        error, because "I cannot confirm this" and "this is broken" are different
+        statements and only the first one is ours to make.
+        """
+        if dnskey.key_tag != self.key_tag or dnskey.algorithm != self.algorithm:
+            return False
+        if known_digest_octets(self.digest_type) is None:
+            return False
+        return ds_digest(owner, dnskey.to_wire(), self.digest_type) == self.digest
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RData_DS):
+            return self.to_wire() == other.to_wire()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.type_name, self.to_wire()))

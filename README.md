@@ -148,6 +148,11 @@ them change the security properties of anything built on top.
   verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
   are unauthenticated: anyone who can deliver a well-formed response that matches
   the question — same source address, same ID, echoed question — is believed.
+  `DNSKEY` and `DS` do decode now, key tag and DS digest included
+  (`namespy/dnssec.py`; RFC 4034 §2, §5, Appendix B) — that is the half needing no
+  cryptographic dependency. What is missing is RRSIG and the proof records
+  (`NSEC`/`NSEC3`), the canonical-RRset rule they depend on, and the verification
+  itself.
 - **EDNS(0) options are partial: NSID, Extended DNS Errors and MQTYPE are put to
   use.**
   Outbound queries advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with

@@ -367,6 +367,38 @@ nothing has been tagged or published yet, so `master` is the only version.
   a line whose two names differ only in case reads like two names. A cached denial is consulted
   before the RFC 9520 failure note where the two overlap, since one is a proof with an SOA behind
   it and the other only a promise not to ask again.
+- The first leg of DNSSEC (RFC 4034 §2, §5, Appendix B) — `DNSKEY` and `DS` stop being RFC 3597
+  hex blobs. `namespy/dnssec.py` holds the arithmetic and `RData_DNSKEY` / `RData_DS` in
+  `namespy/rdata.py` are the codecs, registered on type numbers 48 and 43 like every other
+  type this package understands. The point of doing these two first is that they need no
+  dependency: a DNSKEY carries a public key it never interprets (§2.1.4 defers the format to
+  documents this package does not implement), a DS carries a hash it never checks, the key tag
+  is a 16-bit checksum, and the digest is one `hashlib` call over "DNSKEY owner name | DNSKEY
+  RDATA" (§5.1.4). Signature verification — RSA, ECDSA, EdDSA — is where the dependency
+  decision actually lives, and it is still ahead.
+- Both published vectors in RFC 4034 are the tests, so nothing here is a number this code
+  computed and then agreed with: §5.4's DNSKEY yields key tag **60485** and SHA-1 digest
+  **2BB183AF5F22588179A53B0A98631FAD1A292118** exactly as printed. A checksum with no other
+  vector is cross-checked against a second, independent transcription of Appendix B's reference
+  C code over odd and even lengths.
+- Two verified errata change the answer and are pinned by name. **4552** corrects Appendix B's
+  prose ("ignoring any carry bits") to what the C actually does — accumulate at 32-bit
+  precision, fold once, discard only the carry that fold produces — and warns the result is
+  "often the same as reduction modulo 65535, but not always"; `test_key_tag_is_not_reduction_modulo_65535`
+  uses the smallest input where they differ, because a shortcut that agrees on
+  most keys and disagrees on some lands its disagreement on a delegation. **193** corrects
+  §B.1's parenthetical for algorithm 1 from "4th to last and 3rd to last" octets to "3rd to last
+  and 2nd to last", which is what its own normative phrase always meant; the vector there is
+  built so the two readings give different numbers.
+- Digest types are the ones this package can actually produce — SHA-1 (§A.2), SHA-256
+  (RFC 4509 §2), SHA-384 (RFC 6605 §2) — and minting any other refuses *by number* rather than
+  approximating it. Reading is deliberately more forgiving than writing: a DS with an unknown
+  digest type parses, round-trips and prints, because refusing to parse a delegation would turn
+  this resolver's ignorance into SERVFAIL for someone else's zone. Same asymmetry in `DNSKEY`:
+  a key with the wrong Protocol or a missing Zone Flag is kept and reported
+  (`may_verify_rrsets`), not dropped at parse time, because §2.1.2 puts that judgement at
+  verification and an operator needs to see which rule the zone broke.
+
 
 ### Fixed
 
