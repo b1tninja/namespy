@@ -166,6 +166,62 @@ class GluePolicy(enum.Enum):
     PERMISSIVE = "permissive"
 
 
+class NxdomainPolicy(enum.Enum):
+    """How much of a remembered NXDOMAIN may be answered without asking again.
+
+    RFC 8020 §2¶1: "When an iterative caching DNS resolver receives an NXDOMAIN
+    response, it SHOULD store it in its cache and then all names and resource
+    record sets (RRsets) at or below that node SHOULD be considered unreachable.
+    Subsequent queries for such names SHOULD elicit an NXDOMAIN response." The
+    operative words are *at or below*: a denial proved for one name is a
+    statement about the whole subtree beneath it -- and about every RRset at the
+    node itself, which is how a AAAA comes to be answered by the NXDOMAIN that
+    arrived for an A. That is also why this needs a lookup of its own rather than
+    a cache hit: the denial was written under whichever type happened to be asked
+    first, and the cut is not about the type.
+
+    :attr:`ALWAYS` is the §2 SHOULD, and the default.
+
+    :attr:`NEVER` exists because the generalisation is bounded by a TTL rather
+    than by the truth: a name created under a denied node stays invisible until
+    the negative entry expires, which §2¶4 concedes outright -- "The fact that a
+    subtree does not exist is not forever". That makes the cut wrong for one job,
+    the same job ``--no-failure-cache`` exists for: watching a zone change. It is
+    not a safety knob. Unlike out-of-bailiwick glue it cannot hand a lookup to
+    somebody else's choice of server; the worst it can do be briefly stale, and
+    RFC 2308 §3 already bounds that.
+
+    :attr:`VALIDATED` is §2¶3: "a validating resolver MAY decide to implement the
+    'NXDOMAIN cut' behavior (described in the first paragraph of this section)
+    only when the NXDOMAIN response has been validated with DNSSEC". It cannot be
+    honoured yet, because nothing here validates, so constructing it raises
+    instead of quietly behaving like :attr:`NEVER`. The two emit the same
+    packets, and a caller who asked for validated-only would have no way to tell
+    "the proofs did not check out" from "there is no verification at all".
+
+    Three things no stance of this policy changes, in the same spirit as
+    :class:`GluePolicy`:
+
+    * **the proof** -- an entry can only exist if an SOA denied the name
+      (RFC 2308 §5 refuses to cache a negative without one);
+    * **the clock** -- the entry's life is that SOA's negative TTL (§3), so a cut
+      can never outlive the answer it came from;
+    * **the origin** -- response matching (RFC 5452 §9.1) and the bailiwick
+      filter decide what a response is allowed to say in the first place, which
+      is a different threat from how long its claims are remembered.
+    """
+
+    #: RFC 8020 §2 as written: a denied subtree is unreachable. The default.
+    ALWAYS = "always"
+
+    #: Deny only the exact name cached; walk below it. Diagnostics only.
+    NEVER = "never"
+
+    #: Cut only on DNSSEC-validated denials (RFC 8020 §2¶3). Not representable
+    #: without validation, and refuses to be constructed.
+    VALIDATED = "validated"
+
+
 class Resolver(asyncio.Protocol):
     """Send queries to authoritative servers and match the answers.
 
@@ -208,6 +264,7 @@ class Resolver(asyncio.Protocol):
     #: The safe member is also the class default, so a driver that never sets
     #: it -- and a test that builds a bare ``Resolver()`` -- filters strictly.
     glue_policy = GluePolicy.STRICT
+    nxdomain_cut = NxdomainPolicy.ALWAYS
 
     #: Optional DNS suffix the resolver assumes for *relative* names — those
     #: whose presentation form does not end in the root terminator (``.``).
@@ -905,6 +962,26 @@ class Nxdomain:
 
 
 @dataclass(frozen=True)
+class NxdomainCut:
+    """A cached denial at or above this name answered for it, without asking (RFC 8020 §2).
+
+    *denied_by* is the name whose NXDOMAIN did it, and the pair is the whole
+    point of the event. Nothing in RFC 8020 asks for this to be reported -- §2 is
+    only about the answer -- but it is reported anyway, because the alternative is
+    an operator debugging a denial whose cause is nowhere in the reply: what the
+    response carries is the *ancestor's* SOA (Appendix A: "The accompanying SOA
+    record indicates the apex of the zone, not the closest existing domain name")
+    beside a question naming the deeper name, so a trace line is the only place
+    the two names appear together. The reader this is for is the one §5¶1
+    describes -- the administrator whose internal machines live under a name the
+    TLD has already denied.
+    """
+
+    name: str
+    denied_by: str
+
+
+@dataclass(frozen=True)
 class Cname:
     """An alias was encountered; *target* must be re-anchored as the new SNAME.
 
@@ -1520,6 +1597,7 @@ def resolve_steps(
     max_alias_hops: int = MAX_ALIAS_HOPS,
     qname_min: bool = False,
     glue_policy: GluePolicy = GluePolicy.STRICT,
+    nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
     failures=None,
     extra_qtypes: tuple = (),
 ):
@@ -1534,6 +1612,18 @@ def resolve_steps(
     ``Answer``/``Done`` or ``Nxdomain``/``Nodata``/``Done`` on a hit. After
     a real authoritative response classifies as a terminal event, the
     result is written back to the cache.
+
+    ``nxdomain_cut`` decides whether a denial cached at or above the name may
+    answer for it without a query (RFC 8020 §2 -- see :class:`NxdomainPolicy`). It
+    is consulted after the exact-key lookup, which is also §2¶2's allowance that
+    "if a resolver has cached data under the NXDOMAIN cut, it MAY continue to send
+    it as a reply (until the TTL of this cached data expires)": data already filed
+    under a cut is a better answer than the cut. It precedes the failure cache
+    because a cached NXDOMAIN is a proof with an SOA behind it, where a failure
+    note is only a promise not to ask again. The cut is checked on every hop rather
+    than once at the top, because §2¶6 warns that "if there is a chain of CNAME (or
+    DNAME), the name that does not exist is the last of the chain ... and not the
+    QNAME" -- checking at the origin would miss a denial reached through an alias.
 
     If ``failures`` is provided (a :class:`namespy.cache.FailureCache`), the
     same loop also refuses to *start* a query whose failure is already
@@ -1601,6 +1691,10 @@ def resolve_steps(
     #: SERVFAIL") rather than the bare fact that the list ran dry.
     demotions: dict = {}
 
+    #: Whether a denial cached above a name may answer for it (RFC 8020 §2).
+    #: Decided once: a policy cannot change partway down a walk.
+    cut_enabled = nxdomain_cut is NxdomainPolicy.ALWAYS
+
     def _remember(reason):
         """Note that this name cannot be resolved right now (RFC 9520 §3.2)."""
         if failures is None:
@@ -1628,6 +1722,19 @@ def resolve_steps(
                     yield Nodata(hit.soa)
                 yield Done(_synthesize_response(sname, hit))
                 return
+            if cut_enabled:
+                cut = _nxdomain_cut(cache, sname.qname, sname.qclass)
+                if cut is not None:
+                    # RFC 8020 §2¶1: the cached NXDOMAIN for an ancestor makes
+                    # this name "unreachable", so the lookup ends here without
+                    # touching the network. The event order matters as much as
+                    # the answer: NxdomainCut first, because it is what makes the
+                    # bare Nxdomain below it traceable to someone else's denial.
+                    entry, denied_by = cut
+                    yield NxdomainCut(str(sname.qname), str(denied_by))
+                    yield Nxdomain()
+                    yield Done(_synthesize_response(sname, entry))
+                    return
         if failures is not None:
             blocked = failures.match(sname.qname, sname.qtype, sname.qclass)
             if blocked is not None:
@@ -1883,6 +1990,46 @@ def _cached_failure_reason(entry) -> str:
     """
     subject = f"zone {entry.zone}" if entry.zone is not None else "this name"
     return f"cached failure for {subject}: {entry.reason} (strike {entry.strikes})"
+
+
+def _nxdomain_cut(cache, name, qclass):
+    """The cached NXDOMAIN that denies *name*, or ``None`` (RFC 8020 §2¶1).
+
+    Walks the name's ancestors from the closest down, the name itself included,
+    and stops at the first denial.
+
+    Including the name is not redundancy with :meth:`~namespy.cache.DnsCache.get`,
+    and it took a failing test to see why. §2¶1 covers "all names and resource
+    record sets (RRsets) *at* or below that node", and the node is the name that
+    was denied -- so the denial that arrived for an A is also a statement about
+    every other RRset at that name, which a per-type lookup (RFC 2308's model)
+    cannot see. Appendix A is the other half of why the key is this name: "we
+    deduce the nonexistence of a domain only for NXDOMAIN answers where the denied
+    name was the exact domain ... The accompanying SOA record indicates the apex of
+    the zone, not the closest existing domain name."
+
+    Closest-first is not cosmetic either. The SOA the answer carries has to come
+    from the zone that made the denial, and a denial at ``example.com`` proves
+    less than one at ``foo.example.com``: taking the outermost match would answer
+    for a subtree using evidence about a smaller one. Stopping at the first hit is
+    also what keeps this cheap -- each step is one indexed lookup, and the walk is
+    as long as the name has labels.
+
+    The ancestor is returned alongside the entry, and it is the ancestor *as the
+    queried name spells it*, not as the cached entry happens to be stored: case
+    is not significant (RFC 1035 §3.1) but it is very visible in a trace line, and
+    "www.Foo.EXAMPLE denied by FOO.example" reads like two names when it is one.
+
+    Only NXDOMAIN may cut. :meth:`~namespy.cache.DnsCache.nxdomain_at` is what
+    enforces that per backend, so a cache that cannot answer the question returns
+    ``None`` and the walk continues: RFC 8020 is a SHOULD, and asking again is
+    never wrong.
+    """
+    for ancestor in reversed(DomainName(name).hierarchy()):
+        hit = cache.nxdomain_at(ancestor, qclass)
+        if hit is not None:
+            return hit, ancestor
+    return None
 
 
 def _synthesize_response(sname, hit):
@@ -2155,6 +2302,7 @@ class RecursiveResolver(Resolver):
         edns_options: Sequence = (),
         qname_min: bool = False,
         glue_policy: GluePolicy = GluePolicy.STRICT,
+        nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
     ):
         """Build a resolver without touching the network.
 
@@ -2201,9 +2349,18 @@ class RecursiveResolver(Resolver):
             :class:`GluePolicy` says what accepting costs and what it does not.
             Also accepted as the equivalent string, so a config file or CLI flag
             can hand it over directly.
-        :raises ValueError: if *glue_policy* is not a :class:`GluePolicy` (or its
-            name/value) -- a policy that silently failed to apply would be worse
-            than one that was refused at the door.
+        :param nxdomain_cut: whether a NXDOMAIN already in the cache may deny the
+            names below it without a query. The default,
+            :attr:`NxdomainPolicy.ALWAYS`, is RFC 8020 section 2's SHOULD.
+            :attr:`NxdomainPolicy.NEVER` answers only the exact name cached and
+            walks everything beneath it: correct for watching a zone change, and
+            wrong for serving, because it throws away the reason the negative
+            cache has a subtree-wide claim at all. :class:`NxdomainPolicy` says
+            what each stance costs. Also accepted as the equivalent string.
+        :raises ValueError: if *glue_policy* or *nxdomain_cut* is not a
+            :class:`GluePolicy` / :class:`NxdomainPolicy` (or its name/value), or
+            if *nxdomain_cut* is :attr:`NxdomainPolicy.VALIDATED` -- a policy that
+            silently failed to apply would be worse than one refused at the door.
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
         """
         self.queue: dict[tuple, tuple] = {}
@@ -2233,6 +2390,27 @@ class RecursiveResolver(Resolver):
                 "resolver_glue_policy=%s: out-of-bailiwick glue will be believed "
                 "(RFC 5452 section 6 filtering disabled) -- diagnostics only",
                 self.glue_policy.value,
+            )
+        # Same coercion, same reason: NxdomainPolicy("never") from a config file
+        # and NxdomainPolicy.NEVER must arrive as one thing, and a typo must not
+        # leave a resolver that thinks it has a policy.
+        self.nxdomain_cut = NxdomainPolicy(nxdomain_cut)
+        if self.nxdomain_cut is NxdomainPolicy.VALIDATED:
+            # Refused rather than degraded. VALIDATED and NEVER produce identical
+            # packets today -- nothing here validates -- so a silent fallback
+            # would look like it worked while teaching the operator that DNSSEC
+            # proof is what stopped the cut, when in fact nothing was checked.
+            raise ValueError(
+                "NxdomainPolicy.VALIDATED needs DNSSEC validation, which namespy "
+                "does not perform yet; use NxdomainPolicy.ALWAYS (RFC 8020 section 2) "
+                "or NxdomainPolicy.NEVER"
+            )
+        if self.nxdomain_cut is NxdomainPolicy.NEVER:
+            # Not a warning: unlike permissive glue this disables an efficiency,
+            # not a defense, and leaves the resolver strictly more chatty.
+            self.log.info(
+                "resolver_nxdomain_cut=never: names below a cached NXDOMAIN will be "
+                "walked again (RFC 8020 section 2 disabled) -- for watching a zone change",
             )
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
@@ -2685,12 +2863,17 @@ class RecursiveResolver(Resolver):
                     # that stopped at the top of the descent would be a policy
                     # that silently changes meaning halfway down -- in the
                     # permissive direction, one that reports an adoption the
-                    # sub-resolution never performed.
+                    # sub-resolution never performed. nxdomain_cut is inherited
+                    # for the same reason and more simply: a nameserver name
+                    # beneath a cached denial has no address to find, and walking
+                    # it anyway is exactly the traffic RFC 8020 section 2 asks a
+                    # resolver to stop sending.
                     sub_gen = resolve_steps(
                         child_sname,
                         child_slist,
                         self.cache,
                         glue_policy=self.glue_policy,
+                        nxdomain_cut=self.nxdomain_cut,
                         failures=self.failure_cache,
                     )
                     sub_response = await self._drive(sub_gen, child_trace, depth + 1)
@@ -2800,6 +2983,7 @@ class RecursiveResolver(Resolver):
             max_alias_hops=self.max_alias_hops,
             qname_min=self.qname_min,
             glue_policy=self.glue_policy,
+            nxdomain_cut=self.nxdomain_cut,
             failures=self.failure_cache,
             extra_qtypes=tuple(extra_qtypes),
         )

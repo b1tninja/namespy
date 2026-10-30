@@ -86,6 +86,23 @@ def _name_text(name):
     return name.canonical_text
 
 
+def _decode_soa(payload):
+    """Recover the SOA that proved a denial, or ``None`` when it cannot be read.
+
+    A payload this parser cannot read means a truncated write or a database left
+    by an older build. Degrading to "negative entry without SOA" costs a
+    re-query, which beats failing the lookup outright.
+    """
+    if not payload:
+        return None
+    try:
+        soa, _ = DnsRecord.parse(bytes(payload), 0)
+    except (DnsPacketParseError, struct.error, IndexError) as exc:
+        LOGGER.debug("cache_soa_undecodable(err=%s)", exc)
+        return None
+    return soa
+
+
 class SqliteDnsCache(DnsCache):
     """SQLite-backed :class:`~namespy.cache.DnsCache`.
 
@@ -162,17 +179,28 @@ class SqliteDnsCache(DnsCache):
                 expires_at,
                 bool(authoritative),
             )
-        soa = None
-        if payload:
-            try:
-                soa, _ = DnsRecord.parse(bytes(payload), 0)
-            except (DnsPacketParseError, struct.error, IndexError) as exc:
-                # A row this parser cannot read means a truncated write or a DB
-                # from an older build. Degrade to "negative entry without SOA",
-                # which costs a re-query, rather than failing the lookup outright.
-                LOGGER.debug("cache_soa_undecodable(err=%s)", exc)
-                soa = None
-        return NegativeEntry(name, qtype, qclass, rcode, soa, expires_at)
+        return NegativeEntry(name, qtype, qclass, rcode, _decode_soa(payload), expires_at)
+
+    def nxdomain_at(self, name, qclass):
+        key_name = _name_text(name)
+        qc = int(qclass)
+        now = self.time_fn()
+        # kind = NXDOMAIN and nothing else: a NODATA row denies one type at one
+        # name and says nothing about the subtree below it, which is the whole of
+        # RFC 8020 §2. qtype is deliberately absent -- the entry was written under
+        # whichever type happened to be asked first, and the cut is not about the
+        # type. Filtering on name alone uses the leftmost column of the primary
+        # key, so the ancestor walk this method feeds costs one indexed read per
+        # label rather than a scan.
+        row = self._conn.execute(
+            "SELECT qtype, rcode, expires_at, payload FROM rrset_cache "
+            "WHERE name=? AND qclass=? AND kind=? AND expires_at>? LIMIT 1",
+            (key_name, qc, _KIND_NXDOMAIN, now),
+        ).fetchone()
+        if row is None:
+            return None
+        row_qtype, rcode, expires_at, payload = row
+        return NegativeEntry(name, row_qtype, qc, rcode, _decode_soa(payload), expires_at)
 
     def put(self, entry):
         key_name = _name_text(entry.name)

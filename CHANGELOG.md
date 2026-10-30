@@ -332,6 +332,41 @@ nothing has been tagged or published yet, so `master` is the only version.
   bundling descent — are attached as child traces and render as their own diagrams, so the
   file says what was asked and how many times. A lookup that did not bundle renders exactly as
   before, marker absent, which is what the existing mermaid tests pin.
+- The NXDOMAIN cut (RFC 8020 §2) — a NXDOMAIN already in the cache now denies the names at and
+  below it, so a lookup that RFC 2308 would send upstream is answered from the denial the zone
+  already made. §2¶1's claim is about *names* — "all names and resource record sets (RRsets) at
+  or below that node SHOULD be considered unreachable" — while a negative entry is keyed
+  `(name, qtype, class)`, so the
+  NXDOMAIN that arrived in answer to an A was invisible to the AAAA this cut is meant to serve.
+  That is why the change is in the cache layer and not the resolver: `DnsCache.nxdomain_at(name,
+  qclass)` is the QTYPE-free lookup `get()` cannot be. Its SQLite form is one read on the primary
+  key's leftmost column; its in-memory form is an index maintained on every removal path, because
+  the cut is consulted on every hop of every query and a scan of the cache per hop would cost
+  more than the traffic the cut saves. The base implementation returns `None` rather than raising:
+  the cut is a SHOULD, so a backend that cannot answer it keeps walking, which is the behaviour
+  from before it existed. Two consequences of §2 that tests caught by failing — and were right to:
+  the *name itself* is cut for every other type, since §2¶1 says "at or below that node" and the
+  node is the denied name — re-proving a nonexistence the zone already stated is not what RFC 8020
+  asks for; and the cut
+  must be consulted at *every* hop, because §2¶6 makes the denied name the last one in an alias
+  chain, so a resolver that checked only at the origin would walk straight into a subtree its own
+  cache says is unreachable. `NxdomainPolicy` decides all this and sits beside `GluePolicy`
+  deliberately: `ALWAYS` is the §2 SHOULD, and `NEVER` exists for the reason §2¶4 gives — "The
+  fact that a subtree does not exist is not forever" — so a name created under a denied node is
+  invisible until the negative entry expires, which is wrong for serving and exactly right for
+  watching a zone change, the same split `--no-failure-cache` draws. Unlike permissive glue it
+  gives up an efficiency rather than a defense, so it logs instead of warning on stderr.
+  `VALIDATED` is §2¶3's MAY — cut only when the NXDOMAIN was DNSSEC-validated — and is refused at
+  the door with a message naming DNSSEC, because it and `NEVER` emit identical packets while
+  nothing here validates, and a silent fallback would let an operator believe proofs were what
+  stopped the cut; the test that pins the refusal is the one that has to change when validation
+  arrives. A cut's answer is indistinguishable on the wire from a denial fetched for the name
+  asked about — the reply carries the *ancestor's* SOA beside a question naming the deeper name —
+  so `--trace` gains `NXDOMAIN cut: www.foo.example below foo.example` and the answer a matching
+  `;;` line, both naming the ancestor, and both halves reported in the case the query used because
+  a line whose two names differ only in case reads like two names. A cached denial is consulted
+  before the RFC 9520 failure note where the two overlap, since one is a proof with an SOA behind
+  it and the other only a promise not to ask again.
 
 ### Fixed
 

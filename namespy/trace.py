@@ -95,6 +95,12 @@ class Trace:
                 body.append(f"    Note over C: NODATA SOA={ev.soa.name if ev.soa else '?'}")
             elif cn == "Nxdomain":
                 body.append("    Note over C: NXDOMAIN")
+            elif cn == "NxdomainCut":
+                # Rendered *before* the NXDOMAIN it caused, and naming both
+                # halves on purpose: the packets of a cut and of a fetched denial
+                # are indistinguishable, so this line is the only place the
+                # denied name and the ancestor that denied it appear together.
+                body.append(f"    Note over C: NXDOMAIN cut: {ev.name} below {ev.denied_by}")
             elif cn == "Demote":
                 ns = ev.entry.ns if ev.entry is not None else "?"
                 body.append(f"    Note over C: demote {ns} ({ev.reason})")

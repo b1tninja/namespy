@@ -40,7 +40,7 @@ from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Response
 from namespy.rdata import RData, RData_A, RData_AAAA, RData_NS, RData_TXT
-from namespy.resolver import Done, GluePolicy, Sname
+from namespy.resolver import Done, GluePolicy, NxdomainCut, NxdomainPolicy, Sname
 from namespy.trace import Trace
 
 
@@ -1004,3 +1004,62 @@ async def test_an_ordinary_lookup_keeps_the_output_it_always_had(monkeypatch, ca
     _stub_endpoints(monkeypatch, _answered)
     assert await cli.cli_query(_args(["example.org"])) == 0
     assert "MQTYPE SECTION" not in capsys.readouterr().out
+
+
+def test_the_nxdomain_cut_is_on_until_told_otherwise():
+    """RFC 8020 is the default behaviour of every recursive resolver of note."""
+    assert _args(["example.com"]).no_nxdomain_cut is False
+
+
+async def test_the_no_nxdomain_cut_switch_reaches_the_resolver(monkeypatch):
+    """Parsing a flag is not wiring a policy.
+
+    The consequence of a mistake here is the bad kind: the lookup still succeeds,
+    so an operator watching a delegation appear concludes the zone has not changed
+    when in fact their own resolver answered from a sibling's cached denial.
+    """
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["--no-nxdomain-cut", "example.com"])) == 0
+    assert made[0][1].nxdomain_cut is NxdomainPolicy.NEVER
+
+    assert await cli.cli_query(_args(["example.com"])) == 0
+    assert made[1][1].nxdomain_cut is NxdomainPolicy.ALWAYS
+
+
+def test_a_cut_says_which_denial_answered_for_it():
+    """The response cannot show this, so the printer has to.
+
+    What the packet carries is the ancestor's SOA beside a question naming the
+    deeper name -- indistinguishable from a denial fetched for the name itself,
+    which is exactly why the person who just created that name needs the line.
+    """
+    cut = NxdomainCut("www.foo.example.com.", "foo.example.com.")
+    text = _format_response(_explained((3, b"")), _args(["example.com"]), 3, cut=cut)
+    assert ";; NXDOMAIN cut: www.foo.example.com." in text
+    assert "foo.example.com." in text
+
+
+def test_an_ordinary_answer_says_nothing_about_cuts():
+    """No cut, no line: the output of a normal lookup stays the output of a normal one."""
+    text = _format_response(_explained((3, b"")), _args(["example.com"]), 3)
+    assert "NXDOMAIN cut" not in text
+
+
+def test_the_cut_is_found_in_a_child_trace_too():
+    """A bundle re-ask can end in a cut, and hangs its trace off the descent.
+
+    Searching only the top trace would print the answer and drop the one line that
+    explains it, which is the failure this feature exists to prevent.
+    """
+    response = _explained((3, b""))
+    top = Trace(Sname(DomainName("example.com.")))
+    child = top.child(Sname(DomainName("www.foo.example.com.")))
+    child.record(NxdomainCut("www.foo.example.com.", "foo.example.com."))
+    response.trace = top
+
+    found = cli._nxdomain_cut_of(response)
+    assert found is not None
+    assert found.denied_by == "foo.example.com."
+
+    assert cli._nxdomain_cut_of(_explained((3, b""))) is None

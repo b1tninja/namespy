@@ -1,4 +1,5 @@
 import ipaddress
+import struct
 
 import pytest
 
@@ -260,3 +261,143 @@ def test_put_replaces_existing(make_cache):
     assert len(cache) == 1
     got = cache.get(DomainName("example.com."), DnsRType.A, DnsRClass.IN)
     assert ipaddress.IPv4Address(bytes(got.records[0].rdata)) == ipaddress.IPv4Address("2.2.2.2")
+
+
+# ------------------------------------------------- RFC 8020: the QTYPE-free denial
+
+
+def _soa_proof(zone):
+    """A wire-parseable SOA, because a negative proof has to survive a backend.
+
+    The inline ``rdata=b""`` the round-trip tests above use decodes to nothing on
+    the far side of a serialising cache -- which is fine when all that matters is
+    the rcode, and not fine here: several assertions below are about *which*
+    zone's SOA came back, since that record is the evidence a cut is served with.
+    """
+    rdata = (
+        DomainName(f"ns.{zone}").__bytes__()
+        + DomainName(f"adm.{zone}").__bytes__()
+        + struct.pack("!IIIII", 1, 7200, 3600, 1209600, 60)
+    )
+    return DnsRecord(DomainName(zone), DnsRType.SOA, DnsRClass.IN, 60, rdata=rdata)
+
+
+def _deny(
+    cache,
+    name,
+    qtype,
+    expires_at,
+    *,
+    soa_zone="example.com.",
+    qclass=DnsRClass.IN,
+    rcode=DnsResponseCode.NAME_ERROR,
+):
+    """Cache a denial for *name* so a cut can be tried against it."""
+    cache.put(
+        NegativeEntry(
+            DomainName(name),
+            qtype,
+            qclass,
+            rcode,
+            _soa_proof(soa_zone),
+            expires_at,
+        )
+    )
+
+
+def test_nxdomain_at_ignores_the_type_that_asked(make_cache):
+    """The reason this method exists at all: RFC 8020's claim is about a name.
+
+    "all names and resource record sets (RRsets) at or below that node SHOULD be
+    considered unreachable" (§2¶1) mentions no type, but the denial was written
+    under whichever type was asked first. The two assertions below are the gap and
+    the fill: get() cannot see it, nxdomain_at() can.
+    """
+    clock = _Clock()
+    cache = make_cache(clock)
+    _deny(cache, "foo.example.com.", DnsRType.A, clock.t + 60)
+
+    assert cache.get(DomainName("foo.example.com."), DnsRType.AAAA, DnsRClass.IN) is None
+    hit = cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.IN)
+    assert isinstance(hit, NegativeEntry)
+    assert hit.rcode == DnsResponseCode.NAME_ERROR
+
+
+def test_nxdomain_at_carries_the_proof(make_cache):
+    """The SOA comes back, because it is the only evidence in the answer."""
+    clock = _Clock()
+    cache = make_cache(clock)
+    _deny(cache, "foo.example.com.", DnsRType.A, clock.t + 60, soa_zone="example.com.")
+    hit = cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.IN)
+    assert hit.soa is not None
+    assert hit.soa.name == DomainName("example.com.")
+
+
+def test_nxdomain_at_folds_case_and_terminator_like_get(make_cache):
+    """One folding rule for both lookups, or they disagree about name equality."""
+    clock = _Clock()
+    cache = make_cache(clock)
+    _deny(cache, "FOO.example.com.", DnsRType.A, clock.t + 60)
+    assert cache.nxdomain_at(DomainName("foo.EXAMPLE.com"), DnsRClass.IN) is not None
+
+
+def test_nxdomain_at_misses_an_expired_denial(make_cache):
+    """A denial the zone has stopped vouching for cannot deny anything (§2308 3)."""
+    clock = _Clock()
+    cache = make_cache(clock)
+    _deny(cache, "foo.example.com.", DnsRType.A, clock.t + 60)
+    assert cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.IN) is not None
+    clock.t += 61
+    assert cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.IN) is None
+
+
+def test_nxdomain_at_ignores_nodata(make_cache):
+    """NODATA means one type is missing at one name. It has no subtree to cut.
+
+    Both live in ``NegativeEntry``, so this is the assertion that keeps a
+    convenience of the data model from turning into a bug in the policy: a cached
+    NODATA for ``foo`` must never deny ``bar.foo``.
+    """
+    clock = _Clock()
+    cache = make_cache(clock)
+    _deny(
+        cache,
+        "foo.example.com.",
+        DnsRType.A,
+        clock.t + 60,
+        rcode=DnsResponseCode.NO_ERROR,
+    )
+    assert cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.IN) is None
+
+
+def test_nxdomain_at_is_exact_and_class_scoped(make_cache):
+    clock = _Clock()
+    cache = make_cache(clock)
+    _deny(cache, "foo.example.com.", DnsRType.A, clock.t + 60)
+    # No subtree logic in the cache: deciding that a name is *below* a denial is
+    # the caller's walk. A cache that guessed would leave the resolver without
+    # ownership of the rule it is supposed to be implementing.
+    assert cache.nxdomain_at(DomainName("bar.foo.example.com."), DnsRClass.IN) is None
+    assert cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.CH) is None
+
+
+def test_nxdomain_at_base_class_declines():
+    """A backend that cannot answer this declines instead of breaking.
+
+    The default is ``None``, not NotImplementedError, because RFC 8020 is a
+    SHOULD: a third-party cache written before the cut existed must keep working,
+    simply walking where a smarter backend would stop.
+    """
+
+    class Minimal(DnsCache):
+        def get(self, name, qtype, qclass):
+            return None
+
+        def put(self, entry):
+            pass
+
+        def __len__(self):
+            return 0
+
+    cache = Minimal()
+    assert cache.nxdomain_at(DomainName("foo.example.com."), DnsRClass.IN) is None

@@ -154,6 +154,28 @@ class NegativeEntry(CacheEntry):
         return f"<NegativeEntry {self.name}/{self.qtype} rcode={self.rcode}>"
 
 
+def _cut_key(name, qclass):
+    """The ``(labels, qclass)`` half of :func:`_key`, for QTYPE-free lookups.
+
+    Built by going through :func:`_key` rather than reimplementing the folding,
+    so a change to how names are canonicalised cannot leave the RFC 8020 cut
+    matching a name the cache itself would treat as distinct.
+    """
+    key = _key(name, 0, qclass)
+    return (key[0], key[2])
+
+
+def _is_nxdomain(entry):
+    """True for a cache entry that denies the *existence* of its name.
+
+    RFC 8020 §2 is about NXDOMAIN alone. A NODATA entry proves that one type is
+    absent at one name and says nothing whatever about the names below it -- so
+    the two share :class:`NegativeEntry`, and this is the test that must not be
+    skipped just because the class does.
+    """
+    return isinstance(entry, NegativeEntry) and int(entry.rcode) == int(DnsResponseCode.NAME_ERROR)
+
+
 class DnsCache(ABC):
     """Abstract per-RRset DNS cache.
 
@@ -180,6 +202,31 @@ class DnsCache(ABC):
         """Sweep expired entries and return how many were removed."""
         return 0
 
+    def nxdomain_at(self, name, qclass):  # noqa: ARG002 - the fallback ignores both
+        """Return a cached NXDOMAIN recorded at exactly *name*, whatever was asked.
+
+        RFC 8020 §2¶1 asks a resolver to treat "all names and resource record
+        sets (RRsets) at or below that node" as unreachable once a name has been
+        denied -- a statement about the *name*, made without regard to QTYPE.
+        :meth:`get` cannot express it: a negative entry is keyed
+        ``(name, qtype, class)``, so the NXDOMAIN that arrived in answer to an A
+        is invisible to the AAAA that this cut is supposed to answer.
+        That is the lookup this method provides, and the caller walks a name's
+        ancestors with it, closest first, using
+        :meth:`~namespy.names.DomainName.hierarchy`.
+
+        Implementations return a :class:`NegativeEntry` whose rcode is
+        ``NAME_ERROR`` and whose *soa* is the proof that denied the name -- the
+        cut is answered with that SOA, so a caller that discards it loses the
+        only evidence in the response.
+
+        The base implementation returns ``None``, and that is the documented
+        fallback rather than an unfilled stub. The cut is a SHOULD, so a backend
+        that cannot answer this without scanning simply lets the resolver keep
+        walking: the pre-RFC-8020 behaviour, still correct, only more chatty.
+        """
+        return None  # noqa: RET501 - explicit: "no cut available" is the contract
+
 
 class MemoryDnsCache(DnsCache):
     """Process-local dict-backed :class:`DnsCache`.
@@ -191,7 +238,30 @@ class MemoryDnsCache(DnsCache):
     def __init__(self, max_entries=None, time_fn=None):
         super().__init__(time_fn=time_fn)
         self._entries: OrderedDict = OrderedDict()
+        #: ``(labels, qclass)`` -> key of the newest cached NXDOMAIN at that name.
+        #:
+        #: An index rather than a scan, because the cut is consulted on every hop
+        #: of every query: testing ancestors against ``_entries`` would cost
+        #: O(cache size) per hop, which is dearer than the upstream query the cut
+        #: exists to avoid.
+        #:
+        #: The index may legitimately *under*-report. A pointer is dropped when
+        #: its entry is evicted or expires, and a second NXDOMAIN at the same name
+        #: replaces the first; either way the next lookup finds nothing and the
+        #: resolver walks, which is the pre-RFC-8020 behaviour. It cannot
+        #: over-report, because :meth:`nxdomain_at` re-checks what it finds.
+        self._nxdomain: dict = {}
         self.max_entries = max_entries
+
+    def _unindex(self, key):
+        """Drop the cut index entry if -- and only if -- ``key`` owns it."""
+        index_key = (key[0], key[2])
+        if self._nxdomain.get(index_key) == key:
+            del self._nxdomain[index_key]
+
+    def _forget(self, key):
+        self._entries.pop(key, None)
+        self._unindex(key)
 
     def get(self, name, qtype, qclass):
         key = _key(name, qtype, qclass)
@@ -199,19 +269,35 @@ class MemoryDnsCache(DnsCache):
         if entry is None:
             return None
         if entry.expired(self.time_fn()):
-            del self._entries[key]
+            self._forget(key)
+            return None
+        self._entries.move_to_end(key)
+        return entry
+
+    def nxdomain_at(self, name, qclass):
+        key = self._nxdomain.get(_cut_key(name, qclass))
+        if key is None:
+            return None
+        entry = self._entries.get(key)
+        if entry is None or not _is_nxdomain(entry) or entry.expired(self.time_fn()):
+            # Every removal path clears the index, so reaching here means a
+            # pointer outlived its entry. The price is a walk -- never an answer
+            # manufactured from a denial that has stopped existing.
+            self._forget(key)
             return None
         self._entries.move_to_end(key)
         return entry
 
     def put(self, entry):
         key = entry.key
-        if key in self._entries:
-            del self._entries[key]
+        self._forget(key)
         self._entries[key] = entry
+        if _is_nxdomain(entry):
+            self._nxdomain[(key[0], key[2])] = key
         if self.max_entries is not None:
             while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+                evicted, _ = self._entries.popitem(last=False)
+                self._unindex(evicted)
 
     def __len__(self):
         return len(self._entries)
@@ -220,7 +306,7 @@ class MemoryDnsCache(DnsCache):
         now = self.time_fn()
         keys = [k for k, e in self._entries.items() if e.expired(now)]
         for k in keys:
-            del self._entries[k]
+            self._forget(k)
         return len(keys)
 
 

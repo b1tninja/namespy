@@ -106,6 +106,7 @@ is one row per obligation.
 | DNAME substitution and restart at the zone cut — the non-CNAME alias | 6672 §5 | ✅ | `test_resolver_alias.py` |
 | NXDOMAIN vs NODATA distinguished by authority content | 2308 §2.2.1 | ✅ | `test_resolver_classify.py` |
 | Negative answers cached at `min(SOA.MINIMUM, SOA TTL)` | 2308 §5 | ✅ | `test_cache.py`, `test_resolve_steps.py` |
+| A cached NXDOMAIN denies the names at and below it, whatever the later query's QTYPE | 8020 §2¶1–§2¶4, §2¶6–§2¶8 | ✅ | `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`, the last refused until DNSSEC exists per §2¶3) over the QTYPE-free `DnsCache.nxdomain_at()`, consulted at every hop. `test_nxdomain_cut.py` pins "denies" as the absence of a `SendQuery`, that NODATA never cuts, that the closest denial is the one that answers and carries its own SOA, and that a denial reached through an alias cuts at the end of the chain (§2¶6). §2¶5's MUST — echo the NSEC/NSEC3 proofs when DO is set — is unreachable until the DNSSEC codecs exist, so it is not claimed here; see roadmap P3 |
 | CNAME-chain and alias-expansion bounds | 1034 §3.6.2 | ✅ | `test_resolver_alias.py` |
 | Wildcard matching and synthesis of the closest encloser | 4592 §2.1–§2.2 | ⬜ | roadmap P2 — names carry an `is_wildcard` flag; no synthesis |
 | QNAME minimisation | 9156 §4 | ✅ | opt-in `qname_min` / `--qname-min`: §2.3 probe schedule (`test_minimis.py`) + descent integration with probe-aware demotion and budget degradation (`test_qname_min.py`); off by default |

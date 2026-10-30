@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 833 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Suite | 870 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
 | Coverage | 89% measured with `pytest -q --cov` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -161,7 +161,67 @@ cd D:\code\namespy
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Latest round: MQTYPE (RFC 10029)
+## Latest round: the NXDOMAIN cut (RFC 8020)
+
+Shipped: §2's SHOULD, as a policy. A NXDOMAIN in the cache now denies the names at and below it,
+so the lookup RFC 2308 would send upstream is answered from the denial the zone already made.
+
+**Why the change is in the cache and not the resolver.** §2¶1's claim is about *names* — "all
+names and resource record sets (RRsets) at or below that node SHOULD be considered unreachable" —
+while a negative entry is
+keyed `(name, qtype, class)`. The NXDOMAIN that arrived in answer to an A was therefore invisible
+to the AAAA this cut exists to serve, and no amount of resolver-side cleverness fixes a key that
+cannot be named. So `DnsCache.nxdomain_at(name, qclass)` is the QTYPE-free lookup `get()` cannot
+be: SQLite does it as one read on the primary key's leftmost column, memory keeps an index
+maintained on every removal path. The index is not micro-optimisation — the cut is consulted on
+every hop of every query, so scanning the cache per hop would cost more than the traffic saved.
+The base implementation returns `None` rather than raising: the cut is a SHOULD, so a backend that
+cannot answer keeps walking, which *is* the pre-8020 behaviour.
+
+**Two things the tests caught by failing, both mine.** First draft walked only the *ancestors* of
+the queried name, which misses the "at" in §2¶1's "at or below that node" — the node is the denied
+name, so its other RRsets are covered too — and a AAAA for a name whose A was denied still went
+out; the walk now includes the name itself. Second, the alias case (§2¶6: the denied name is the
+**last** one in the chain, "and not the QNAME") only
+worked once the cut moved inside the per-hop loop rather than being checked once at the origin.
+
+**Policy shape, and where it deliberately differs from `GluePolicy`.** Three stances because RFC
+8020 names three: `ALWAYS` (§2¶1's SHOULD, default), `NEVER` (§2 is a SHOULD, and §2¶4 concedes
+"The fact that a subtree does not exist is not forever" — this is the watch-a-zone-change switch,
+sibling of `--no-failure-cache`), and `VALIDATED` (§2¶3's MAY, cut only on a DNSSEC-validated
+denial). `VALIDATED` refuses to construct and says DNSSEC in the message, because it and `NEVER`
+emit identical packets while nothing validates; a silent fallback would let an operator believe
+proofs were what stopped the cut. `test_validated_policy_is_refused_at_the_door` is the thing that
+must change when validation lands. Unlike permissive glue, `NEVER` logs rather than warning on
+stderr: it gives up an efficiency, not a defense, and cannot hand a lookup to anyone.
+
+**Visibility, which is the half of the glue precedent worth copying.** A cut's answer is
+indistinguishable on the wire from a denial fetched for the name itself — the reply carries the
+*ancestor's* SOA beside a question naming the deeper name — so `NxdomainCut` renders as
+`NXDOMAIN cut: www.foo.example below foo.example` in the trace and as a `;;` line in the answer.
+Both halves are reported in the case the *query* used, not as the cached entry is stored: two names
+differing only in case read like two names, and this line exists to be read by whoever just
+created the name being denied.
+
+**Overlap with RFC 9520, decided rather than discovered.** The cut is consulted *before* the
+failure note, because a cached denial is a proof with an SOA behind it while a failure note is only
+a promise not to ask again — and only the first of the two can answer the client.
+
+**Verified**: 870 passed (+37), `ruff check namespy tests` clean, `ruff format --check` clean,
+`mypy namespy` exits 0. `docs/roadmap.md` gained its 8020 §2 row; `docs/rfc-map.md` §10 the
+code-mapping row.
+
+**Next**: the zero-dependency DNSSEC record codecs (4034/4035 RRSIG, DNSKEY, DS, and the proof
+records NSEC/NSEC3) — the first leg of validation, and the thing `VALIDATED` is waiting on. Checking
+the RFC while writing this turned up the one obligation here that is *not* shipped: §2¶5 says a
+resolver "MUST return these NSEC or NSEC3 records in the response to the triggering query if the
+query had the DNSSEC OK (DO) bit set". It is unreachable rather than missing — there are no proof
+records to return until the codec exists — but it is the reason the roadmap row is scoped to
+§2¶1–¶4 and §2¶6–¶8 rather than to the section. §5¶1 is the known cost of the whole feature, and
+the RFC's own answer to it ("This document assumes that such a setup is rare and does not need to
+be supported") is why `NEVER` exists rather than a per-zone exception.
+
+## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them
 (§3.4's combination), and now the client's half too — `RecursiveResolver.resolve_bundle`
@@ -314,7 +374,7 @@ code-mapping table had no row for any of the last four features. When a feature 
 belongs in that table in the same commit — that document is where a contributor looks to find
 out whether a rule is deliberately absent.
 
-## Previous round: Extended DNS Errors (RFC 8914)
+## Earlier round: Extended DNS Errors (RFC 8914)
 
 Shipped: the `ERROR` option (code 15) is written *and* read. `ExtendedDNSError` in
 `namespy/edns.py` holds the INFO-CODE plus the raw EXTRA-TEXT octets and infers nothing
@@ -379,7 +439,7 @@ replaced with today's. The floor itself stays at 80: 87.2% is one platform's num
 rule 9 says a raise waits for a measurement, not a guess — the next one should come from a
 CI run.
 
-## Earlier round: RFC 9520 failure caching (`FailureCache`)
+## An earlier round: RFC 9520 failure caching (`FailureCache`)
 
 Shipped: a resolution failure is remembered and acted on. `FailureCache` in
 `namespy/cache/__init__.py` is consulted by `resolve_steps` before any query leaves

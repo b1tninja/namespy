@@ -244,6 +244,7 @@ generator synchronously with `gen.send(canned_response)` — no sockets.
 | MQTYPE, answering (RFC 10029 §3.3–§3.4) | `namespy/mqtype.py`, `DnsServer._mqtype_request()` and `DnsServer._combine_mqtype()` |
 | MQTYPE, asking (RFC 10029 §3.2, §3.5) | `namespy/bundle.py` (`query_option_for()`, `collect_bundle()`), `RecursiveResolver.resolve_bundle()` |
 | SVCB / HTTPS service parameters (RFC 9460) | `SvcParams` (`namespy/svcb.py`), registered as the RDATA codec in `namespy/rdata.py` |
+| The NXDOMAIN cut (RFC 8020 §2) | `NxdomainPolicy`, `NxdomainCut`, `_nxdomain_cut()` (`namespy/resolver.py`); the QTYPE-free `DnsCache.nxdomain_at()` in both backends (`namespy/cache/__init__.py`, `namespy/cache/sqlite.py`); rendered by `Trace.to_mermaid()` and the CLI's `;; NXDOMAIN cut:` line, switched by `--no-nxdomain-cut` |
 | QNAME minimisation probe schedule (RFC 9156 §2.3, §3) | `namespy/minimis.py`, driven from `resolve_steps` where it builds each probe's name |
 | Trace tree | [`namespy/trace.py`](../namespy/trace.py) `Trace` |
 | Mermaid output | `Trace.to_mermaid()` |

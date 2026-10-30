@@ -126,7 +126,7 @@ from .packet import (  # noqa: E402
     Query,
     Response,
 )
-from .resolver import GluePolicy, RecursiveResolver, Resolver  # noqa: E402
+from .resolver import GluePolicy, NxdomainPolicy, RecursiveResolver, Resolver  # noqa: E402
 from .trace import Trace  # noqa: E402
 from .wire import DnsNameParseError  # noqa: E402
 
@@ -159,6 +159,7 @@ __all__ = [
     "GluePolicy",
     "MemoryDnsCache",
     "NegativeEntry",
+    "NxdomainPolicy",
     "PositiveEntry",
     "Query",
     "RecursiveResolver",

@@ -27,7 +27,13 @@ from .enums import (
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query
 from .rdata import generic_presentation, type_name_of
-from .resolver import EDNS_PAYLOAD_SIZE, GluePolicy, RecursiveResolver
+from .resolver import (
+    EDNS_PAYLOAD_SIZE,
+    GluePolicy,
+    NxdomainCut,
+    NxdomainPolicy,
+    RecursiveResolver,
+)
 from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
@@ -187,7 +193,7 @@ def _format_record_row(r):
     return f"{r.name}\t{r.ttl}\t{class_col}\t{type_name_of(r.rtype)}\t{_format_rdata(r)}"
 
 
-def _format_response(response, args, elapsed_ms, bundle=None):
+def _format_response(response, args, elapsed_ms, bundle=None, cut=None):
     """Render *response* as a dig-style answer.
 
     Follows dig's section layout so existing muscle memory and log scrapers
@@ -236,6 +242,16 @@ def _format_response(response, args, elapsed_ms, bundle=None):
         f"ANSWER: {len(response.answers)}, AUTHORITY: {len(response.nameservers)}, "
         f"ADDITIONAL: {len(response.additional_records)}"
     )
+    if cut is not None:
+        # RFC 8020 section 2 let a cached denial above this name answer for it, so
+        # the status line above was never earned by the name asked. It has to be
+        # said: the response itself cannot, because what it carries is the
+        # ancestor's SOA and a question section naming the deeper name, and the
+        # person reading it is usually the one who just created that name.
+        lines.append(
+            f";; NXDOMAIN cut: {cut.name} answered from the cached denial for "
+            f"{cut.denied_by} (RFC 8020)"
+        )
     lines.append("")
 
     if response.opt() is not None:
@@ -486,6 +502,17 @@ def build_parser():
         "needs to see the retries",
     )
     p.add_argument(
+        "--no-nxdomain-cut",
+        dest="no_nxdomain_cut",
+        action="store_true",
+        help="do not let a cached NXDOMAIN deny the names below it (RFC 8020 off): "
+        "ask again for every deeper name instead of answering from the ancestor's "
+        "denial. The default treats a whole subtree as unreachable until the "
+        "negative entry expires -- right for serving, wrong for watching a name "
+        "appear, because one created under a denied node stays invisible for the "
+        "rest of that SOA's MINIMUM",
+    )
+    p.add_argument(
         "--allow-out-of-bailiwick-glue",
         dest="allow_out_of_bailiwick_glue",
         action="store_true",
@@ -527,6 +554,39 @@ def _glue_policy(args) -> GluePolicy:
         file=sys.stderr,
     )
     return GluePolicy.PERMISSIVE
+
+
+def _nxdomain_cut(args) -> NxdomainPolicy:
+    """Translate the flag into a policy (RFC 8020 section 2).
+
+    No stderr banner, unlike the glue flag two lines below it, because this one
+    gives up an efficiency rather than a defense: the answers it produces are
+    still correct, merely fetched rather than remembered, and the extra queries
+    it costs are already visible in --trace.
+    """
+    return NxdomainPolicy.NEVER if args.no_nxdomain_cut else NxdomainPolicy.ALWAYS
+
+
+def _nxdomain_cut_of(response):
+    """The RFC 8020 cut that answered *response*, or ``None``.
+
+    Sought in the trace rather than inferred from the packet, because the packet
+    cannot make the distinction: a NXDOMAIN served from an ancestor's cached
+    denial and one fetched for the name itself are the same bytes, carrying an
+    SOA either way. Child traces are searched too -- a bundle re-ask can end in a
+    cut, and its trace hangs off the descent that bundled it.
+    """
+    trace = getattr(response, "trace", None)
+    pending = [trace]
+    while pending:
+        node = pending.pop()
+        if node is None:
+            continue
+        for event in node.events:
+            if isinstance(event, NxdomainCut):
+                return event
+        pending.extend(node.children)
+    return None
 
 
 def _outbound_options(args) -> tuple:
@@ -667,6 +727,7 @@ async def cli_query(args) -> int:
             qname_min=args.qname_min,
             glue_policy=_glue_policy(args),
             failure_cache=_failure_cache(args),
+            nxdomain_cut=_nxdomain_cut(args),
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -714,7 +775,15 @@ async def cli_query(args) -> int:
             if text:
                 print(text)
         else:
-            print(_format_response(response, args, elapsed_ms, bundle if asked else None))
+            print(
+                _format_response(
+                    response,
+                    args,
+                    elapsed_ms,
+                    bundle if asked else None,
+                    cut=_nxdomain_cut_of(response),
+                )
+            )
 
         if args.trace:
             _dump_last_resolution_md(resolver_protocol, path=args.trace_file)
@@ -746,6 +815,7 @@ async def serve(args) -> int:
                 qname_min=args.qname_min,
                 glue_policy=_glue_policy(args),
                 failure_cache=_failure_cache(args),
+                nxdomain_cut=_nxdomain_cut(args),
             ),
             local_addr=("0.0.0.0", 0),
         )
