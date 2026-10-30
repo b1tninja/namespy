@@ -299,7 +299,7 @@ async def test_recursive_walk_result_is_relayed_end_to_end():
     resolver = RecursiveResolver(cache=MemoryDnsCache())
     server, _resolver, transport = make_server(resolver=resolver)
 
-    async def authoritative(entry, questions):
+    async def authoritative(entry, questions, extra_qtypes=()):
         return Response(
             ID=0,
             QR=DnsQR.RESPONSE,
@@ -1420,7 +1420,7 @@ async def test_declining_to_combine_anything_is_not_declining_the_option() -> No
     single extra lookup, and it has to be expressible because the two refusals sound
     nothing alike: an empty QT list (legal on its own — Appendix A.3's DS-plus-NS figure
     is exactly that) says *this much work, not this extension*, while silence is what
-    section 3.6 defines as a server that cannot combine.
+    section 3.5 defines as a server for which the option is simply unsupported.
 
     Without the floor lifted, the smallest limit still bought one lookup per query that
     asked for two types, so an operator who wanted the option answered and the traffic

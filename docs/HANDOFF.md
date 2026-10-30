@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 758 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
-| Coverage | 88.0% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) answered as well as encoded — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`) |
+| Suite | 826 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Coverage | 88.9% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -163,8 +163,10 @@ cd D:\code\namespy
 
 ## Latest round: MQTYPE (RFC 10029)
 
-Shipped: the wire form of both options in both directions, and the server's half of using
-them — §3.4's combination is live. The client's half, asking, is not.
+Shipped: the wire form of both options in both directions, the server's half of using them
+(§3.4's combination), and now the client's half too — `RecursiveResolver.resolve_bundle`
+asks, `namespy.bundle` reads, and `--mqtype` puts both on the command line, so an
+A + AAAA + HTTPS lookup is one descent instead of three.
 `namespy/mqtype.py` composes MQTYPE-Query (20) and MQTYPE-Response (21), parses either,
 and holds the §3.3 rules on the way out as well as the way in — §3.2 makes a client
 responsible for "packets that conform to the server request parsing rules described in
@@ -208,11 +210,42 @@ worth knowing before editing:
   of what makes a record the same record, and a NODATA answer legitimately carries one SOA
   twice — once in the Answer section denying the type, once in the Authority section
   proving the name exists. Keying without the section quietly "fixes" that.
+- `namespy/bundle.py` reads and never sends; the resolver walks and never interprets. That
+  split is what keeps a cached lie out of the design: the reader decides what an answer says
+  about each requested QTYPE (`BundleState`), and the resolver decides what may be stored,
+  which is only what the answer vouched for. An unlisted type is `NEEDED`, §3.5's four
+  innocent reasons being the reason it is a work list rather than a verdict, and
+  `resolve_bundle` re-asks it (§3.5: "The client MUST subsequently initiate separate
+  standalone queries") unless the caller passes `ask_separately=False`.
+- `supported` and `void` stay two fields, and the void is handled in `resolve_steps` *before*
+  classification reaches the cache. A duplicated QTx or a second MQTYPE-Response is
+  "equivalent to FORMERR" (§3.5) and discards the primary answer with it, so a client that
+  cached the primary on its way to rejecting the bundle would be storing an answer it has just
+  been told to throw away; `test_an_invalid_answer_is_discarded_before_it_reaches_the_cache`
+  is the pin. Unsupported is the opposite case — the answer is good and is used as-is.
+- The option is threaded through the walk rather than attached to one query, and the lookups
+  that merely support the walk are kept out of it. A QNAME minimisation probe sets
+  `bundle = ()` explicitly: it asks about a shorter name than the extras were requested for,
+  so §3.4's per-combination flags would be the probe's and a server would be invited to
+  combine RRsets for a name nobody asked about (`test_a_minimisation_probe_never_carries_it`).
+  Glue sub-resolution needs no such guard — the list travels only in the one walk that was
+  handed it, so every other walk starts empty by construction.
+- `BundledType.separate` says whether a type's answer arrived in the combined reply or in a
+  query of its own, and only `reasked()` ever sets it. It looks redundant next to `response`,
+  which a re-ask fills in at the same moment, and it is not: `--mqtype` against today's
+  authoritative servers takes the re-ask path *every time*, and the first version of the CLI
+  report printed "combined: 2 record(s) in the answer above" over an Answer section holding
+  two A records. Where an answer came from is a fact about the exchange, not something a
+  renderer should infer from a record being present — `test_an_answer_bought_separately_is_not_reported_as_combined`
+  is the pin, and `_format_short` filters on the same field rather than on record identity.
+- The UDP fallback is three tiers in RFC 6891 §6.2.2's own order: FORMERR whose reply carries
+  an OPT loses the MQTYPE-Query and nothing else; FORMERR with no OPT loses EDNS entirely;
+  both re-run the walk. A server that has never seen option 20 therefore costs one more
+  exchange, never an answer — which is the same promise `--nsid` makes.
 
-Not shipped, and `docs/roadmap.md` says 🟡: a resolver that asks once instead of an
-A + AAAA + HTTPS trio down the same tree. §4's four-QTx guideline is exported as
-`MQTYPE_RECOMMENDED_QTX_LIMIT`, which is both the default of `DnsServer(max_qtypes=...)`
-and the default of the CLI's `--max-qtypes` — one constant, so the two cannot drift
+§4's four-QTx guideline is exported as `MQTYPE_RECOMMENDED_QTX_LIMIT`, which is the default
+of `DnsServer(max_qtypes=...)` and the default of the CLI's `--max-qtypes` — one constant, so
+the two cannot drift
 about what an undecided operator gets. An operator may raise it, or pass `None` to leave
 the list bounded only by what an EDNS option can hold at all: §3.1 gives OPTION-LENGTH no
 count field of its own, so it is RFC 6891's 16-bit option length (which `EdnsOption`
@@ -224,11 +257,25 @@ flag is what keeps the CLI honest here — an absent `--max-qtypes` wired throug
 `None` would have quietly meant *unlimited*, which is the opposite of the conservative
 default §4 asks for.
 
+The asking side is deliberately not held to that number. §4's guideline is advice about how
+much work to take on, `query_option_for` enforces only what §3.3 makes mandatory, and a server
+that thinks a list is too long already has a legal way to say so: leave the tail out (§3.5's
+"the server was unwilling to process the request (for example, because a limit was exceeded)"),
+which the client reads as work left over and re-asks. So five `--mqtype` flags may return four
+combined and one fetched separately; what they can never do is turn that omission into a
+negative answer about the name.
+
 `tests/test_mqtype.py` (44 tests, Appendix A's three figures as the oracle), sixteen
 tests in `tests/test_server.py` — the refusals, the combination rules down to the bytes of
 the option on the wire, the operator's limit at both ends of its range, and one test that
 holds the EDE and MQTYPE size rules in the same packet — and 22 in `tests/test_enums.py`
-pinning every boundary of the §3.1 table. `mqtype.py` is at 100% coverage.
+pinning every boundary of the §3.1 table. `mqtype.py` is at 100% coverage. On the asking
+side, `tests/test_bundle.py` (28) covers the reader — §3.5's outcomes, every invalid shape,
+the ownership rules a harvest is held to — and `tests/test_resolver_mqtype.py` (28) covers
+what a walk does with it: the option on the real question and never on a minimisation probe,
+the three fallbacks, the cache rules including the one that must never fire, and demotion
+when a server on the path contradicts itself. Twelve more in `tests/test_cli.py` hold the
+flag and its rendering. `bundle.py` is at 100% coverage too.
 
 ## Previous round: Extended DNS Errors (RFC 8914)
 
@@ -281,9 +328,8 @@ directions: `test_ech_is_conveyed_but_stays_opaque`'s `unknown_keys == (5,)` on 
 hand-built `SvcParams` is the pin. What is
 still doctest-only is `zone_file_warnings` (svcb.py:1325–1368), which leaves the module at
 88% — chase that by moving those examples into `tests/`, not by writing weaker tests.
-What remains in `docs/roadmap.md`, in order: MQTYPE's asking side (10029 §3.5 -- the
-server answers, the resolver still walks the tree once per type),
-then wildcard synthesis (4592 §2.2).
+What remains in `docs/roadmap.md`, in order: wildcard synthesis (4592 §2.2) is now at the
+head of the queue -- MQTYPE's asking side, which used to lead it, shipped in the round above.
 
 Housekeeping that turned out to be a real fix: the coverage floor had never been *read*
 by CI. `[tool.coverage.report] fail_under` is a pytest-cov input, and pytest-cov measures
@@ -374,3 +420,4 @@ volunteered address.
 Definition of done for any of these: focused tests + full suite green under
 `-O`; roadmap row flipped in the same commit; README/CHANGELOG updated if
 the gap list changes; ratchet coverage if it moved.
+ved.

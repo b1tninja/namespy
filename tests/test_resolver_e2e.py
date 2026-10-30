@@ -104,11 +104,17 @@ class FakeNetwork:
         self.default = default
         self.by_name = {_as_name(name): handler for name, handler in (by_name or {}).items()}
         self.sent = []
+        #: The MQTYPE-Query list each query asked with, in send order. Kept beside
+        #: ``sent`` rather than inside its tuples because which queries carry a bundle
+        #: is a property of the whole walk -- the probes and the glue lookups must not
+        #: have one, and reading the list is how that gets asserted.
+        self.bundles = []
 
-    async def __call__(self, entry, questions):
+    async def __call__(self, entry, questions, extra_qtypes=()):
         address = entry.addresses[0] if entry.addresses else None
         qname = questions[0].name
         self.sent.append((str(entry.ns), str(address)))
+        self.bundles.append(tuple(extra_qtypes))
         return self.by_name.get(_as_name(qname), self.by_address.get(address, self.default))
 
 

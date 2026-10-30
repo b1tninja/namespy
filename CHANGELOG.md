@@ -270,7 +270,7 @@ nothing has been tagged or published yet, so `master` is the only version.
   cut. A `TC` primary stops the loop on its own — the full set can only arrive over TCP,
   and the option belongs with the answer that reaches it — and every one of those stops
   still returns the option, empty if nothing was folded in, because §3.4 makes presence
-  the support signal and §3.6 makes absence the signal to retry type by type. Where RFC
+  the support signal and §3.5 makes absence the signal to retry type by type. Where RFC
   8914 §3's "drop EDE options first" would have taken the reply's explanation with it,
   the explanation is what goes and the MQTYPE-Response stays. `tests/test_mqtype.py`
   (44) uses Appendix A's three figures as the oracle and covers every §3.3 condition and
@@ -278,6 +278,45 @@ nothing has been tagged or published yet, so `master` is the only version.
   its posture — the refusals and the combination rules down to the octet, and the exact
   reach of the operator's limit, zero and unbounded included; and 22 in
   `tests/test_enums.py` pin every boundary of the §3.1 allocation table.
+- MQTYPE on the asking side (RFC 10029 §3.2, §3.5) — `namespy.bundle` reads a combined
+  answer, `RecursiveResolver.resolve_bundle(packet, (AAAA, HTTPS))` walks once, and
+  `--mqtype TYPE` (repeatable) puts it on the command line. The reader is a module of its own
+  because the failure this feature invites is a cached lie, and it is a failure about
+  *absence*: §3.5 gives four reasons a requested QTx can be missing from the MQTYPE-Response —
+  nothing in cache, flags that did not match, a server unwilling to do the work, a size limit
+  — and not one of them is "this name has no records of that type". So an unlisted type comes
+  back as `BundleState.NEEDED`, a work list rather than a verdict, and only the types the
+  answer vouched for reach the cache. §3.5's "The client MUST subsequently initiate separate
+  standalone queries for all QTx values for which an answer is still required" is what
+  `resolve_bundle` does by default; `ask_separately=False` hands that decision to a caller who
+  knows whether it wants an AAAA at all. `supported` and `void` are two fields instead of one
+  boolean because the two cases want opposite things: a server that never implemented the
+  extension answers the primary question perfectly well, and §3.5 says to process it "as if the
+  MQTYPE-Query option had not been used", while a server that duplicated a QTx or sent the
+  option twice has produced an answer §3.5 makes equivalent to FORMERR — which voids the
+  harvest *and* the primary, so the void is caught in `resolve_steps` before classification,
+  since anywhere later the bad answer has already been cached on its way to being rejected.
+  §3.5's ranking rule (RFC 2181 §5.4.1) cuts both ways: an authoritative NODATA for a listed
+  QTx is a negative and caches like any other under RFC 2308 §5, and one that nobody vouched
+  for caches as nothing at all. Each entry also carries where its answer came from —
+  `BundledType.separate` — because a combined type and a re-asked one are otherwise the same
+  state with records attached, and only the first was combined by anybody.
+- The list travels with the walk, not with one query. An MQTYPE-Query option rides every send
+  of the descent it belongs to and none of the lookups that merely support it: a QNAME
+  minimisation probe asks the child so that a server can answer NOERROR rather than name the
+  zone, while §3.4 evaluates each (QNAME, QCLASS, QTx) combination against the flags of *the
+  query that asked* — so a probe carrying the list invites a server to attribute the parent's
+  RRsets to the child's name. Glue sub-resolution is excluded for the same reason: it asks
+  about a nameserver's name at somebody else's request, and its answer is not this bundle's.
+  §3.3's refusals are refused before they are sent — a repeated QTx, one that is a Meta-RR
+  rather than a data type, a bundle behind a non-data primary such as ANY, which §3.3 makes a
+  FORMERR rather than a difference of opinion — and a server that rejects the option is
+  stepped down
+  the way RFC 6891 §6.2.2 steps anything else down: drop the option if a reply comes back
+  FORMERR carrying an OPT, drop EDNS entirely if it comes back FORMERR without one.
+  `tests/test_bundle.py` (28), `tests/test_resolver_mqtype.py` (28) and twelve in
+  `tests/test_cli.py` hold the reader, the threading, the three fallbacks and the rendering;
+  `bundle.py` is at 100% coverage.
 
 ### Changed
 
@@ -466,15 +505,17 @@ Tracked honestly rather than as a promise — full list with reasons in
 
 - EDNS(0) *options* are implemented and several are put to use: NSID (RFC 5001) in
   both directions, per-server payload adaptation (RFC 6891 §6.2.3, §6.2.4), Extended DNS
-  Errors (RFC 8914) composed and consumed, MQTYPE (RFC 10029) where the bundled server
-  combines the QTYPEs a query names and reports which ones it folded in (§3.3–§3.4), and
-  the bundled server answers an extended query with an OPT of its own (§6.1.1, §6.2.4).
+  Errors (RFC 8914) composed and consumed, MQTYPE (RFC 10029) in both directions — the
+  bundled server combines the QTYPEs a query names and reports which ones it folded in
+  (§3.3–§3.4), and the resolver asks for them, reads what came back, and re-asks what did
+  not (§3.2, §3.5) — and the bundled server answers an extended query with an OPT of its
+  own (§6.1.1, §6.2.4).
   Still unused on purpose: COOKIE has no server-side state to validate a reply against,
   and Padding is never emitted because RFC 7830 §6 withdraws it from plaintext UDP, which
   is every transport here. No client subnet option (RFC 7871) and no transport keepalive
-  (RFC 7828) — see `docs/roadmap.md`. MQTYPE has the responder's half and not the
-  questioner's: nothing here sends a MQTYPE-Query, so an A + AAAA + HTTPS lookup is still
-  three walks of the same tree.
+  (RFC 7828) — see `docs/roadmap.md`. Asking with MQTYPE is opt-in (`--mqtype`,
+  `resolve_bundle`), so a lookup that did not ask for it still sends nothing a legacy
+  server has never seen.
 - No DNSSEC validation, no serve-stale (RFC 8767), no IDN/punycode
   (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 / RFC 8484). QNAME
   minimisation (RFC 9156) ships opt-in — see *Added*.

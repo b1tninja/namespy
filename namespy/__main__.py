@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 
+from .bundle import BundleResult, BundleState
 from .edns import (
     extended_error_presentation,
     extended_errors_of,
@@ -21,6 +22,7 @@ from .enums import (
     DnsQType,
     DnsRClass,
     DnsResponseCode,
+    is_data_rrtype,
 )
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query
@@ -185,7 +187,7 @@ def _format_record_row(r):
     return f"{r.name}\t{r.ttl}\t{class_col}\t{type_name_of(r.rtype)}\t{_format_rdata(r)}"
 
 
-def _format_response(response, args, elapsed_ms):
+def _format_response(response, args, elapsed_ms, bundle=None):
     """Render *response* as a dig-style answer.
 
     Follows dig's section layout so existing muscle memory and log scrapers
@@ -194,6 +196,10 @@ def _format_response(response, args, elapsed_ms):
     effective RCODE (RFC 6891 sections 6.1.2-6.1.3); and ``ad``/``cd`` flags,
     which live only in OPT and are the first thing an operator wants to see when
     comparing against a validating resolver.
+
+    *bundle* adds a third pseudo-section, and is ``None`` unless ``--mqtype`` was
+    given: with no bundle asked for there is nothing to account for, and the
+    output of an ordinary lookup stays byte for byte what it was.
     """
     lines = []
     lines.append(
@@ -270,6 +276,10 @@ def _format_response(response, args, elapsed_ms):
                 lines.append(_format_record_row(r))
             lines.append("")
 
+    if bundle is not None:
+        lines.append(_format_bundle(bundle))
+        lines.append("")
+
     lines.append(f";; Query time: {int(elapsed_ms)} msec")
     lines.append(f";; MSG SIZE  rcvd: {len(bytes(response))}")
     return "\n".join(lines)
@@ -301,10 +311,30 @@ def _response_errors(response):
         return ()
 
 
-def _format_short(response):
-    if response is None:
+def _format_short(response, bundle=None):
+    """RDATA and nothing else -- plus the RDATA of anything else that was asked for.
+
+    ``--short`` keeps stdout parseable, which is why the bundle's commentary stays in the
+    report. But a caller who asked for AAAA beside A and got only the A lines would read
+    that as an empty set, and the empty set is the one thing this interface must never
+    imply about a type the answer did not speak for (RFC 10029 section 3.5). So the extra
+    records print, and the unanswered types print nothing at all: no line is their honest
+    short form, and the ledger of why is what the non-short mode is for.
+    """
+    if response is None and bundle is None:
         return ""
-    return "\n".join(_format_rdata(r) for r in response.answers)
+    answers = [] if response is None else list(response.answers)
+    lines = [_format_rdata(r) for r in answers]
+    if bundle is not None:
+        # Only the records of a separate lookup are new to the reader. A combined type's
+        # records are Answer rows of the response just printed -- section 3.4 puts them
+        # there -- so appending them again would show the same line twice, and filtering on
+        # provenance rather than on identity is what keeps the two cases apart when a
+        # re-asked type happens to return records equal to ones already in the packet.
+        lines.extend(
+            _format_rdata(r) for entry in bundle.types if entry.separate for r in entry.records
+        )
+    return "\n".join(lines)
 
 
 def _normalize_dig_plus_args(argv):
@@ -432,6 +462,19 @@ def build_parser():
         "exposure -- --trace marks the probes",
     )
     p.add_argument(
+        "--mqtype",
+        action="append",
+        type=_parse_qtype,
+        metavar="TYPE",
+        help="ask for one more record type inside the same walk with an MQTYPE-Query EDNS "
+        "option (RFC 10029); repeatable. 'namespy example.org A --mqtype AAAA --mqtype "
+        "HTTPS' is one descent from the root instead of three. A server that does not "
+        "implement it answers the primary question as usual and the extras are then "
+        "looked up separately, so this can only ever save round trips, never cost an "
+        "answer. The primary type must be a data type (section 3.3): a bundle cannot "
+        "ride behind ANY.",
+    )
+    p.add_argument(
         "--no-failure-cache",
         dest="no_failure_cache",
         action="store_true",
@@ -499,6 +542,93 @@ def _outbound_options(args) -> tuple:
     return (nsid_option(),) if getattr(args, "nsid", False) else ()
 
 
+def _bundle_qtypes(args) -> tuple:
+    """The types ``--mqtype`` asked for, minus any run in which they cannot travel.
+
+    Two conditions make the flag a no-op before it reaches the resolver, and both are
+    announced rather than left to the user's imagination. ``--no-edns`` removes the only
+    carriage an EDNS(0) option has: RFC 10029 section 3.3 puts the list in an MQTYPE-Query
+    option, which lives in an OPT record. A non-data primary -- ANY, AXFR, a SIG(0)
+    pseudo-type -- is the case a server is *required* to answer FORMERR once a bundle
+    rides with it (section 3.3 again), so refusing here saves an exchange that was over
+    before it started, and points at what a bundle is for instead of rediscovering the
+    rule off a stranger's error code.
+
+    What is wrong with the list itself -- a repeat, a Meta-RR posing as a data type, a value
+    no 16-bit field can hold -- stays the resolver's business:
+    :func:`~namespy.bundle.query_option_for` is where those section 3.3 limits live, and
+    :func:`cli_query` turns its ``ValueError`` into a message.
+    """
+    asked = tuple(int(qtype) for qtype in getattr(args, "mqtype", None) or ())
+    if not asked:
+        return ()
+    if not is_data_rrtype(int(args.type)):
+        print(
+            f";; --mqtype ignored: a bundle behind a {type_name_of(args.type)} question must "
+            "be answered FORMERR (RFC 10029 section 3.3). Ask for a data type instead.",
+            file=sys.stderr,
+        )
+        return ()
+    if getattr(args, "no_edns", False):
+        print(
+            ";; --mqtype ignored: EDNS(0) is off, and an MQTYPE-Query option has no other "
+            "way to travel (RFC 10029 section 3.3). Drop --no-edns to bundle.",
+            file=sys.stderr,
+        )
+        return ()
+    return asked
+
+
+def _format_bundle(bundle) -> str:
+    """What the bundle makes of each type ``--mqtype`` asked for, as comment lines.
+
+    Not where the records are: a server that combined them put those RRsets "into the same
+    sections in which they would have appeared in a standalone query" -- RFC 10029 section
+    3.4 -- which for a data answer means the Answer section the block above has already
+    printed. What that section cannot show is the mapping, namely which record answered which
+    of several questions, and which questions this answer leaves open. The latter is written
+    as unanswered and never as empty: section 3.5 gives four reasons a requested QTx may be
+    absent from the MQTYPE-Response, of which "the server was unwilling to process the
+    request" and "the response size limit would be exceeded" are two, so a line reading "0
+    records" would state a verdict the protocol refuses to license -- and caching that verdict
+    is the exact failure this whole feature has to get wrong before it breaks the DNS.
+
+    Each line also says how the type was answered, and on today's Internet that is the more
+    informative half. The overwhelmingly common case is a server that has never seen option
+    20: its reply leaves every requested type to a query of its own. Call those "combined"
+    and this tool tells a lie about a stranger's capabilities -- and hides the records, which
+    are not in the packet the Answer section above was drawn from, and which the user
+    therefore asked for and did not receive.
+    """
+    lines = ["", ";; MQTYPE SECTION:"]
+    if bundle.void:
+        lines.append(f";; answer void and re-asked without the bundle: {bundle.reason}")
+    elif not bundle.supported:
+        lines.append(";; no MQTYPE-Response option: no server combined these types")
+    for entry in bundle.types:
+        name = type_name_of(entry.qtype)
+        if entry.state is BundleState.NEEDED:
+            lines.append(f";;\t{name}: not answered; nothing is known about it either way")
+            continue
+        origin = "asked separately" if entry.separate else "combined here"
+        if entry.state is BundleState.COMBINED:
+            verdict = f"{len(entry.records)} record(s)"
+        elif entry.state is BundleState.NODATA:
+            verdict = "NODATA: this name exists and has no records of this type"
+        else:
+            verdict = "NXDOMAIN: this name does not exist"
+        lines.append(f";;\t{name}: {origin}: {verdict}")
+        # A separate query's records are printed, because otherwise the line above would
+        # promise an answer and the reader would find no trace of it. They are prefixed with
+        # ';' the way the QUESTION section's rows are, because they are answers the caller
+        # asked for that this response never carried: setting them out as Answer rows would
+        # report that the server combined them, which is precisely what the exchange
+        # established it had not done.
+        if entry.separate:
+            lines.extend(f";{_format_record_row(r)}" for r in entry.records)
+    return "\n".join(lines)
+
+
 def _report_server_ids(resolver) -> None:
     """Print the identifiers the servers handed back, one line each.
 
@@ -523,6 +653,10 @@ def _report_server_ids(resolver) -> None:
 async def cli_query(args) -> int:
     loop = asyncio.get_running_loop()
     qname = DomainName(args.name)
+    # Decided before the resolver is built, because it decides what the resolver sends on
+    # every hop rather than on one: an empty tuple here means the walk below never carries
+    # an MQTYPE-Query option and no server is asked to do anything new.
+    asked = _bundle_qtypes(args)
 
     _transport, resolver_protocol = await loop.create_datagram_endpoint(
         lambda: RecursiveResolver(
@@ -541,21 +675,46 @@ async def cli_query(args) -> int:
         query = Query(questions=[question], RD=True)
         start = time.monotonic()
         try:
-            response = await asyncio.wait_for(
-                resolver_protocol.resolve(query),
-                timeout=args.timeout,
-            )
+            if asked:
+                bundle = await asyncio.wait_for(
+                    resolver_protocol.resolve_bundle(query, asked),
+                    timeout=args.timeout,
+                )
+            else:
+                # An ordinary lookup goes through the ordinary door. resolve_bundle() with
+                # an empty list is defined to be this same walk, but routing every lookup
+                # through it would quietly make the new method part of what a Resolver has
+                # to provide -- including the ones this project did not write.
+                answer = await asyncio.wait_for(
+                    resolver_protocol.resolve(query),
+                    timeout=args.timeout,
+                )
+                bundle = BundleResult(supported=False, primary=answer)
         except TimeoutError:
             print(f";; query timed out after {args.timeout:.1f} s", file=sys.stderr)
             return 2
+        except ValueError as exc:
+            # A list RFC 10029 section 3.3 will not carry: a repeat of the primary's own
+            # type, a Meta-RR posing as a data type, a value no 16-bit field can hold.
+            # Usage errors are said, not raised -- the walk that would have followed is not
+            # worth starting, and a traceback is not what a rejected argument means.
+            print(f";; --mqtype: {exc}", file=sys.stderr)
+            return 2
         elapsed_ms = (time.monotonic() - start) * 1000.0
+        response = bundle.primary
+
+        if bundle.void:
+            # Loudly, and on stderr where it cannot corrupt an answer: a server that
+            # answered a bundle invalidly has been told to stop by section 3.5, and the
+            # operator is the only one who can tell the rest of the world about it.
+            print(f";; warning: {bundle.reason}", file=sys.stderr)
 
         if args.short:
-            text = _format_short(response)
+            text = _format_short(response, bundle if asked else None)
             if text:
                 print(text)
         else:
-            print(_format_response(response, args, elapsed_ms))
+            print(_format_response(response, args, elapsed_ms, bundle if asked else None))
 
         if args.trace:
             _dump_last_resolution_md(resolver_protocol, path=args.trace_file)

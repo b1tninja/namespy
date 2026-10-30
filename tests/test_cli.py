@@ -4,9 +4,9 @@ Nothing here touches the network. ``cli_query`` and ``serve`` build their
 endpoints through ``loop.create_datagram_endpoint``, which is patched to hand
 back the protocol the factory would have produced -- a real
 :class:`~namespy.resolver.RecursiveResolver`, since constructing one reads the
-packaged root hints and does no I/O -- with its ``resolve`` replaced. That keeps
-the tests honest about the wiring while leaving resolver behaviour to
-:mod:`tests.test_resolve_steps`.
+packaged root hints and does no I/O -- with its ``resolve`` (and, for the
+``--mqtype`` tests, its ``resolve_bundle``) replaced. That keeps the tests honest
+about the wiring while leaving resolver behaviour to :mod:`tests.test_resolve_steps`.
 
 Exit codes are the interface a script consumes: ``0`` answered, ``2`` no answer,
 ``1`` could not start.
@@ -20,7 +20,9 @@ import pytest
 
 from namespy import __main__ as cli
 from namespy.__main__ import (
+    _bundle_qtypes,
     _dump_last_resolution_md,
+    _format_bundle,
     _format_rdata,
     _format_record_row,
     _format_response,
@@ -31,12 +33,13 @@ from namespy.__main__ import (
     _report_server_ids,
     build_parser,
 )
+from namespy.bundle import BundledType, BundleResult, BundleState
 from namespy.cache import FailureCache
 from namespy.edns import extended_dns_error_option, nsid_option, serialize_options
 from namespy.enums import DnsQClass, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Response
-from namespy.rdata import RData, RData_A, RData_NS, RData_TXT
+from namespy.rdata import RData, RData_A, RData_AAAA, RData_NS, RData_TXT
 from namespy.resolver import Done, GluePolicy, Sname
 from namespy.trace import Trace
 
@@ -59,17 +62,25 @@ class _FakeTransport:
         self.closed = True
 
 
-def _stub_endpoints(monkeypatch, resolve):
+def _stub_endpoints(monkeypatch, resolve, resolve_bundle=None):
     """Route the CLI's endpoint creation to *resolve*, bypassing real sockets.
 
     Patched on the running loop instance rather than on its class, so a bug here
     cannot leak into another test that expects a real socket.
+
+    *resolve_bundle* is patched only when a test asks for it, which is what keeps
+    ``test_cli_query_prints_answer_and_exits_zero``'s assertion meaningful: a plain
+    lookup must go through ``resolve``, not through the bundling door with an empty
+    list -- otherwise merely having this feature in the tree would make the method
+    mandatory for any resolver object, ours or anybody else's.
     """
     made = []
 
     async def fake_endpoint(factory, **_kwargs):
         protocol = factory()
         protocol.resolve = resolve
+        if resolve_bundle is not None:
+            protocol.resolve_bundle = resolve_bundle
         transport = _FakeTransport()
         made.append((transport, protocol))
         return transport, protocol
@@ -789,3 +800,207 @@ async def test_the_operational_qtype_limit_reaches_the_server_a_serve_builds(mon
         task.cancel()
         assert await task == 0
         assert limit == made[-1].max_qtypes, "the resolver endpoint is created before the server's"
+
+
+# ------------------------------------------------------------------------ --mqtype
+
+AAAA_ROW = DnsRecord(
+    "example.com", DnsRType.AAAA, rdata=RData_AAAA("2606:2800:220:1:248:1893:25c8:1946")
+)
+TXT_ROW = DnsRecord("example.com", DnsRType.TXT, rdata=RData_TXT(["bundled"]))
+
+
+def _bundled(*argv):
+    """The types ``--mqtype`` in *argv* actually asks the resolver for."""
+    return _bundle_qtypes(_args(list(argv)))
+
+
+def test_mqtype_is_repeatable_and_keeps_the_order_typed():
+    """One flag, one type -- and the order survives, because it is the order the option
+    carries on the wire and the order the report repeats. A parser that sorted or setified
+    the list would be changing the bytes without asking."""
+    args = _args(["example.org", "A", "--mqtype", "AAAA", "--mqtype", "HTTPS"])
+    assert [int(q) for q in args.mqtype] == [int(DnsQType.AAAA), int(DnsQType.HTTPS)]
+
+
+def test_a_plain_lookup_asks_for_no_bundle_at_all():
+    """The default must be that nothing new is sent. Every server on the Internet receives
+    the queries this tool sends, and an off-by-default is the only courteous setting for an
+    extension they have not all seen."""
+    assert _bundled("example.org") == ()
+
+
+def test_a_bundle_cannot_ride_behind_a_question_with_no_answer_of_its_own(capsys):
+    """RFC 10029 section 3.3 obliges a server to answer FORMERR when the primary question
+    is not a data RRTYPE, so this exchange is finished before it starts. Refusing it here
+    costs nothing and says what a bundle is for; sending it collects a stranger's error code
+    and teaches the user nothing they could act on."""
+    assert _bundled("example.org", "ANY", "--mqtype", "AAAA") == ()
+    assert "section 3.3" in capsys.readouterr().err
+
+
+def test_no_edns_leaves_the_list_nowhere_to_go(capsys):
+    """An MQTYPE-Query is an EDNS(0) option: with --no-edns there is no OPT record to carry
+    it (section 3.3). A flag that silently does nothing is worse than one refused out loud,
+    because the user would conclude the servers do not support the extension."""
+    assert _bundled("--no-edns", "example.org", "--mqtype", "AAAA") == ()
+    assert "--mqtype ignored" in capsys.readouterr().err
+
+
+def test_a_report_says_which_question_each_answer_belongs_to():
+    """The records themselves are already in the Answer section -- section 3.1 put them
+    there -- so the block's whole job is the mapping, which is the one thing a reader cannot
+    recover from the packet: several RRsets travelling together, and no field saying which
+    of them answered which question."""
+    bundle = BundleResult(
+        supported=True,
+        primary=_response_with_opt(),
+        combined=(int(DnsQType.AAAA),),
+        types=(
+            BundledType(
+                int(DnsQType.AAAA), BundleState.COMBINED, records=(AAAA_ROW,), authoritative=True
+            ),
+        ),
+    )
+    text = _format_bundle(bundle)
+    assert "AAAA" in text
+    assert "1 record" in text
+
+
+def test_an_unanswered_type_is_reported_as_unanswered_and_never_as_empty():
+    """The interface's share of section 3.5, which lists four reasons a requested QTx may be
+    absent from the MQTYPE-Response -- cache misses, flag mismatches, a server unwilling to
+    do the work, a size limit -- and not one of them is "the name has no such records". "0
+    records" would be a negative answer this protocol refuses to give, and the mistake a user
+    would then make, believing the name has no AAAA, is the one this feature exists not to
+    make."""
+    bundle = BundleResult(
+        supported=False,
+        primary=_response_with_opt(),
+        still_needed=(int(DnsQType.AAAA),),
+        types=(BundledType(int(DnsQType.AAAA), BundleState.NEEDED),),
+    )
+    text = _format_bundle(bundle)
+    assert "not answered" in text
+    assert "0 record" not in text
+    assert "NODATA" not in text, "unasked-for is not the same as not-there"
+
+
+def test_a_void_answer_is_read_aloud_not_quietly_replaced():
+    """Section 3.5 tells the client to throw the answer away, which the resolver does; it
+    does not tell the operator that a server on the path broke the rules, and nobody else
+    is going to say so. A server doing this is a server to report."""
+    bundle = BundleResult(
+        supported=True,
+        primary=_response_with_opt(),
+        void=True,
+        reason="MQTYPE-Response option appeared twice",
+    )
+    assert "twice" in _format_bundle(bundle)
+
+
+def test_short_output_prints_a_bundled_record_exactly_once():
+    """A combined record is one of the Answer rows, so --short would print it twice if the
+    harvest were appended blindly; a record from a separate lookup is genuinely new, and
+    dropping it would leave the user holding one type out of the two they asked for."""
+    response = _response_with_opt()
+    response.answers.append(AAAA_ROW)
+    from_bundle = BundleResult(
+        supported=True,
+        primary=response,
+        types=(
+            BundledType(
+                int(DnsQType.AAAA), BundleState.COMBINED, records=(AAAA_ROW,), authoritative=True
+            ),
+        ),
+    )
+    assert _format_short(response, from_bundle).splitlines() == [
+        "93.184.216.34",
+        "2606:2800:220:1:248:1893:25c8:1946",
+    ]
+
+    from_elsewhere = BundleResult(
+        supported=False,
+        primary=response,
+        types=(
+            BundledType(
+                int(DnsQType.TXT),
+                BundleState.COMBINED,
+                records=(TXT_ROW,),
+                authoritative=True,
+                response=object(),
+                separate=True,
+            ),
+        ),
+    )
+    text = _format_short(response, from_elsewhere)
+    assert text.count("2606:2800:220:1:248:1893:25c8:1946") == 1, "the Answer row, once"
+    assert '"bundled"' in text, "and the record only a separate lookup found"
+
+
+def test_an_answer_bought_separately_is_not_reported_as_combined():
+    """What every lookup against today's authoritative servers actually looks like, and the
+    rendering has to survive it: the server never saw option 20, so nothing was combined,
+    and the AAAA and HTTPS the user asked for arrived in replies of their own -- absent from
+    the Answer section this output has already printed. Call that "combined" and the tool
+    invents support a stranger never offered; leave the records out and it looks as though
+    the flag fetched nothing at all.
+
+    (This is a bug this test was written to fix: the first version printed "combined: 2
+    record(s) in the answer above" over an Answer section holding two A records.)
+    """
+    bundle = BundleResult(
+        supported=False,
+        primary=_response_with_opt(),
+        types=(
+            BundledType(
+                int(DnsQType.AAAA),
+                BundleState.COMBINED,
+                records=(AAAA_ROW,),
+                authoritative=True,
+                response=object(),
+                separate=True,
+            ),
+        ),
+    )
+    text = _format_bundle(bundle)
+    assert "asked separately" in text
+    assert "combined here" not in text, "the header says nobody combined; so must the rows"
+    assert "2606:2800:220:1:248:1893:25c8:1946" in text, "and shown, not just counted"
+
+
+async def test_the_bundle_flag_reaches_the_walk_that_sends_it(monkeypatch, capsys):
+    """The one assertion that proves the flag is wired to something: the types typed are
+    the types handed to the resolver, and the report appears in the answer."""
+    seen = []
+
+    async def bundled(_query, extra_qtypes):
+        seen.append(tuple(extra_qtypes))
+        return BundleResult(supported=True, primary=_response_with_opt())
+
+    _stub_endpoints(monkeypatch, _answered, resolve_bundle=bundled)
+    assert await cli.cli_query(_args(["example.org", "A", "--mqtype", "AAAA"])) == 0
+    assert seen == [(int(DnsQType.AAAA),)]
+    assert ";; MQTYPE SECTION:" in capsys.readouterr().out
+
+
+async def test_a_list_the_protocol_will_not_carry_is_a_usage_error_not_a_crash(monkeypatch, capsys):
+    """A repeat, a Meta-RR, a value outside the 16-bit field: the section 3.3 limits live in
+    the resolver, and what
+    reaches the user is the sentence, not the traceback -- the walk that would have followed
+    is not worth starting, and an unhandled exception is not what a rejected argument means."""
+
+    async def refused(_query, _extra_qtypes):
+        raise ValueError("MQTYPE-Query repeats a QTx: 1")
+
+    _stub_endpoints(monkeypatch, _answered, resolve_bundle=refused)
+    assert await cli.cli_query(_args(["example.org", "A", "--mqtype", "AAAA"])) == 2
+    assert "repeats a QTx" in capsys.readouterr().err
+
+
+async def test_an_ordinary_lookup_keeps_the_output_it_always_had(monkeypatch, capsys):
+    """No --mqtype, no mention of one. A feature nobody asked for must not change what a
+    script parsing this output has been parsing all along."""
+    _stub_endpoints(monkeypatch, _answered)
+    assert await cli.cli_query(_args(["example.org"])) == 0
+    assert "MQTYPE SECTION" not in capsys.readouterr().out

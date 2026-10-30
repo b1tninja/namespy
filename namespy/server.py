@@ -250,9 +250,9 @@ class DnsServer(asyncio.Protocol):
             Zero is a configuration rather than a mistake, and it is the one that
             buys the support signal for nothing: a query is still answered, still
             carries a MQTYPE-Response, and the list in it is empty. Silence would
-            be the other available message, and section 3.6 reads silence as "this
-            server cannot combine", which is not true of a server that simply
-            declined this much work.
+            be the other available message, and section 3.5 makes silence mean the
+            option is "unsupported by the server", which is not true of a server that
+            simply declined this much work.
         """
         if not isinstance(resolver, RecursiveResolver):
             raise TypeError(f"resolver must be a RecursiveResolver, got {type(resolver).__name__}")

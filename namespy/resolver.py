@@ -60,9 +60,23 @@ from socket import gaierror
 from typing import NamedTuple
 
 from . import enable_path_mtu_discovery
+from .bundle import (
+    BundledType,
+    BundleResult,
+    BundleState,
+    bundle_is_void,
+    collect_bundle,
+    query_option_for,
+)
 from .cache import FailureCache, MemoryDnsCache, NegativeEntry, PositiveEntry
-from .edns import extended_error_presentation, extended_errors_of, nsid_of, nsid_presentation
-from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
+from .edns import (
+    MQTYPE_QUERY_OPTION_CODE,
+    extended_error_presentation,
+    extended_errors_of,
+    nsid_of,
+    nsid_presentation,
+)
+from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType, is_data_rrtype
 from .minimis import QnameMinimiser
 from .names import DomainName
 from .packet import (
@@ -204,7 +218,9 @@ class Resolver(asyncio.Protocol):
     #: relative names are simply anchored at the root.
     dns_suffix = None
 
-    async def query(self, questions, nameserver_record, address_record, **kwargs):
+    async def query(
+        self, questions, nameserver_record, address_record, *, extra_edns_options=(), **kwargs
+    ):
         for label, value in (
             ("nameserver_record", nameserver_record),
             ("address_record", address_record),
@@ -222,13 +238,21 @@ class Resolver(asyncio.Protocol):
                 f"{len(bytes(address_record.rdata))} octet(s)"
             )
         dns_packet = Query(questions=questions, **kwargs)
+        options = tuple(self.edns_options) + tuple(extra_edns_options)
         if self.edns_payload_size:
             # RFC 6891 and the practice behind DNS Flag Day: an EDNS-aware
             # requestor advertises OPT on *every* query rather than probing
             # selectively, so the responder never has to guess and the
             # 512-octet truncation regime becomes the fallback rather than
             # the default.
-            dns_packet.add_edns(self._advertised_payload(ip), options=self.edns_options)
+            dns_packet.add_edns(self._advertised_payload(ip), options=options)
+        else:
+            # No OPT record, so nothing can carry an option: RFC 10029 section 3.1's
+            # QT list is OPT RDATA, not a section of its own. A bundle asked for under
+            # --no-edns therefore degrades to the questions the caller would have sent
+            # before this extension existed, and resolve_bundle reports it as
+            # unsupported rather than silently reporting an empty combination.
+            options = ()
         # RFC 7766 section 6 / RFC 5936: AXFR is a TCP-only operation, and a UDP
         # attempt would be answered with a truncated or refused reply rather
         # than a zone transfer.
@@ -269,29 +293,64 @@ class Resolver(asyncio.Protocol):
             future.cancel()
             return None
 
-        # Two attempts at most. The second exists only for the RFC 6891
-        # section 6.2.2 fallback -- "If a requestor detects that the remote
-        # end does not support EDNS(0), it MAY issue queries without an OPT
-        # record" -- and is taken only when the first answer actually said so
-        # (see _edns_rejected). The pending key cannot shift between
-        # attempts: it is built from the transaction ID and the question,
-        # and dropping the OPT record alters neither.
-        for attempt in (1, 2):
-            if attempt == 2:
+        # Three attempts at most, each taken for a different refusal, and each removing
+        # one thing the server objected to.
+        #
+        # The first alternative is the RFC 6891 section 6.2.2 fallback -- "If a
+        # requestor detects that the remote end does not support EDNS(0), it MAY issue
+        # queries without an OPT record" -- taken only when the answer actually said so
+        # (see _edns_rejected).
+        #
+        # The second is RFC 10029 section 3.5's: "In the above case, or if the server
+        # generates a FORMERR response, the client MUST issue additional standalone
+        # queries (that is, without using the MQTYPE-Query option) for all QTYPEs for
+        # which an answer is still required". A server that FORMERRs a *well-formed*
+        # MQTYPE-Query is in breach of RFC 6891 section 6.1.2 ("Any OPTION-CODE values
+        # not understood by a responder or requestor MUST be ignored"), but what the
+        # document prescribes is asking again without the option rather than punishing
+        # the server -- and demotion is the alternative that turns an
+        # extension-unfriendly server into a name that stops resolving.
+        #
+        # The two remedies are mutually exclusive, which is what makes three attempts
+        # the worst case rather than a ladder to fall down. A FORMERR *without* an OPT
+        # says "no EDNS here" and belongs to _edns_rejected, whose remedy (drop the OPT)
+        # drops the option with it; a FORMERR *with* an OPT is section 7's complaint
+        # about the contents of the OPT, and with a MQTYPE-Query in flight the option is
+        # the thing that was added to it.
+        #
+        # The pending key cannot shift between attempts: it is built from the
+        # transaction ID and the question, and neither retry touches either.
+        bundle_in_flight = any(option.code == MQTYPE_QUERY_OPTION_CODE for option in options)
+        for attempt in (1, 2, 3):
+            if attempt > 1:
                 future = asyncio.get_running_loop().create_future()
-                self.log.debug("resolver_edns_fallback(dst=%s id=%s)", ip.exploded, dns_packet.ID)
             queue[key] = (dns_packet, future)
             transport.sendto(bytes(dns_packet), sendto_addr)
             response = await self._await_udp(future, key, dns_packet, ip, queue=queue)
             if response is not None:
                 self._note_server(ip, response)
-            if response is None or attempt == 2 or not self._edns_rejected(dns_packet, response):
+            if response is None or attempt == 3:
                 return response
-            dns_packet.remove_edns()
-        # Unreachable: attempt 2 always returns above, so the loop is
-        # exhaustive by construction. Spelled out so the invariant survives a
-        # future edit that might otherwise let a fall-through return a future
-        # that was never resolved.
+            if self._edns_rejected(dns_packet, response):
+                self.log.debug("resolver_edns_fallback(dst=%s id=%s)", ip.exploded, dns_packet.ID)
+                dns_packet.remove_edns()
+                bundle_in_flight = False
+                continue
+            if bundle_in_flight and int(response.extended_rcode) == int(
+                DnsResponseCode.FORMAT_ERROR
+            ):
+                self.log.debug("resolver_mqtype_fallback(dst=%s id=%s)", ip.exploded, dns_packet.ID)
+                # EDNS stays: the complaint was about the OPT's contents, and an
+                # unextended re-ask would surrender the advertised payload size too.
+                dns_packet.remove_edns()
+                options = tuple(o for o in options if o.code != MQTYPE_QUERY_OPTION_CODE)
+                dns_packet.add_edns(self._advertised_payload(ip), options=options)
+                bundle_in_flight = False
+                continue
+            return response
+        # Unreachable: attempt 3 always returns above, so the loop is exhaustive by
+        # construction. Spelled out so the invariant survives a future edit that might
+        # otherwise let a fall-through return a future that was never resolved.
         return None
 
     #: Cap on the per-server EDNS memos (advertised payload size, NSID). A
@@ -770,6 +829,16 @@ class SendQuery:
     #: real question (RFC 9156 section 3 step 2). Trace rendering marks these
     #: so a reader can tell a probe from a resolution step.
     probe: bool = False
+    #: Extra QTYPEs to ask for alongside *questions* in a MQTYPE-Query option
+    #: (RFC 10029 section 3.1); empty is the ordinary single-type query.
+    #:
+    #: It rides on the effect rather than living on the resolver because the option
+    #: belongs to one question and not to every query a lookup happens to send. A glue
+    #: sub-resolution asks for a nameserver's address; bundling the user's HTTPS and
+    #: AAAA into *that* would request another name's data under the wrong name, and a
+    #: minimisation probe asks for a shorter child name whose answer says nothing about
+    #: the extras' RRsets. Both build their own SendQuery, and neither passes this on.
+    extra_qtypes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1452,6 +1521,7 @@ def resolve_steps(
     qname_min: bool = False,
     glue_policy: GluePolicy = GluePolicy.STRICT,
     failures=None,
+    extra_qtypes: tuple = (),
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1493,6 +1563,18 @@ def resolve_steps(
     sub-resolutions, and a policy that failed to reach them would quietly stop
     applying halfway down -- which in the permissive direction means the
     measurement records an adoption that did not happen.
+
+    ``extra_qtypes`` asks each server that receives the *real* question to combine
+    those QTYPEs into the same answer (RFC 10029; see :mod:`namespy.bundle`). The
+    option goes out on full-QNAME queries and on nothing else: not on a
+    QNAME-minimisation probe, which asks about a shorter name, and not on a glue
+    sub-resolution, which asks about a nameserver's address rather than the caller's.
+    A server that merely delegates does still see it, because there is no way to know
+    from here which server is the zone's, and asking costs nothing that the protocol
+    has not already made legal -- RFC 6891 section 6.1.2 says "Any OPTION-CODE values
+    not understood by a responder or requestor MUST be ignored". Whatever a referral
+    hop combines is not read: the caller harvests the bundle from the terminal answer,
+    which is the only response in the walk that is an answer about those types at all.
     """
     # Alias state lives here, not in classify: a CNAME in one response can point
     # at a name that another response aliases again, so only the loop spanning
@@ -1605,14 +1687,37 @@ def resolve_steps(
             # server is in hand, or the probe budget is spent (section 3
             # step 3: "resolve the original query as normal").
             questions = [DnsQuestion(probe, DnsQType.A, sname.qclass)]
+            # And no bundle with it. A probe asks about a shorter name than the
+            # extras were requested for, so a MQTYPE-Query here would have a server
+            # combine RRsets for the *child* -- records for a name nobody asked
+            # about, arriving under a question that is not the caller's.
+            bundle = ()
         else:
             questions = sname.questions
+            bundle = extra_qtypes
         attempted.add(entry.zone)
-        response = yield SendQuery(entry, questions, probe=probe is not None)
+        response = yield SendQuery(entry, questions, probe=probe is not None, extra_qtypes=bundle)
         # Whatever this server offered as an explanation, kept for the reason
         # strings built below. It decides nothing in this loop -- see
         # :func:`_extended_error_note` for the sentence that forbids that.
         ede_note = _extended_error_note(response)
+        if bundle and bundle_is_void(response, primary_qtype=int(sname.qtype), requested=bundle):
+            # RFC 10029 section 3.5: an answer whose MQTYPE-Response arrives twice,
+            # repeats a QTx, or repeats the primary QTYPE is "invalid (equivalent to
+            # FORMERR)". Equivalent, so it is handled the way a FORMERR is handled: this
+            # server drops out and the next one is asked.
+            #
+            # Where the check sits matters more than the rule. Before classify, and so
+            # before the cache write below, an answer the client has been told to discard
+            # is never stored -- and a later lookup that found it waiting in the cache
+            # would make the discard a formality, which is exactly the bug this branch
+            # replaced. Asking somewhere else is also the only remedy that can succeed:
+            # the server that contradicted itself will contradict itself again.
+            LOGGER.debug("resolver_mqtype_invalid(dst=%s)", entry.ns)
+            _note_demotion(entry, "invalid MQTYPE-Response")
+            yield Demote(entry, "invalid MQTYPE-Response")
+            slist.demote(entry)
+            continue
         terminal = False
         alias_target = None
         for step in classify(
@@ -2457,12 +2562,28 @@ class RecursiveResolver(Resolver):
             additional_records=additional_records,
         )
 
-    async def _send_for_entry(self, entry, questions):
+    async def _send_for_entry(self, entry, questions, extra_qtypes=()):
         """Send the query to this entry, trying all known addresses."""
         if not entry.addresses:
             return None
 
         ns_record = DnsRecord(entry.zone, DnsRType.NS, DnsRClass.IN, 0, rdata=entry.ns)
+
+        extra_options = ()
+        if extra_qtypes:
+            primary = getattr(questions[0], "qtype", None) if questions else None
+            try:
+                option = query_option_for(primary, extra_qtypes)
+            except ValueError as exc:
+                # An optional extension must never be the reason a name fails to
+                # resolve. resolve_bundle validates the list where the caller can still
+                # hear about it, so reaching here means somebody drove resolve_steps
+                # directly with a list a conforming server is obliged to refuse --
+                # section 3.3's FORMERRs. Send the query that list was meant to
+                # accompany and say why the option is not in it.
+                self.log.debug("resolver_mqtype_undone(dst=%s err=%s)", entry.ns, exc)
+            else:
+                extra_options = (option,) if option is not None else ()
 
         for address in list(entry.addresses):
             # Addresses arrive either as ipaddress objects (glue, root hints) or
@@ -2474,7 +2595,13 @@ class RecursiveResolver(Resolver):
             addr_rtype = DnsRType.A if len(packed) == 4 else DnsRType.AAAA
             addr_record = DnsRecord(entry.ns, addr_rtype, DnsRClass.IN, 0, rdata=packed)
             try:
-                response = await self.query(questions, ns_record, addr_record, RD=False)
+                response = await self.query(
+                    questions,
+                    ns_record,
+                    addr_record,
+                    RD=False,
+                    extra_edns_options=extra_options,
+                )
             except asyncio.InvalidStateError:
                 response = None
 
@@ -2533,7 +2660,7 @@ class RecursiveResolver(Resolver):
             trace.record(step)
 
             if isinstance(step, SendQuery):
-                sent = await self._send_for_entry(step.entry, step.questions)
+                sent = await self._send_for_entry(step.entry, step.questions, step.extra_qtypes)
                 continue
             if isinstance(step, NeedAddress):
                 # RFC 1034 section 5.3.3 step 2: glue may be absent (a
@@ -2601,10 +2728,26 @@ class RecursiveResolver(Resolver):
         :meth:`resolve_steps` tracks a single Sname, so silently resolving just
         the first of several unrelated questions would be a quiet wrong answer.
         """
+        response, _sname = await self._walk(dns_packet)
+        return response
+
+    @staticmethod
+    def _sole_question(dns_packet, method="resolve"):
+        """Validate that *dns_packet* asks one (name, class), and return its question.
+
+        The validation raises :class:`TypeError` / :class:`ValueError` rather than
+        asserting: these guard a public API against caller mistakes, and an ``assert``
+        vanishes under ``python -O``, which would let a zero-question packet through to
+        ``questions[0]`` and surface as an ``IndexError`` far from its cause.
+
+        Multiple questions are accepted only when they share a name and class --
+        :func:`resolve_steps` tracks a single Sname, so silently resolving just the
+        first of several unrelated questions would be a quiet wrong answer.
+        """
         if not isinstance(dns_packet, DnsPacket):
-            raise TypeError(f"resolve() expects a DnsPacket, got {type(dns_packet).__name__}")
+            raise TypeError(f"{method}() expects a DnsPacket, got {type(dns_packet).__name__}")
         if not dns_packet.questions:
-            raise ValueError("resolve() needs a packet with at least one question")
+            raise ValueError(f"{method}() needs a packet with at least one question")
 
         first = dns_packet.questions[0]
         if len(dns_packet.questions) > 1 and any(
@@ -2612,14 +2755,24 @@ class RecursiveResolver(Resolver):
             for question in dns_packet.questions[1:]
         ):
             raise ValueError(
-                "resolve() handles one (name, class) per call; multi-question "
+                f"{method}() handles one (name, class) per call; multi-question "
                 "packets must agree on name and class"
             )
+        return first
+
+    async def _walk(self, dns_packet, extra_qtypes=()):
+        """Drive one walk from the roots; return ``(response, terminal sname)``.
+
+        The SNAME comes back because it mutates on the way down. After a CNAME it holds
+        the name the answer is really about, which is the name the extras' records are
+        owned by and therefore the name a bundle must be harvested against -- asking
+        AAAA for an aliased name gets the target's AAAA, exactly as asking A does.
+        """
+        question = self._sole_question(dns_packet)
 
         # Apply the resolver's DNS suffix. Names already terminated by a
         # trailing ``.`` pass through unchanged; relative names are promoted
         # to absolute by appending :attr:`dns_suffix` (or just the root).
-        question = dns_packet.questions[0]
         qname = question.name.qualify(dns_suffix=self.dns_suffix)
         sname = Sname(qname, question.qtype, question.qclass)
         self.last_trace = Trace(sname)
@@ -2633,9 +2786,188 @@ class RecursiveResolver(Resolver):
             qname_min=self.qname_min,
             glue_policy=self.glue_policy,
             failures=self.failure_cache,
+            extra_qtypes=tuple(extra_qtypes),
         )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):
             response.ID = dns_packet.ID
             response.trace = self.last_trace
-        return response
+        return response, sname
+
+    async def resolve_bundle(self, dns_packet, extra_qtypes=(), *, ask_separately=True):
+        """Resolve one question and, in the same exchange, the QTYPEs in *extra_qtypes*.
+
+        This is RFC 10029's asking side. The Question section still holds exactly one
+        question -- QDCOUNT stays one, and RFC 9619's argument that it usually is one
+        survives untouched -- while the extra types ride in a MQTYPE-Query option. One
+        walk down the delegation tree then answers for all of them, which is the point:
+        a resolver that asks A, AAAA and HTTPS separately walks the same servers the
+        same way three times, and the walk is the expensive part.
+
+        What comes back is a :class:`~namespy.bundle.BundleResult`, whose two most
+        important fields are the ones most often conflated. A server that has never
+        heard of the extension is ``supported=False`` with every extra type still needed
+        and a primary answer in perfect health -- RFC 6891 section 6.1.2 requires that
+        "Any OPTION-CODE values not understood by a responder or requestor MUST be
+        ignored", so asking costs a few octets and nothing else. A server whose answer
+        contradicts itself is ``void=True``, and its primary answer is not usable either.
+
+        ``ask_separately`` carries out section 3.5's own instruction -- "The client MUST
+        subsequently initiate separate standalone queries for all QTx values for which an
+        answer is still required" -- by resolving each uncovered type with its own query,
+        without the option. Pass ``False`` to keep the work list and decide later; nothing
+        else about the result changes. A re-ask is an ordinary lookup and inherits the
+        ordinary rules, so if this lookup left the name's zone remembered as a failure
+        (RFC 9520 section 3.2) the re-ask is suppressed and the type stays on the work
+        list: the result admitting it finished nothing, rather than a verdict nobody was
+        allowed to earn.
+
+        Raises :exc:`ValueError` for a list that could not be sent. Section 3.3 makes
+        "An MQTYPE-Query option in a query where the primary question is a non-data
+        RRTYPE (e.g., ANY, AXFR)" a FORMERR and section 3.2 obliges a client not to send
+        one, so bundling behind an ANY is refused here rather than discovered by a server
+        that is required to reject it.
+        """
+        question = self._sole_question(dns_packet, "resolve_bundle")
+        asked = tuple(int(qtype) for qtype in extra_qtypes)
+        if asked:
+            if not is_data_rrtype(int(question.qtype)):
+                raise ValueError(
+                    f"cannot bundle a MQTYPE-Query behind a {question.qtype} question: "
+                    "RFC 10029 section 3.3 obliges a server to answer FORMERR when the "
+                    "primary question is not a data RRTYPE"
+                )
+            # Built and discarded for the sake of its validation: every section 3.3
+            # condition on the list is checked here, at the boundary where the caller can
+            # still be told, rather than at the socket where all that can be done about
+            # it is to drop the option quietly.
+            query_option_for(question.qtype, asked)
+
+        response, sname = await self._walk(dns_packet, asked)
+        # Held while the re-asks run, so the trace the caller sees is the descent that
+        # did the bundling rather than whichever standalone query happened to be last.
+        bundle_trace = self.last_trace
+        if not asked:
+            return BundleResult(supported=False, primary=response)
+
+        if isinstance(response, Response):
+            bundle = collect_bundle(
+                response,
+                primary_qtype=int(question.qtype),
+                requested=asked,
+                terminal_name=sname.qname,
+            ).with_primary(response)
+            # A self-contradictory answer does not get this far. :func:`resolve_steps`
+            # reads one as the FORMERR section 3.5 says it is equivalent to, demotes that
+            # server and asks another -- and that is the only place the rule can be
+            # honoured, because an answer the client has been told to discard must not
+            # already have been cached by the time somebody decides to discard it. What
+            # is left to handle here is the ordinary pair of outcomes: it combined, or it
+            # did not.
+            self._cache_bundle(response, sname, bundle)
+        else:
+            # Nothing answered the primary. After a discarded answer this is the usual
+            # shape -- one server, no second opinion, the walk out of candidates. The
+            # extras are still owed their queries: section 3.5 asks for a standalone one
+            # "for all QTx values for which an answer is still required". But a re-ask is
+            # an ordinary lookup and inherits the ordinary rules, including RFC 9520
+            # section 3.2: a zone this lookup just watched fail is remembered as dead, and
+            # the re-ask is stopped before it sends. What comes back then says every type
+            # is still needed, which is the truth, rather than a verdict nobody earned.
+            bundle = BundleResult(
+                supported=False,
+                primary=response,
+                still_needed=asked,
+                types=tuple(BundledType(qtype, BundleState.NEEDED) for qtype in asked),
+            )
+        self.last_trace = bundle_trace
+        if not ask_separately:
+            return bundle
+
+        for entry in bundle.types:
+            if entry.state is not BundleState.NEEDED:
+                continue
+            # A standalone query, without the option -- section 3.5 is explicit: "that
+            # is, without using the MQTYPE-Query option". It asks for the name the
+            # *caller* asked about, not the name the bundle happened to end at: this
+            # query has its own alias chain to walk, and starting it at the terminal name
+            # would be re-using somebody else's route.
+            single = Query(
+                questions=[DnsQuestion(question.name, entry.qtype, question.qclass)], RD=True
+            )
+            answer, _terminal = await self._walk(single)
+            if not isinstance(answer, Response):
+                # Unfinished, so it stays NEEDED. A work list is allowed to say that: a
+                # type nobody answered is not a type with no records.
+                continue
+            records = tuple(r for r in answer.answers if int(r.rtype) == entry.qtype)
+            if int(answer.RCODE) == int(DnsResponseCode.NAME_ERROR):
+                state = BundleState.NXDOMAIN
+            elif records:
+                state = BundleState.COMBINED
+            else:
+                state = BundleState.NODATA
+            bundle = bundle.reasked(entry.qtype, state=state, records=records, response=answer)
+
+        self.last_trace = bundle_trace
+        return bundle
+
+    def _cache_bundle(self, response, sname, bundle) -> None:
+        """Store what a combined answer delivered for the extra QTYPEs.
+
+        Section 3.5 is what licenses caching these at all: "any authoritative answers
+        received MUST be ranked the same as the answer for the primary question" (RFC
+        2181 section 5.4.1, cited there by name). The same, and not better -- so an
+        extra's entry is authoritative exactly when the response claimed authority, and a
+        NODATA learned this way is cached with the same SOA-derived ceiling RFC 2308
+        section 5 imposes on the primary's own negative answer. Both rules are already
+        :func:`_write_cache`'s for the primary; this extends the same treatment to the
+        types that arrived in its shadow, keyed by the name the walk ended at, because
+        that is the name the records are owned by and the name a later query for AAAA
+        will arrive at by following the same CNAME.
+
+        What is never cached here is :attr:`~namespy.bundle.BundleState.NEEDED`. A QTx
+        the server did not list has section 3.5's four innocent reasons, none of which is
+        "no such records", and storing a negative for it would hide a name for the length
+        of the zone's MINIMUM on the strength of a server having said nothing at all.
+        """
+        cache = self.cache
+        if cache is None or response.TC:
+            # RFC 1123 section 6.1.3.2: "Truncated responses MUST NOT be saved (cached)".
+            # A combination is the last place a partial RRset could hide, since section
+            # 3.4 lets a server stop early precisely because the answer grew too large.
+            return
+        now = cache.time_fn()
+        soa = next((r for r in response.nameservers if int(r.rtype) == int(DnsRType.SOA)), None)
+        for entry in bundle.types:
+            if entry.state is BundleState.COMBINED:
+                records = tuple(r for r in entry.records if int(r.rtype) != OPT_RTYPE)
+                if not records:
+                    continue
+                ttl = min(int(getattr(r, "ttl", 0) or 0) for r in records)
+                if ttl <= 0:
+                    continue
+                cache.put(
+                    PositiveEntry(
+                        sname.qname,
+                        entry.qtype,
+                        sname.qclass,
+                        records,
+                        now + ttl,
+                        authoritative=entry.authoritative,
+                    )
+                )
+            elif entry.authoritative:
+                # NODATA and NXDOMAIN, and only from a server that claimed authority --
+                # the bar RFC 2308 section 2.2.1 sets for the primary's own negative.
+                ttl = _negative_ttl_seconds(soa)
+                if ttl <= 0:
+                    continue
+                rcode = (
+                    DnsResponseCode.NAME_ERROR
+                    if entry.state is BundleState.NXDOMAIN
+                    else DnsResponseCode.NO_ERROR
+                )
+                cache.put(
+                    NegativeEntry(sname.qname, entry.qtype, sname.qclass, rcode, soa, now + ttl)
+                )

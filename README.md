@@ -47,13 +47,14 @@ Not published to PyPI yet, so install from the repository.
 ```bash
 namespy example.com                  # dig-style answer
 namespy example.com AAAA
+namespy example.com A --mqtype AAAA --mqtype HTTPS   # one walk, three types (RFC 10029)
 namespy --short example.com MX       # or: namespy +short example.com MX
 namespy example.com --trace          # write the resolution walk to last_resolution.md
 namespy --serve                      # demo server on 127.0.0.1:53
 ```
 
 `python -m namespy` does the same without installing the console script, and
-`namespy --help` lists the rest (`--no-edns`, `--nsid`, `--root-hints`,
+`namespy --help` lists the rest (`--no-edns`, `--nsid`, `--mqtype`, `--root-hints`,
 `--dns-suffix`, `--timeout`, `--trace-file`, `--qname-min`,
 `--allow-out-of-bailiwick-glue`, `--no-failure-cache`, `-v`, `--debug`).
 
@@ -102,6 +103,21 @@ async def main():
 
 asyncio.run(main())
 ```
+
+One walk can answer more than one type. `resolve_bundle` asks for the extras in an
+MQTYPE-Query option (RFC 10029), and what a server did not combine comes back as work
+rather than as a verdict:
+
+```python
+bundle = await resolver.resolve_bundle(query, (DnsQType.AAAA, DnsQType.HTTPS))
+for entry in bundle.types:
+    print(entry.qtype, entry.state.value, len(entry.records))
+print(bundle.still_needed)  # empty unless a type stayed unanswered
+```
+
+An answer that contradicts itself (§3.5: a duplicated QTx, the option twice) voids the
+bundle *and* the primary answer, is reported in `bundle.void` and `bundle.reason`, and is
+never cached — silence about a type, on the other hand, only means nobody answered it.
 
 The pieces are useful apart from the resolver. Decoding a capture needs neither a
 resolver nor an event loop:
@@ -153,7 +169,8 @@ them change the security properties of anything built on top.
   Padding (RFC 7830) encode and decode but are not yet *used*: there is no server-side
   cookie state to validate a reply against — the server only refuses a COOKIE whose
   length is impossible (§5.2.2) — and RFC 7830 §6 forbids padding over plaintext UDP,
-  which is all this code sends today. MQTYPE (RFC 10029) is answered, not asked: both
+  which is all this code sends today. MQTYPE (RFC 10029) is answered and, since this round,
+  asked as well: both
   option codes compose and parse (`namespy/mqtype.py`), the bundled server refuses every
   malformed MQTYPE-Query §3.3 lists, and given a well-formed one it combines the extra
   QTYPEs into the answer and returns the §3.4 MQTYPE-Response naming exactly the
@@ -165,9 +182,14 @@ them change the security properties of anything built on top.
   is the figure §4 calls appropriate for public DNS — and zero is the setting that
   answers the option without ever buying the extra lookups. A response that cannot carry
   one more type stops combining rather than truncating: §3.4's rule that a listed QTx is
-  present in full outranks the wish to answer everything at once. The
-  asking side is what is missing: nothing here sends a MQTYPE-Query, so the option is
-  only ever read (`mqtype_supported()`, `mqtype_answered_qtypes()`), never needed. The
+  present in full outranks the wish to answer everything at once. Asking is `--mqtype TYPE`
+  (repeatable), or `RecursiveResolver.resolve_bundle(packet, (AAAA, HTTPS))` from code: one
+  descent answers all three, `namespy/bundle.py` reads what came back, and any type the
+  answer did not combine gets its own query (§3.5) rather than a negative — §3.5's four
+  reasons for leaving a QTx out are all about the server and none of them is "this name has
+  no such records". A server that has never seen option 20 costs time and no answer; a
+  server that answers a bundle invalidly has the whole reply discarded before any of it can
+  reach the cache. The
   demo server answers an extended query
   with an OPT of its own — never a forwarded one, always its own payload size, and its
   identifier only if it was given one with `--advertise-nsid` and only if the
