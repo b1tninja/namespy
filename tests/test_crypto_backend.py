@@ -9,6 +9,7 @@ in the version the extra resolves to. They generate their own keys, so they cann
 conformance; the RFC's vectors do that in the verification leg.
 """
 
+import importlib
 import subprocess
 import sys
 import tomllib
@@ -31,6 +32,19 @@ from namespy.crypto import (
     require_backend,
     validation_requirement,
 )
+
+
+def _needs_backend() -> None:
+    """Skip unless the probe itself reports a backend.
+
+    Deliberately not ``pytest.importorskip("cryptography")``. That answers a different
+    question: an empty leftover directory -- what a partial uninstall leaves -- imports as a
+    namespace package, so ``importorskip`` passes and the test then dies on a missing
+    submodule. Tying the skip to :func:`crypto_available` means the test and the library agree
+    on what "installed" means, which is the only version of this that is worth anything.
+    """
+    if not crypto_available():
+        pytest.skip("namespy[crypto] is not installed")
 
 
 @pytest.fixture
@@ -86,6 +100,42 @@ def test_the_refusal_names_the_extra_to_install(no_backend):
         no_backend.require_backend("verify an RRSIG")
     assert "verify an RRSIG" in str(caught.value)
     assert "cryptography" in str(caught.value)
+
+
+def test_a_leftover_directory_is_not_reported_as_a_backend(tmp_path, monkeypatch):
+    """An empty ``cryptography/`` on the path is not an installed backend.
+
+    Found the hard way: a partial uninstall leaves the package directory behind, Python
+    imports it happily as a namespace package, and ``import cryptography`` then succeeds
+    with nothing in it. A probe that reported "backend present" on that evidence would send
+    verification code into an AttributeError instead of the MissingCryptoError callers are
+    built to handle -- the worse of the two failures, because it looks like a working install
+    right up until it is not.
+
+    It needs the distribution to be genuinely absent, and that is the same import-machinery
+    fact being tested: an empty directory yields only a *namespace portion*, and the finder
+    prefers a real package from anywhere else on ``sys.path``. So shadowing an installed
+    ``cryptography`` this way cannot work, and the test says so rather than passing by
+    accident in whichever configuration it happens to run.
+    """
+    from namespy import crypto
+
+    if crypto_available():
+        pytest.skip(
+            "the shadow below is a namespace portion and would lose to the installed "
+            "package; this case needs the distribution genuinely absent"
+        )
+
+    (tmp_path / "cryptography").mkdir()
+    monkeypatch.setattr(sys, "path", [str(tmp_path), *sys.path])
+    monkeypatch.delitem(sys.modules, "cryptography", raising=False)
+    monkeypatch.setattr(crypto, "_PROBED", False)
+    monkeypatch.setattr(crypto, "_BACKEND", None)
+
+    assert crypto.backend() is None
+    assert crypto.crypto_available() is False
+    with pytest.raises(MissingCryptoError, match=r"namespy\[crypto\]"):
+        crypto.require_backend("verify an RRSIG")
 
 
 def test_the_extra_is_named_for_the_capability_not_for_dnssec():
@@ -199,7 +249,7 @@ def test_rsa_key_size_bounds_are_the_protocol_limits():
 
 def test_the_backend_is_reported_when_the_extra_is_installed():
     """The probe finds the distribution, names its version, and is stable when asked twice."""
-    pytest.importorskip("cryptography")
+    _needs_backend()
     found = require_backend("verify an RRSIG")
     assert found is backend()
     assert found.name == "cryptography"
@@ -226,14 +276,17 @@ def test_the_shapes_dnssec_needs_exist_in_the_installed_backend():
     asserted, because a backend that accepted an off-curve point would leave this package's own
     security reasoning silently wrong.
     """
-    import importlib
+    # The skip guard is the probe's own answer, and it comes before anything touches the
+    # library. Getting this wrong is not hypothetical: an import statement above the guard
+    # raised ModuleNotFoundError instead of skipping, and failed all four Test jobs on the
+    # first CI run of this file -- a failure that cannot be reproduced on a machine that has
+    # the extra installed, which is exactly why the guard is a call and not an import.
+    _needs_backend()
 
-    from cryptography.exceptions import InvalidSignature
-
-    pytest.importorskip("cryptography")
     found = require_backend("verify an RRSIG")
     assert found.module.__name__ == "cryptography"
 
+    invalid_signature = importlib.import_module("cryptography.exceptions").InvalidSignature
     ec = importlib.import_module("cryptography.hazmat.primitives.asymmetric.ec")
     ed25519 = importlib.import_module("cryptography.hazmat.primitives.asymmetric.ed25519")
     hashes_ = importlib.import_module("cryptography.hazmat.primitives.hashes")
@@ -258,7 +311,7 @@ def test_the_shapes_dnssec_needs_exist_in_the_installed_backend():
     )
     public_key.verify(der, payload, ec.ECDSA(hashes_.SHA256()))
 
-    with pytest.raises(InvalidSignature):
+    with pytest.raises(invalid_signature):
         public_key.verify(der, b"different payload", ec.ECDSA(hashes_.SHA256()))
 
     # Not a point on P-256, which is what a crafted DNSKEY would deliver. The library says

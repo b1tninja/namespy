@@ -194,6 +194,13 @@ def backend() -> CryptoBackend | None:
         try:
             module = __import__(CRYPTO_DISTRIBUTION, fromlist=["__version__"])
         except ImportError:
+            module = None
+        if module is None or getattr(module, "__file__", None) is None:
+            # Either absent, or present as a namespace package: a directory with nothing in
+            # it -- what a partial uninstall leaves -- imports successfully and has no
+            # __file__. Reporting that as a backend would be worse than reporting none,
+            # because the caller would reach into a module with no primitives and fail inside
+            # verification instead of at this boundary, where MissingCryptoError is expected.
             _BACKEND = None
         else:
             _BACKEND = CryptoBackend(

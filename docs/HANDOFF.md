@@ -384,6 +384,27 @@ signature field, so the codec must not require it to be exactly the key length; 
 octets" exponent length plus its prohibition on leading zero octets is still unenforced in
 `RData_DNSKEY`, with one verified erratum on RFC 3110 §3 to read first.
 
+**Two bugs the first push found, neither of which this machine could see.** The first was mine in
+the test: a plain `from cryptography.exceptions import ...` sat *above* `pytest.importorskip`, so
+an install without the extra raised ModuleNotFoundError instead of skipping — all four Test jobs
+red while the Crypto job was green. A developer box that has installed the extra cannot
+reproduce that, which is the whole argument for the matrix, and the guard is now a call to
+`_needs_backend()` that asks the probe rather than an import that duplicates its question.
+
+The second was in the probe, and only surfaced because uninstalling the library left an empty
+`cryptography/` directory behind: Python imports that as a **namespace package** — successfully,
+with no `__file__` — so `backend()` reported a present backend that had nothing in it. That is the
+worst of the two answers, because it sends a caller past the boundary and into an AttributeError
+inside verification instead of the `MissingCryptoError` it is built to handle. The probe now
+treats a namespace package as absent (`namespy/crypto.py`, with a test that reproduces the
+leftover directory). Working out why that test fails when the library *is* installed taught me the
+other half of the rule: an empty directory yields only a namespace *portion*, and the finder
+prefers a real package from anywhere else on `sys.path`, so the shadow cannot win — the test skips
+with that reason stated rather than passing by luck in whichever configuration it landed in.
+
+Both configurations are now exercised on purpose: absent locally and in the four Test jobs (989
+passed, 2 skipped), present in the Crypto job (12 passed, 1 skipped).
+
 **Verified**: `ruff check .` and `ruff format --check .` clean, `mypy namespy` exits 0, and the
 claim that `import namespy` pulls in no third-party module is now proven in a subprocess — the
 only place it can actually be checked.
