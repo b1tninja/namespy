@@ -26,7 +26,7 @@ from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query
 from .rdata import generic_presentation, type_name_of
 from .resolver import EDNS_PAYLOAD_SIZE, GluePolicy, RecursiveResolver
-from .server import DnsServer
+from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
 EXAMPLE_NAME = "example.org"
@@ -412,6 +412,19 @@ def build_parser():
         "which machine it is",
     )
     p.add_argument(
+        "--max-qtypes",
+        dest="max_qtypes",
+        type=int,
+        default=MQTYPE_RECOMMENDED_QTX_LIMIT,
+        metavar="N",
+        help="with --serve: how many extra QTYPEs (RFC 10029) one query may have "
+        "combined into its answer -- the limit section 4 asks operators to keep, and "
+        "the figure it calls appropriate for public DNS. Zero supports the option "
+        "without ever buying a second lookup: the MQTYPE-Response still goes out, "
+        "empty, which is what 'this is understood and nothing was combined' sounds "
+        "like, and silence is what 'not implemented' sounds like",
+    )
+    p.add_argument(
         "--qname-min",
         action="store_true",
         help="QNAME minimisation: downline servers get progressively deeper "
@@ -582,7 +595,9 @@ async def serve(args) -> int:
         )
 
         _server_transport, _server_protocol = await loop.create_datagram_endpoint(
-            lambda: DnsServer(resolver_protocol, nsid=args.advertise_nsid),
+            lambda: DnsServer(
+                resolver_protocol, nsid=args.advertise_nsid, max_qtypes=args.max_qtypes
+            ),
             local_addr=("127.0.0.1", 53),
         )
         logging.debug(

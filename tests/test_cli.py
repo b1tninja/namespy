@@ -755,3 +755,37 @@ async def test_the_advertised_identifier_reaches_the_server_a_serve_builds(monke
     assert await task == 0
 
     assert b"ns-a" == made[-1].nsid, "the resolver endpoint is created before the server's"
+
+
+async def test_the_operational_qtype_limit_reaches_the_server_a_serve_builds(monkeypatch):
+    """RFC 10029 section 4 asks implementors to let operators configure how many QTx
+    values are processed, and ``DnsServer.max_qtypes`` is where that sentence lands --
+    so a ``--serve`` that cannot say it is a server whose only answer is the default.
+
+    The second round pins the default itself: a server started with no opinion still
+    combines up to the four the document calls appropriate for public DNS, because the
+    flag's absence means "no opinion", not "no combining".
+    """
+    made = []
+
+    async def idle_endpoint(factory, **_kwargs):
+        protocol = factory()
+        made.append(protocol)
+        return _FakeTransport(), protocol
+
+    async def skip_demo(_loop):
+        return None
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
+    )
+    monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+
+    for argv, limit in ((["--serve", "--max-qtypes", "2"], 2), (["--serve"], 4)):
+        made.clear()
+        task = asyncio.ensure_future(cli.serve(_args(argv)))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        assert await task == 0
+        assert limit == made[-1].max_qtypes, "the resolver endpoint is created before the server's"

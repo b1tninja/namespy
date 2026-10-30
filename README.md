@@ -132,7 +132,8 @@ them change the security properties of anything built on top.
   verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
   are unauthenticated: anyone who can deliver a well-formed response that matches
   the question — same source address, same ID, echoed question — is believed.
-- **EDNS(0) options are partial: NSID and Extended DNS Errors are put to use.**
+- **EDNS(0) options are partial: NSID, Extended DNS Errors and MQTYPE are put to
+  use.**
   Outbound queries advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with
   `--no-edns` or the constructor knob), arriving OPT records yield `extended_rcode`,
   `ad`, `cd` and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer
@@ -152,8 +153,23 @@ them change the security properties of anything built on top.
   Padding (RFC 7830) encode and decode but are not yet *used*: there is no server-side
   cookie state to validate a reply against — the server only refuses a COOKIE whose
   length is impossible (§5.2.2) — and RFC 7830 §6 forbids padding over plaintext UDP,
-  which is all this code sends today. The demo server answers an extended query with an
-  OPT of its own — never a forwarded one, always its own payload size, and its
+  which is all this code sends today. MQTYPE (RFC 10029) is answered, not asked: both
+  option codes compose and parse (`namespy/mqtype.py`), the bundled server refuses every
+  malformed MQTYPE-Query §3.3 lists, and given a well-formed one it combines the extra
+  QTYPEs into the answer and returns the §3.4 MQTYPE-Response naming exactly the
+  types it folded in whole. An empty list beside a failure says "supported, nothing
+  combined";
+  silence stays the way a server that never heard of the extension looks, so a reply to
+  every valid query carries the option even when it holds nothing. §4's operator knob is
+  the server's `max_qtypes` — `--max-qtypes` on the demo server, four by default, which
+  is the figure §4 calls appropriate for public DNS — and zero is the setting that
+  answers the option without ever buying the extra lookups. A response that cannot carry
+  one more type stops combining rather than truncating: §3.4's rule that a listed QTx is
+  present in full outranks the wish to answer everything at once. The
+  asking side is what is missing: nothing here sends a MQTYPE-Query, so the option is
+  only ever read (`mqtype_supported()`, `mqtype_answered_qtypes()`), never needed. The
+  demo server answers an extended query
+  with an OPT of its own — never a forwarded one, always its own payload size, and its
   identifier only if it was given one with `--advertise-nsid` and only if the
   query asked — and keeps §7's silence for a query that had none. Truncation is fully
   handled: a `TC` answer is re-asked over TCP instead of being believed

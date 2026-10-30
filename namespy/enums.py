@@ -395,3 +395,90 @@ class DnsQType(_TypeMixin, IntEnum):
 
     def __repr__(self) -> str:
         return self.name
+
+
+#: The four answers :func:`rrtype_class` gives, as constants rather than a closed
+#: enum. An enum whose members had numbers would sit one comparison away from the
+#: RRTYPE numbers it classifies -- ``RrtypeClass.DATA == 1`` next to ``A == 1`` is
+#: an accident waiting to be written -- and nothing in the protocol needs these to
+#: be ordered, only to be distinguishable in a log line.
+RRTYPE_CLASS_DATA = "data"
+RRTYPE_CLASS_META = "meta"
+RRTYPE_CLASS_QUERY = "query"
+RRTYPE_CLASS_RESERVED = "reserved"
+
+#: The three Meta-TYPEs, in RFC 6895 section 3.1's own words: "There are currently
+#: three Meta-TYPEs assigned: OPT [RFC6891], TSIG [RFC2845], and TKEY [RFC2930]".
+#: OPT is the awkward one -- it is a Meta-RR "assigned TYPE 41", which puts it
+#: inside the band the allocation policy otherwise hands to data TYPEs, so it has
+#: to be subtracted rather than assumed out by range.
+_META_RRTYPES = frozenset({41, 249, 250})
+
+#: ... and "There are currently five QTYPEs assigned: * (ALL/ANY), MAILA, MAILB,
+#: AXFR, and IXFR", which are 255 down to 251. They are not Meta-TYPEs: a Meta-TYPE
+#: describes the message, while these describe a request for data the responder may
+#: well have. The distinction matters to RFC 10029 section 3.3, which refuses
+#: either kind in a QTx but for a different reason in each case.
+_QUERY_RRTYPES = frozenset({251, 252, 253, 254, 255})
+
+#: The bands RFC 6895 section 3.1's allocation table carves out of the 16-bit
+#: space. The upper bounds are inclusive; see :func:`rrtype_class` for what each
+#: band means and why the data space is not one contiguous run.
+_DATA_TYPE_MAX = 127
+_QTYPE_BAND_MAX = 255
+_DATA_RANGE_MAX = 61439
+
+
+def rrtype_class(value: int) -> str:
+    """Which of RFC 6895 section 3.1's three subcategories ``value`` belongs to.
+
+    "There are three subcategories of RRTYPE numbers: data TYPEs, QTYPEs, and
+    Meta-TYPEs. Data TYPEs are the means of storing data. QTYPES can only be used
+    in queries. Meta-TYPEs designate transient data associated with a particular
+    DNS message" (section 3.1). A fourth answer is needed because the same table
+    also carves out space that is allocated to nobody yet: "RRTYPE zero is used as
+    a special indicator for the SIG(0) RR ... and must never be allocated for
+    ordinary use", 61440-65279 is "Reserved for future use", 65280-65534 is
+    "Reserved for Private Use", and 65535 is "Reserved (Standards Action)".
+
+    The data space is therefore two runs -- 1-127 and 256-61439 -- rather than one,
+    which surprises people who assume the 16 bits fill up in order. That gap is
+    the allocation policy's doing ("Remaining RRTYPEs in this range are assigned
+    for Q and Meta-TYPEs", for 128-255), and RFC 6895 itself flags the
+    interoperability scar it leaves: "There have been DNS implementations that made
+    caching decisions based on the top bit of the bottom byte of the RRTYPE."
+
+    An *unassigned* number inside a data band classifies as data, because that is
+    what the policy says will be assigned there, and because the alternative --
+    refusing a type this project has never heard of -- is the behaviour RFC 3597
+    section 3 rules out. An unassigned number inside 128-255 classifies as
+    reserved for the same reason read the other way: no data meaning can ever be
+    allocated there.
+
+    Raises :exc:`ValueError` outside the 16-bit field. That is not a classification
+    problem but a caller bug, and a silently-misclassified 70000 would travel.
+    """
+    number = int(value)
+    if not 0 <= number <= 0xFFFF:
+        raise ValueError(f"RRTYPE outside the 16-bit field: {value}")
+    if number == 0:
+        return RRTYPE_CLASS_RESERVED
+    if number in _META_RRTYPES:
+        return RRTYPE_CLASS_META
+    if number in _QUERY_RRTYPES:
+        return RRTYPE_CLASS_QUERY
+    if number <= _DATA_TYPE_MAX or (_QTYPE_BAND_MAX < number <= _DATA_RANGE_MAX):
+        return RRTYPE_CLASS_DATA
+    return RRTYPE_CLASS_RESERVED
+
+
+def is_data_rrtype(value: int) -> bool:
+    """Whether ``value`` names a data RRTYPE -- storage, not a query artefact.
+
+    The question RFC 10029 section 3.1 asks of every QTx: each listed value "must
+    be for a data RRTYPE as described in Section 3.1 of [RFC6895]". See
+    :func:`rrtype_class` for what counts, including the two decisions people argue
+    about: OPT is not data despite living in the data band, and a private-use
+    number is not data either, however much its originator means it.
+    """
+    return rrtype_class(value) == RRTYPE_CLASS_DATA

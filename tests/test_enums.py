@@ -13,6 +13,8 @@ the query-only pseudo-types must exist nowhere else.
 * RFC 1035 section 3.2.3 (QTYPE/QCLASS wildcards), section 6 (``AXFR``)
 * RFC 6891 section 6.1.3 (extended RCODE), section 6.1.1 (``OPT`` is not stored)
 * RFC 3597 section 3 (unknown types must not be treated as errors)
+* RFC 6895 section 3.1 (the data TYPE / QTYPE / Meta-TYPE subcategories, and the
+  bands the allocation policy leaves unassigned)
 """
 
 import pytest
@@ -24,6 +26,8 @@ from namespy.enums import (
     DnsRClass,
     DnsResponseCode,
     DnsRType,
+    is_data_rrtype,
+    rrtype_class,
 )
 
 
@@ -179,3 +183,84 @@ def test_mnemonic_labels_an_unknown_code() -> None:
     assert DnsResponseCode.mnemonic(unknown) == "RCODE11"
     assert DnsRType.mnemonic(1) == "A"
     assert DnsRClass.mnemonic(1) == "IN"
+
+
+# ------------------------------------------------- the data / QTYPE / Meta split
+#
+# RFC 6895 section 3.1 partitions the 16-bit space into three subcategories and
+# allocates the rest to nobody. Nothing in the protocol asks the question often
+# enough to be worth a type, but RFC 10029 section 3.1 asks it of every QTx and
+# section 3.3 turns a wrong answer into a FORMERR, so the partition needs its own
+# tests -- including the two boundaries people get wrong: OPT, a Meta-RR assigned a
+# number inside the data band, and the 128-255 gap that stops "data" from being one
+# contiguous run.
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, "reserved"),  # SIG(0)'s special indicator, "never allocated for ordinary use"
+        (1, "data"),
+        (41, "meta"),  # OPT, and the reason a range check alone is not enough
+        (127, "data"),  # last of the low data band
+        (128, "reserved"),  # first of the Q/Meta band, allocated to nobody yet
+        (200, "reserved"),
+        (249, "meta"),  # TKEY
+        (250, "meta"),  # TSIG
+        (251, "query"),  # IXFR
+        (252, "query"),  # AXFR
+        (255, "query"),  # ANY
+        (256, "data"),  # URI, and the first number above the gap
+        (32768, "data"),  # TA, assigned from 32,768 upward per section 3.1
+        (61439, "data"),  # last number the policy allocates to data
+        (61440, "reserved"),  # "Reserved for future use. IETF Review required"
+        (65280, "reserved"),  # "Reserved for Private Use"
+        (65535, "reserved"),  # "Reserved (Standards Action)"
+    ],
+)
+def test_every_band_of_the_rrtype_space_classifies(value: int, expected: str) -> None:
+    """The boundaries of RFC 6895 section 3.1's allocation table, each one tested at
+    the number where the policy changes rather than in the middle of a band."""
+    assert expected == rrtype_class(value)
+
+
+def test_the_meta_and_query_sets_are_the_ones_rfc_6895_counts() -> None:
+    """Section 3.1 counts its own subcategories -- "There are currently three
+    Meta-TYPEs assigned: OPT, TSIG, and TKEY. There are currently five QTYPEs
+    assigned: * (ALL/ANY), MAILA, MAILB, AXFR, and IXFR" -- so the classification must
+    agree with that arithmetic exactly. A sixth Meta-TYPE appearing in this module's
+    answer would mean it had invented one."""
+    meta = {value for value in range(0x10000) if rrtype_class(value) == "meta"}
+    query = {value for value in range(0x10000) if rrtype_class(value) == "query"}
+    assert {41, 249, 250} == meta
+    assert {251, 252, 253, 254, 255} == query
+
+
+def test_a_number_outside_the_field_is_not_a_type_at_all() -> None:
+    """The field is 16 bits, so 65536 is not an unassigned type -- it cannot arrive on
+    the wire. Classifying it would let a caller's arithmetic bug pass as a policy
+    judgement."""
+    for bad in (-1, 0x10000):
+        with pytest.raises(ValueError, match="16-bit field"):
+            rrtype_class(bad)
+
+
+def test_is_data_rrtype_is_the_same_question_not_a_second_opinion() -> None:
+    """Two predicates that can disagree are one too many; the convenience function has
+    to be exactly the classifier read one way."""
+    for value in (0, 1, 41, 127, 128, 249, 251, 255, 256, 61439, 61440, 65535):
+        assert is_data_rrtype(value) == (rrtype_class(value) == "data"), value
+
+
+def test_the_query_only_and_meta_types_are_never_data() -> None:
+    """The eight numbers RFC 6895 section 3.1 counts as QTYPEs and Meta-TYPEs are
+    spelled out here rather than derived from the enums, because both enums carry all
+    of them -- ``DnsRType`` has to know OPT, TSIG and TKEY to decode a message that
+    contains one -- so a set difference between the two enums would (correctly) come
+    out as just 251-255 and prove nothing about the Meta-TYPEs.
+
+    They are also exactly the numbers RFC 10029 section 3.3 refuses as a QTx, so this
+    is the same list read by two different documents.
+    """
+    for value in (41, 249, 250, 251, 252, 253, 254, 255):
+        assert not is_data_rrtype(value), DnsQType.mnemonic(value)

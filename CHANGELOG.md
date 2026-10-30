@@ -211,6 +211,70 @@ nothing has been tagged or published yet, so `master` is the only version.
   client connects instead of losing the record. `tests/test_svcb_presentation.py`
   (101) covers §2.1's encoding rules in both directions — charstring escaping,
   value-list splitting and joining, the `keyNNNNN` spelling, and the rejections.
+- MQTYPE (RFC 10029) — asking several QTYPEs in one exchange without touching the
+  Question section, so QDCOUNT stays one and RFC 9619's "QDCOUNT Is (Usually) One"
+  argument survives untouched; the extra types ride in EDNS options 20 and 21 (§5).
+  `namespy.mqtype` builds and reads both, and the asymmetry between them is the
+  design rather than an accident: §3.3 makes an inbound MQTYPE-Response a FORMERR on
+  its own, and §3.5 makes the *absence* of a MQTYPE-Response the way a server says it
+  does not support the extension, so the two directions could not share one code with
+  a flag inside it. Hence two constructors instead of one taking a flag, because only
+  one of the two lists may be empty: §3.3 requires FORMERR for "an MQTYPE-Query option
+  with an empty QT list" while §3.4 says the opposite of the answer — "it is possible
+  for the resulting MQTYPE-Response option to contain an empty list, but as described
+  above, the option must still be returned". Presence is the support signal and
+  contents is what was combined, and Appendix A.3's DS-plus-NS figure is precisely
+  that empty case. `mqtype_query_rejection()` holds all eight §3.3 conditions and the
+  constructors refuse the same list on the sending side, because §3.2 obliges a client
+  to "generate packets that conform to the server request parsing rules described in
+  Section 3.3" — one shared validator, so the two ends can never drift apart about what
+  is valid. Validity turns on RFC 6895 §3.1's data/QTYPE/Meta partition, which is why
+  `enums.rrtype_class()` exists: a range check cannot do it, because `OPT` (41) is a
+  Meta-RR numbered inside the data band while 128–255 is a gap the policy never
+  allocated to data, and an unassigned number above the gap (300) is a perfectly good
+  QTx — refusing it would be RFC 3597 §3's error. Reading an answer is three outcomes
+  rather than two, because §3.5 commands three different things: absent means
+  "unsupported", so keep the primary answer and re-ask the rest; present means use it;
+  present-but-self-contradictory (the option twice, or a QTx repeated, or one
+  repeating the primary QTYPE) means "treat the answer as invalid (equivalent to
+  FORMERR)". Collapsing the third into the first is the dangerous mistake, since it
+  keeps using an answer the client was told to discard — so
+  `mqtype_supported()` and `mqtype_answered_qtypes()` are separate, the first never
+  raising and the second raising for exactly those contradictions.
+  `qtypes_still_needed()` is the work list §3.5 demands and pointedly not a negative
+  answer: a missing QTx has four innocent reasons (nothing cached, flags or rcode
+  mismatched, unwilling server, response too big), none of which is NXDOMAIN or NODATA.
+  §4's "a limit of four QTx values would be appropriate" is offered as
+  `MQTYPE_RECOMMENDED_QTX_LIMIT`, which is what both the server's `max_qtypes` and the
+  demo server's `--max-qtypes` default to — one constant, so an undecided library and an
+  undecided command line cannot disagree about what they got. The knob is a real dial
+  because §4's paragraph is a policy rather than a cap: `None` leaves only §3.1's own
+  127-QTx ceiling, and zero answers the option while buying none of the lookups, which is
+  a refusal of *this much work* and sounds nothing like the silence that means the
+  extension is absent. The demo server enforces §3.3 (malformed → FORMERR, with
+  an OPT per RFC 6891 §7) and, given a well-formed query, combines: each QTx is resolved
+  through the same semaphore slot as the primary lookup, so one client stays one
+  exchange however many types it asked for (§4's amplification argument), and the answer
+  grows by whatever the primary response does not already hold. §3.4's rules are each a
+  separate guard. A record already present is not added twice, where "present" is RFC
+  2181 §5's identity — name, type, class, RDATA, TTL excluded — which is why an SOA that
+  appears in both the Answer (NODATA) and the Authority (proof of absence) sections
+  stays two records. A QTx whose answer disagrees with the primary on rcode, `aa`, `tc`
+  or `ad` is left out, because those are one bit per message and the option may not name
+  a type whose records are absent. A response that would grow past what the client
+  advertised stops combining instead of setting `TC`, since a listed QTx is promised in
+  full and §3.5's recovery from a missing one is to re-ask, not to be told the answer was
+  cut. A `TC` primary stops the loop on its own — the full set can only arrive over TCP,
+  and the option belongs with the answer that reaches it — and every one of those stops
+  still returns the option, empty if nothing was folded in, because §3.4 makes presence
+  the support signal and §3.6 makes absence the signal to retry type by type. Where RFC
+  8914 §3's "drop EDE options first" would have taken the reply's explanation with it,
+  the explanation is what goes and the MQTYPE-Response stays. `tests/test_mqtype.py`
+  (44) uses Appendix A's three figures as the oracle and covers every §3.3 condition and
+  each §3.5 outcome; sixteen in `tests/test_server.py` hold the server to both halves of
+  its posture — the refusals and the combination rules down to the octet, and the exact
+  reach of the operator's limit, zero and unbounded included; and 22 in
+  `tests/test_enums.py` pin every boundary of the §3.1 allocation table.
 
 ### Changed
 
@@ -399,11 +463,15 @@ Tracked honestly rather than as a promise — full list with reasons in
 
 - EDNS(0) *options* are implemented and several are put to use: NSID (RFC 5001) in
   both directions, per-server payload adaptation (RFC 6891 §6.2.3, §6.2.4), Extended DNS
-  Errors (RFC 8914) composed and consumed, and the bundled server answers an extended
-  query with an OPT of its own (§6.1.1, §6.2.4). Still unused on purpose: COOKIE has no
-  server-side state to validate a reply against, and Padding is never emitted because
-  RFC 7830 §6 withdraws it from plaintext UDP, which is every transport here. No client
-  subnet option (RFC 7871) and no transport keepalive (RFC 7828) — see `docs/roadmap.md`.
+  Errors (RFC 8914) composed and consumed, MQTYPE (RFC 10029) where the bundled server
+  combines the QTYPEs a query names and reports which ones it folded in (§3.3–§3.4), and
+  the bundled server answers an extended query with an OPT of its own (§6.1.1, §6.2.4).
+  Still unused on purpose: COOKIE has no server-side state to validate a reply against,
+  and Padding is never emitted because RFC 7830 §6 withdraws it from plaintext UDP, which
+  is every transport here. No client subnet option (RFC 7871) and no transport keepalive
+  (RFC 7828) — see `docs/roadmap.md`. MQTYPE has the responder's half and not the
+  questioner's: nothing here sends a MQTYPE-Query, so an A + AAAA + HTTPS lookup is still
+  three walks of the same tree.
 - No DNSSEC validation, no serve-stale (RFC 8767), no IDN/punycode
   (RFC 5891 / RFC 3492), no DoT/DoH (RFC 7858 / RFC 8484). QNAME
   minimisation (RFC 9156) ships opt-in — see *Added*.

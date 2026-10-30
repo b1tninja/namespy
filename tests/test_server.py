@@ -24,6 +24,11 @@ the server is not tested against a mock of itself.
   carry an OPT of the responder's own; one OPT per message, and never a
   forwarded one; BADVERS for an unimplemented VERSION; no OPT for a requestor
   that did not ask)
+* RFC 10029 section 3.3 (the MQTYPE-Query conditions a server must refuse),
+  section 3.4 (how a valid one is combined into the primary answer, what may not be
+  merged into it, and when the MQTYPE-Response option is owed) and section 3.5 (what
+  a client concludes when that option is absent -- which is why a server that cannot
+  combine must stay silent rather than answer with an empty list)
 """
 
 import asyncio
@@ -35,6 +40,8 @@ import pytest
 from namespy.cache import MemoryDnsCache
 from namespy.edns import (
     COOKIE_OPTION_CODE,
+    MQTYPE_QUERY_OPTION_CODE,
+    MQTYPE_RESPONSE_OPTION_CODE,
     NSID_OPTION_CODE,
     PADDING_OPTION_CODE,
     EdnsOption,
@@ -50,9 +57,16 @@ from namespy.enums import (
     DnsResponseCode,
     DnsRType,
 )
+from namespy.mqtype import (
+    mqtype_answered_qtypes,
+    mqtype_query_option,
+    mqtype_response_option,
+    mqtype_supported,
+    qtypes_still_needed,
+)
 from namespy.names import DomainName
 from namespy.packet import OPT_RTYPE, DnsPacket, DnsQuestion, DnsRecord, Query, Response
-from namespy.rdata import RData_A
+from namespy.rdata import RData_A, RData_AAAA, RData_SOA
 from namespy.resolver import RecursiveResolver
 from namespy.server import EDNS_VERSION_SUPPORTED, RESPONDER_PAYLOAD_SIZE, DnsServer
 
@@ -133,6 +147,24 @@ def test_connection_made_survives_a_transport_without_a_socket():
 def test_concurrency_floor_is_one():
     server, _resolver, _transport = make_server(max_concurrent_lookups=0)
     assert server.max_concurrent_lookups == 1
+
+
+def test_the_qtype_limit_reads_zero_as_zero_and_none_as_no_limit():
+    """The two floors are not the same floor. `max_concurrent_lookups=0` would park
+    every query behind a semaphore nobody can release, so it is clamped up; a QTx limit
+    of zero is a coherent deployment — answer the option, buy none of the lookups — and
+    clamping it would delete the operator's only way to say that. A negative is the
+    mistake: it would slice the requested list from its wrong end and report types the
+    client never asked about.
+
+    `None` is kept distinct from both because it means "no limit", which is §4's advice
+    for DNS-SD and private networks. Collapsing it into the floor is how a CLI that
+    forwards an absent flag as `None` ends up handing out unlimited lookups while
+    believing it applied the conservative default.
+    """
+    assert make_server(max_qtypes=0)[0].max_qtypes == 0
+    assert make_server(max_qtypes=-5)[0].max_qtypes == 0
+    assert make_server(max_qtypes=None)[0].max_qtypes is None
 
 
 # ----------------------------------------------------------- inbound garbage
@@ -821,6 +853,48 @@ def test_an_explanation_is_dropped_before_anything_the_client_asked_for() -> Non
     assert trimmed.RCODE == DnsResponseCode.SERVER_FAILURE
 
 
+async def test_dropping_an_explanation_keeps_the_mqtype_claim() -> None:
+    """The two size rules meet on one oversized reply, and only one of them has an
+    escape hatch.
+
+    RFC 8914 section 3 says drop EDE options before other data; RFC 10029 section 3.4
+    says a server that supports multiple QTYPEs returns the option in its response to
+    a valid query. A reply trimming itself down to the client's advertised size
+    therefore loses the explanation and keeps the claim. The alternative would be a
+    reply reporting that this server has never heard of the extension, and section
+    3.5's client would fall back on the strength of that lie. The arithmetic is the
+    same as the test above: advertise the largest size the answer plus the claim still
+    fits inside, so the only thing that can be shed is the text.
+    """
+    server, _resolver, _transport = make_server()
+    claim = len(mqtype_response_option([int(DnsRType.AAAA)]).data) + 4
+    bare = oversized_failure(query_packet())
+    bare.add_edns(512)
+    advertised = len(bytes(bare)) + claim
+
+    kept = oversized_failure(query_packet())
+    server._apply_edns(
+        query_packet().add_edns(advertised + len(no_authority()[0].data) + 4),
+        kept,
+        no_authority(),
+        mqtype_answered=[int(DnsRType.AAAA)],
+    )
+    assert [22] == [error.info_code for error in extended_errors_of(kept.edns_options())]
+    assert (int(DnsRType.AAAA),) == mqtype_answered_qtypes(kept.edns_options())
+
+    trimmed = oversized_failure(query_packet())
+    server._apply_edns(
+        query_packet().add_edns(advertised),
+        trimmed,
+        no_authority(),
+        mqtype_answered=[int(DnsRType.AAAA)],
+    )
+    options = trimmed.edns_options()
+    assert () == extended_errors_of(options), "the explanation is still the first thing dropped"
+    assert (int(DnsRType.AAAA),) == mqtype_answered_qtypes(options), "the claim is not"
+    assert len(bytes(trimmed)) <= advertised
+
+
 async def test_an_extended_error_option_too_short_to_hold_a_code_is_malformed() -> None:
     """Section 2 makes the INFO-CODE the first two octets of the option, so one octet of
     RDATA cannot express even the code, let alone any text. RFC 6891 section 7 says what
@@ -917,3 +991,543 @@ async def test_connection_lost_cancels_and_forgets_outstanding_work():
     # the settled state has to be awaited rather than inspected immediately.
     results = await asyncio.gather(*tasks, return_exceptions=True)
     assert isinstance(results[0], asyncio.CancelledError)
+
+
+# ------------------------------------------------------------------- MQTYPE (10029)
+#
+# Three behaviours, and the second is the one that costs the most to get right. A
+# malformed MQTYPE-Query is refused like any other unreadable option. A well-formed
+# one is *answered*: the extra types are resolved and folded into the primary reply.
+# And the reply states which of them actually arrived, because RFC 10029 section 3.4
+# obliges a conforming server to return a MQTYPE-Response option in its response to
+# every valid query, "even if that response is truncated" -- a client reads the
+# option's absence as "this server does not implement the extension" (section 3.5),
+# so a server that has implemented it is no longer allowed to say that.
+#
+# The fixtures below answer per QTYPE, because the section is a list of rules about
+# what may be merged and what may not, and each rule needs a question whose answer
+# differs from the primary's in exactly one way.
+
+
+def mqtype_option_with(payload: bytes) -> EdnsOption:
+    """A MQTYPE-Query option with raw payload, for shapes the client-side
+    constructor rightly refuses to build -- the point being that a peer can still
+    send them."""
+    return EdnsOption(MQTYPE_QUERY_OPTION_CODE, payload)
+
+
+#: Long enough that one record under it costs over two hundred octets, which is what
+#: makes "the answer got too big" reachable inside a 512-octet budget without
+#: inventing a record type the codecs do not know.
+LONG_HOST = DomainName(f"{'a' * 60}.{'b' * 60}.{'c' * 60}.example.com.")
+
+
+def a_record(name=HOST, address="93.184.216.34", ttl=300):
+    return DnsRecord(
+        name, DnsRType.A, DnsQClass.IN, ttl, rdata=RData_A(ipaddress.IPv4Address(address))
+    )
+
+
+def aaaa_record(name=HOST, address="2606:2800:220:1:248:1893:25c8:1946", ttl=300):
+    return DnsRecord(
+        name, DnsRType.AAAA, DnsQClass.IN, ttl, rdata=RData_AAAA(ipaddress.IPv6Address(address))
+    )
+
+
+def soa_record(name=HOST, ttl=300):
+    return DnsRecord(
+        name,
+        DnsRType.SOA,
+        DnsQClass.IN,
+        ttl,
+        rdata=RData_SOA(
+            DomainName("ns1.example.com."),
+            DomainName("hostmaster.example.com."),
+            serial=2026102801,
+        ),
+    )
+
+
+def reply_with(records=(), nameservers=(), rcode=None, aa=False, tc=False):
+    """A ``resolve()`` reply shaped like the standalone answer for one question.
+
+    The echoed question comes from the packet handed to the stub, so a sub-query for
+    a QTx comes back describing itself and not the primary -- which is the property
+    the server relies on to know which section a record belongs in.
+    """
+
+    def build(packet):
+        return Response(
+            ID=packet.ID,
+            QR=DnsQR.RESPONSE,
+            RA=True,
+            AA=aa,
+            TC=tc,
+            RCODE=int(DnsResponseCode.NO_ERROR if rcode is None else rcode),
+            questions=list(packet.questions),
+            answers=list(records),
+            nameservers=list(nameservers),
+        )
+
+    return build
+
+
+def resolver_by_qtype(replies, *, asked=None):
+    """A ``resolve()`` stub keyed by ``int(qtype)``, recording every question it saw.
+
+    A QTYPE missing from *replies* is answered SERVFAIL -- the honest shape for "the
+    extra lookup did not work", and RFC 10029 section 3.4's own example of a
+    combination that must not be folded into a NOERROR primary.
+    """
+    asked = [] if asked is None else asked
+
+    async def stub(packet):
+        question = packet.questions[0]
+        asked.append(question)
+        build = replies.get(int(question.qtype))
+        if build is None:
+            return reply_with(rcode=DnsResponseCode.SERVER_FAILURE)(packet)
+        return build(packet)
+
+    return stub
+
+
+def mqtype_query(qtypes, *, primary=DnsQType.A, name=HOST, payload=1232) -> Query:
+    """An extended one-question query asking *qtypes* alongside *primary*."""
+    return Query(ID=0xABCD, questions=[DnsQuestion(name, primary, DnsQClass.IN)]).add_edns(
+        payload, options=[mqtype_query_option(qtypes, primary_qtype=primary)]
+    )
+
+
+async def test_a_malformed_mqtype_query_is_formerr_and_still_carries_an_opt() -> None:
+    """RFC 10029 section 3.3: a QTx "corresponding to a Meta RRTYPE" must be answered
+    FORMERR. TKEY (249) is one of the three Meta-TYPEs RFC 6895 section 3.1 counts, so
+    asking for it alongside A is not a type this server has not met -- it is a type
+    that cannot be zone data at all."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([mqtype_option_with(b"\x00\xf9")])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.FORMAT_ERROR) == int(reply.RCODE)
+    assert reply.opt() is not None, "section 7: an option complaint still needs an OPT"
+
+
+async def test_an_inbound_response_option_is_formerr_by_itself() -> None:
+    """Section 3.3's second condition, which needs no query option alongside it: "An
+    MQTYPE-Response option in any inbound DNS message". A client cannot build one
+    either -- the direction is the whole point of numbering the two separately."""
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([mqtype_response_option([DnsQType.AAAA])])), ADDR)
+    await drain(server)
+
+    assert int(DnsResponseCode.FORMAT_ERROR) == int(transport.replies[0].RCODE)
+
+
+async def test_a_valid_mqtype_query_gets_every_type_that_arrived_and_says_so() -> None:
+    """Section 3.4's whole promise in one exchange: the extra type is resolved, its
+    records join the answer, and MQTYPE-Response names it.
+
+    The reply is parsed back out of the octets the server sent, which is what makes
+    the section counts part of the assertion -- an ANCOUNT that still says one over
+    two answer records is a message no client can read, and the parse is where that
+    would surface.
+    """
+    server, resolver, transport = make_server()
+    asked: list[DnsQuestion] = []
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record()]),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record()]),
+        },
+        asked=asked,
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.NO_ERROR) == int(reply.RCODE)
+    assert {int(record.rtype) for record in reply.answers} == {
+        int(DnsRType.A),
+        int(DnsRType.AAAA),
+    }
+    assert 1 == reply.QDCOUNT, "QDCOUNT stays one: the extra type rode in an option"
+    options = reply.edns_options()
+    assert mqtype_supported(options), "having combined, the server must say so"
+    assert (int(DnsRType.AAAA),) == mqtype_answered_qtypes(options, primary_qtype=int(DnsRType.A))
+    assert 2 == len(asked), "the primary first, then the one QTx"
+    assert int(DnsRType.AAAA) == int(asked[1].qtype)
+
+
+async def test_the_extra_lookup_is_a_standalone_query_not_a_relayed_one() -> None:
+    """Section 3.4 asks for "appropriate outbound queries", plural and separate, so
+    the query this server builds for a QTx belongs to it and not to the client.
+
+    Two ways that goes wrong: forwarding the MQTYPE-Query option, which asks the
+    upstream to do the combining the section assigns to this server, and echoing the
+    option back at the client, which hands a client its own request as an answer. The
+    first is checked on the question the server constructed -- the primary lookup is
+    entitled to the client's OPT as input, since the resolver rebuilds it before
+    anything leaves -- and the second on the reply.
+    """
+    server, resolver, transport = make_server()
+    seen: list[tuple[DnsQuestion, tuple]] = []
+
+    async def stub(packet):
+        seen.append((packet.questions[0], packet.edns_options()))
+        return reply_with(records=[a_record()])(packet)
+
+    resolver.resolve = stub
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    assert 2 == len(seen), "the primary first, then one query per QTx"
+    assert int(DnsRType.AAAA) == int(seen[1][0].qtype)
+    assert not seen[1][1], (
+        "a QTx lookup travels with none of the client's EDNS options: it is the "
+        "server's own query, and the resolver advertises its own reassembly size and "
+        "option list on everything it sends"
+    )
+    reply = transport.replies[0]
+    assert not any(option.code == MQTYPE_QUERY_OPTION_CODE for option in reply.edns_options()), (
+        "the answer carries the response option or nothing, never the request's"
+    )
+
+
+async def test_a_combination_that_did_not_resolve_is_left_out_but_support_is_still_claimed() -> (
+    None
+):
+    """Section 3.4's own example: a NOERROR primary and a SERVFAIL combination. "the
+    mismatching additional response MUST NOT be included in the final combined
+    response, and its QTx value MUST NOT be included in the MQTYPE-Response option's
+    list" -- while the option itself stays, because the server does implement this."""
+    server, resolver, transport = make_server()
+    resolver.resolve = resolver_by_qtype({int(DnsRType.A): reply_with(records=[a_record()])})
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.NO_ERROR) == int(reply.RCODE), (
+        "a bad extra must not spoil the primary"
+    )
+    assert [int(DnsRType.A)] == [int(record.rtype) for record in reply.answers]
+    options = reply.edns_options()
+    assert mqtype_supported(options)
+    assert () == mqtype_answered_qtypes(options, primary_qtype=int(DnsRType.A))
+    assert (int(DnsRType.AAAA),) == qtypes_still_needed([DnsQType.AAAA], ()), (
+        "a work list, not a verdict"
+    )
+
+
+async def test_a_combination_that_is_authoritative_when_the_primary_is_not_is_not_merged() -> None:
+    """The section's second example, the one that is not about RCODE at all: an
+    NS-plus-DS query at the parent side of a zone cut, where "the primary response
+    has AA=0, but a QTx response has AA=1".
+
+    AA is a claim about which server may make claims. Folding the authoritative
+    answer in behind an answer that is not would let one message assert and deny the
+    same thing, and the RCODE alone would never have caught it.
+    """
+    server, resolver, transport = make_server()
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record()]),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record()], aa=True),
+        }
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert not reply.AA, "the primary's flags are the reply's flags, decided before combining"
+    assert [int(DnsRType.A)] == [int(record.rtype) for record in reply.answers]
+    assert () == mqtype_answered_qtypes(reply.edns_options(), primary_qtype=int(DnsQType.A))
+
+
+async def test_a_record_both_questions_returned_appears_once() -> None:
+    """Section 3.4: "The server MUST detect duplicate RRs and keep only a single copy
+    of each RR in its respective section", and its own example is a CNAME chain --
+    both questions walk it, so both answers carry the same CNAME.
+
+    The TTL is not part of the identity used, because RFC 2181 section 5.1 forbids an
+    RRset whose members disagree about TTL: keeping a second copy that differs only
+    in how long it claims to be valid would emit a record set that may not exist.
+    """
+    server, resolver, transport = make_server()
+    shared = a_record()
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[shared, aaaa_record()]),
+            int(DnsRType.AAAA): reply_with(records=[a_record(ttl=60), aaaa_record()]),
+        }
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert 2 == reply.ANCOUNT == len(reply.answers), "A and AAAA, and nothing twice"
+    assert 1 == sum(1 for record in reply.answers if int(record.rtype) == int(DnsRType.A))
+    kept = next(record for record in reply.answers if int(record.rtype) == int(DnsRType.A))
+    assert 300 == kept.ttl, "the primary's copy wins, TTL and all"
+    assert (int(DnsRType.AAAA),) == mqtype_answered_qtypes(
+        reply.edns_options(), primary_qtype=int(DnsQType.A)
+    )
+
+
+async def test_the_same_record_in_two_sections_is_kept_twice() -> None:
+    """The exception in the same breath as the rule: "RRs can be legitimately
+    duplicated in different sections such as for the (SOA, TYPE12345) combination at
+    a zone apex where TYPE12345 is not present".
+
+    A query for SOA puts that SOA in the Answer section; a query for a type nobody
+    has put in the zone puts the same SOA in the Authority section as a proof of
+    nonexistence. They are two statements about the name, and collapsing them would
+    silently delete one -- so this is the one case where a byte-identical pair of
+    records must survive.
+    """
+    server, resolver, transport = make_server()
+    apex = soa_record()
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.SOA): reply_with(records=[apex]),
+            12345: reply_with(nameservers=[soa_record()]),
+        }
+    )
+
+    server.datagram_received(
+        bytes(mqtype_query([12345], primary=DnsQType.SOA)),
+        ADDR,
+    )
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert 1 == len(reply.answers), "the SOA that was asked for"
+    assert 1 == len(reply.nameservers), "the SOA that proves the other type is absent"
+    assert bytes(reply.answers[0].rdata) == bytes(reply.nameservers[0].rdata)
+    assert (12345,) == mqtype_answered_qtypes(reply.edns_options(), primary_qtype=int(DnsQType.SOA))
+
+
+async def test_a_truncated_primary_buys_no_extra_lookups_and_still_claims_support() -> None:
+    """Two sentences of section 3.4 that point in opposite directions, and both hold:
+    "If this initial response results in truncation (TC=1), then the additional
+    queries specified in the MQTYPE-Query option MUST NOT be processed", and the
+    option "MUST [be returned] even if that response is truncated (TC=1)".
+
+    The count of questions the stub was asked is the assertion that matters. A server
+    that fetched the extras anyway and then discarded them would look identical in
+    the answer and differ only in the traffic it put on the network -- which is the
+    half of this that RFC 10029 section 4 is about.
+    """
+    server, resolver, transport = make_server()
+    asked: list[DnsQuestion] = []
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record()], tc=True),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record()]),
+        },
+        asked=asked,
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert 1 == len(asked), "TC=1 means the additional queries are not processed at all"
+    assert reply.TC
+    options = reply.edns_options()
+    assert mqtype_supported(options), "truncation says use TCP, not that MQTYPE is unimplemented"
+    assert () == mqtype_answered_qtypes(options, primary_qtype=int(DnsQType.A))
+
+
+async def test_combining_never_makes_the_answer_truncated() -> None:
+    """Section 3.4's prohibition, at the exact size where it bites: "The handling of
+    an MQTYPE-Query option MUST NOT itself trigger a truncated response."
+
+    The client advertises the 512-octet floor, the name is long enough that the
+    primary answer fits inside that and the AAAA does not, and the server's answer is
+    the one the section prescribes: the type is withdrawn, left off the list, TC
+    untouched. A client that reads TC=1 goes to TCP for the whole answer; a client
+    that reads a missing QTx asks one question. Only the second is the truth here.
+    """
+    server, resolver, transport = make_server()
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record(LONG_HOST)]),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record(LONG_HOST)]),
+        }
+    )
+
+    server.datagram_received(
+        bytes(mqtype_query([DnsQType.AAAA], name=LONG_HOST, payload=512)), ADDR
+    )
+    await drain(server)
+
+    data = transport.sent[0][0]
+    reply = DnsPacket.parse(data)[0]
+    assert not reply.TC, "the option must never cause truncation"
+    assert len(data) <= 512
+    assert [int(DnsRType.A)] == [int(record.rtype) for record in reply.answers]
+    options = reply.edns_options()
+    assert mqtype_supported(options)
+    assert () == mqtype_answered_qtypes(options, primary_qtype=int(DnsQType.A))
+
+
+async def test_types_past_the_operators_limit_are_not_even_looked_up() -> None:
+    """RFC 10029 section 4: "Implementors SHOULD therefore allow operators to
+    configure limits on the number of QTx values specified and/or the resulting
+    response size."
+
+    Over a limit is not a FORMERR -- section 3.3's eight conditions do not include it
+    -- and section 3.5 already has words for the answer: "the server was unwilling to
+    process the request (for example, because a limit was exceeded)". So the types
+    past the limit are simply absent, and the assertion that keeps this an operator
+    defence rather than a cosmetic one is that the third type was never looked up.
+    """
+    server, resolver, transport = make_server(max_qtypes=1)
+    asked: list[DnsQuestion] = []
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record()]),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record()]),
+            int(DnsRType.TXT): reply_with(),
+        },
+        asked=asked,
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA, DnsRType.TXT])), ADDR)
+    await drain(server)
+
+    assert 2 == len(asked), "one primary, one combination, and the limit holds there"
+    reply = transport.replies[0]
+    options = reply.edns_options()
+    assert mqtype_supported(options)
+    assert (int(DnsRType.AAAA),) == mqtype_answered_qtypes(options, primary_qtype=int(DnsQType.A))
+    assert (int(DnsRType.TXT),) == qtypes_still_needed(
+        [DnsQType.AAAA, DnsRType.TXT], mqtype_answered_qtypes(options)
+    )
+
+
+async def test_declining_to_combine_anything_is_not_declining_the_option() -> None:
+    """``max_qtypes=0`` is the deployment that wants the support signal without buying a
+    single extra lookup, and it has to be expressible because the two refusals sound
+    nothing alike: an empty QT list (legal on its own — Appendix A.3's DS-plus-NS figure
+    is exactly that) says *this much work, not this extension*, while silence is what
+    section 3.6 defines as a server that cannot combine.
+
+    Without the floor lifted, the smallest limit still bought one lookup per query that
+    asked for two types, so an operator who wanted the option answered and the traffic
+    not spent had no way to say so.
+    """
+    server, resolver, transport = make_server(max_qtypes=0)
+    asked: list[DnsQuestion] = []
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record()]),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record()]),
+        },
+        asked=asked,
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    assert 1 == len(asked), "the primary question, and nothing else leaves this process"
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.NO_ERROR) == int(reply.RCODE)
+    options = reply.edns_options()
+    assert mqtype_supported(options), "refusing this much work is not refusing the extension"
+    assert () == mqtype_answered_qtypes(options, primary_qtype=int(DnsQType.A))
+    assert (int(DnsRType.AAAA),) == qtypes_still_needed(
+        [DnsQType.AAAA], mqtype_answered_qtypes(options)
+    ), "the client learns which half it still has to ask for"
+
+
+async def test_combining_spends_one_upstream_slot_at_a_time() -> None:
+    """The bound the amplification defence rests on, measured across a combination.
+
+    One datagram used to buy exactly one upstream lookup; answering a MQTYPE-Query
+    honestly means it now buys several, so the claim that carries RFC 5358 section
+    3's argument is not the count but the concurrency. Every combination runs inside
+    the single semaphore slot the client's query already holds, so egress still
+    cannot outrun ingress -- one lookup in flight per client, however many types that
+    client asked about.
+    """
+    server, resolver, transport = make_server(max_concurrent_lookups=1, max_qtypes=None)
+    live = 0
+    peak = 0
+
+    async def stub(packet):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        try:
+            primary = int(packet.questions[0].qtype) == int(DnsRType.A)
+            return reply_with(records=[a_record() if primary else aaaa_record()])(packet)
+        finally:
+            live -= 1
+
+    resolver.resolve = stub
+    qtypes = [DnsQType.AAAA, DnsRType.TXT, DnsRType.MX, DnsRType.NS, DnsRType.CNAME]
+    server.datagram_received(bytes(mqtype_query(qtypes)), ADDR)
+    await drain(server)
+
+    assert 1 == peak, "six lookups, never more than one of them at once"
+    options = transport.replies[0].edns_options()
+    assert len(qtypes) == len(mqtype_answered_qtypes(options, primary_qtype=int(DnsRType.A)))
+
+
+async def test_a_server_with_nothing_to_say_still_says_it() -> None:
+    """The empty list, which is the part of section 3.4 a lazy implementation gets
+    wrong: "The MQTYPE-Response option MUST still be returned, and its QT list MAY be
+    empty, even if that response is truncated (TC=1) or otherwise erroneous."
+
+    Resolution failed here, and the reply is a SERVFAIL -- but it carries a
+    zero-length MQTYPE-Response. Presence is all a client can learn about support,
+    and the silence that means "not implemented" is not available to a server that
+    implemented it.
+    """
+    server, resolver, transport = make_server()
+
+    async def no_answer(_packet):
+        return None
+
+    resolver.resolve = no_answer
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert int(DnsResponseCode.SERVER_FAILURE) == int(reply.RCODE)
+    options = reply.edns_options()
+    assert mqtype_supported(options), "an error response still has to claim support"
+    option = next(o for o in options if o.code == MQTYPE_RESPONSE_OPTION_CODE)
+    assert b"" == option.data, "an empty list is a zero-length option, not an omitted one"
+    assert () == mqtype_answered_qtypes(options, primary_qtype=int(DnsQType.A))
+
+
+async def test_a_query_without_the_option_earns_no_response_option() -> None:
+    """The other half of the same rule, and the more easily broken one: the option
+    goes out *in response to a valid query* that carried one.
+
+    A plain query is not that, and RFC 10029 section 2.2's prohibition on sending an
+    EDNS option that was not requested still stands over it. A server that answered
+    every query with an empty MQTYPE-Response would satisfy the sentence above while
+    telling every client in the world something about itself that nobody asked.
+    """
+    server, resolver, transport = make_server()
+    await answer_with(resolver, stub_reply)
+
+    server.datagram_received(bytes(extended_query([])), ADDR)
+    await drain(server)
+
+    options = transport.replies[0].edns_options()
+    assert not mqtype_supported(options), "unasked is not the same as unanswered"
+    assert not any(o.code == MQTYPE_QUERY_OPTION_CODE for o in options), "never echo the request"

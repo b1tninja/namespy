@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, pushed, in sync with `origin/master`, **branch-protected** (10 required checks, strict) |
-| Suite | 675 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
-| Coverage | 87.2% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`) |
+| Suite | 758 passed, 0 failed; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code) |
+| Coverage | 88.0% measured with `pytest -q --cov`; floor 80 lives in `pyproject.toml`, and CI passes `--cov` now — before this round it did not, so the floor was never read there |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) answered as well as encoded — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -161,7 +161,74 @@ cd D:\code\namespy
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Latest round: Extended DNS Errors (RFC 8914)
+## Latest round: MQTYPE (RFC 10029)
+
+Shipped: the wire form of both options in both directions, and the server's half of using
+them — §3.4's combination is live. The client's half, asking, is not.
+`namespy/mqtype.py` composes MQTYPE-Query (20) and MQTYPE-Response (21), parses either,
+and holds the §3.3 rules on the way out as well as the way in — §3.2 makes a client
+responsible for "packets that conform to the server request parsing rules described in
+Section 3.3", so one `_offence()` serves both ends and they cannot drift apart about what
+is valid. Two codes rather than one code plus a flag, because the directions are not
+symmetric: §3.3 refuses an inbound MQTYPE-Response outright, while §3.5 makes the
+*absence* of one the way a server says it does not support the extension — so an inbound
+response option is a FORMERR and an empty outbound one is a legal "supported, but there
+was nothing to combine" (Appendix A.3's DS-plus-NS figure is exactly that case). Things
+worth knowing before editing:
+
+- `mqtype_supported()` never raises and `mqtype_answered_qtypes()` does, on purpose. A
+  second option, a repeated QTx, or a QTx equal to the primary QTYPE means "treat the
+  answer as invalid (equivalent to FORMERR)" (§3.5), which is a *different* instruction
+  from "unsupported"; one boolean covering both would keep using an answer the client was
+  told to discard.
+- Whether a number may be a QTx is RFC 6895 §3.1's partition, not a range check, which is
+  why `enums.rrtype_class()` is new: `OPT` (41) is a Meta-RR numbered *inside* the data
+  band, 128–255 is a gap the allocation policy never gave to data, and an unassigned 300
+  is a perfectly good QTx (refusing it would repeat RFC 3597 §3's mistake). `NXTYPE` (40)
+  and `OPT` (41) are the trap a `<= 55` test walks straight into.
+- `qtypes_still_needed()` is a work list, not a negative answer. A missing QTx has four
+  innocent reasons — §3.5's own list — and none of them is NXDOMAIN or NODATA, so no
+  caller may cache a negative from it.
+- The combine loop runs inside the egress slot the primary lookup took, so what RFC 10029
+  §4 says about amplification stays true of this server: one client, one outstanding
+  upstream query at a time, whatever it asked for. `_standalone_query` sets
+  `edns_override=True` because the copy of the requestor's OPT is what carries the copy of
+  its payload size — and it drops the MQTYPE-Query on the way, because a query that echoes
+  a QTx at the responder is a second question, not the same one asked twice.
+- Three stops, three meanings, one list. The size rule withdraws a QTx it cannot deliver
+  whole — measured by `_prospective_size`, which pays for the option's own octets before
+  naming a type — and the records go back the way they came; `max_qtypes` shortens the
+  work list because an operator decided a question may not cost that many lookups; a `TC`
+  primary forbids the extra queries outright, since the complete answer can only arrive
+  over TCP, where the loop runs again and the option travels with the answer that reaches
+  the requestor. All three return `answered` as far as it got. RFC 8914 §3's
+  drop-EDE-first rule rebuilds an oversized reply *around* the MQTYPE-Response: the
+  explanation is the one option a size rule is allowed to eat.
+- `_record_key` is RFC 2181 §5's identity plus the section, deliberately. TTL is not part
+  of what makes a record the same record, and a NODATA answer legitimately carries one SOA
+  twice — once in the Answer section denying the type, once in the Authority section
+  proving the name exists. Keying without the section quietly "fixes" that.
+
+Not shipped, and `docs/roadmap.md` says 🟡: a resolver that asks once instead of an
+A + AAAA + HTTPS trio down the same tree. §4's four-QTx guideline is exported as
+`MQTYPE_RECOMMENDED_QTX_LIMIT`, which is both the default of `DnsServer(max_qtypes=...)`
+and the default of the CLI's `--max-qtypes` — one constant, so the two cannot drift
+about what an undecided operator gets. An operator may raise it, or pass `None` to leave
+§3.1's own cap — the 127 QTx values a one-octet length field permits — as the only bound
+on the list. Zero is worth naming because it is not a smaller version of the same
+refusal: it answers the option and combines nothing, which is a server declining this
+much work, while silence is a server that cannot do the extension at all. Passing the
+flag is what keeps the CLI honest here — an absent `--max-qtypes` wired through as
+`None` would have quietly meant *unlimited*, which is the opposite of the conservative
+default §4 asks for.
+
+`tests/test_mqtype.py` (44 tests, Appendix A's three figures as the oracle), sixteen
+tests in `tests/test_server.py` — the refusals, the combination rules down to the bytes of
+the option on the wire, the operator's limit at both ends of its range, and one test that
+holds the EDE and MQTYPE size rules in the same packet — and 22 in `tests/test_enums.py`
+pinning every boundary of the §3.1 table. `mqtype.py` is at 100% coverage.
+
+## Previous round: Extended DNS Errors (RFC 8914)
 
 Shipped: the `ERROR` option (code 15) is written *and* read. `ExtendedDNSError` in
 `namespy/edns.py` holds the INFO-CODE plus the raw EXTRA-TEXT octets and infers nothing
@@ -212,7 +279,8 @@ directions: `test_ech_is_conveyed_but_stays_opaque`'s `unknown_keys == (5,)` on 
 hand-built `SvcParams` is the pin. What is
 still doctest-only is `zone_file_warnings` (svcb.py:1325–1368), which leaves the module at
 88% — chase that by moving those examples into `tests/`, not by writing weaker tests.
-What remains in `docs/roadmap.md`, in order: MQTYPE (10029),
+What remains in `docs/roadmap.md`, in order: MQTYPE's asking side (10029 §3.5 -- the
+server answers, the resolver still walks the tree once per type),
 then wildcard synthesis (4592 §2.2).
 
 Housekeeping that turned out to be a real fix: the coverage floor had never been *read*
@@ -226,7 +294,7 @@ replaced with today's. The floor itself stays at 80: 87.2% is one platform's num
 rule 9 says a raise waits for a measurement, not a guess — the next one should come from a
 CI run.
 
-## Previous round: RFC 9520 failure caching (`FailureCache`)
+## Earlier round: RFC 9520 failure caching (`FailureCache`)
 
 Shipped: a resolution failure is remembered and acted on. `FailureCache` in
 `namespy/cache/__init__.py` is consulted by `resolve_steps` before any query leaves
@@ -247,7 +315,7 @@ one TCP attempt is conforming — it just had never been pinned. `test_silence_i
 and `test_edns_refusal_and_silence_do_not_combine_into_three_attempts` in
 `test_resolver_truncation.py` do that now. What remains in the roadmap is P2 and below.
 
-## Earlier round: EDNS option TLV + per-server payload adaptation
+## Earliest round: EDNS option TLV + per-server payload adaptation
 
 QNAME minimisation shipped opt-in this round: probe walk + descent
 integration (`resolve_steps` takes `qname_min`), probe-aware handling of

@@ -9,8 +9,10 @@ octets -- and puts the entire burden of meaning on the registry:
     OPTION-DATA  variable length
 
 Four codes are modelled here, because those are the four whose rules are
-short enough to enforce and whose absence is visible on the wire:
-
+short enough to enforce inside one module and whose absence is visible on the
+wire. Two more -- MQTYPE-Query (20) and MQTYPE-Response (21) -- are *named* here,
+because printing an option by its registry name is this module's job, but their
+rules are too long for it and live in :mod:`namespy.mqtype`:
 * **NSID (3)**, RFC 5001. A resolver asks by sending the option with no data
   -- "the resolver MUST NOT include any NSID payload data in the query
   message" (section 2.1) -- and the server answers with an opaque byte string
@@ -94,6 +96,8 @@ __all__ = [
     "EXTENDED_ERROR_PRIVATE_USE_MIN",
     "MAX_EDNS_OPTION_OCTETS",
     "MAX_EXTENDED_ERROR_CODE",
+    "MQTYPE_QUERY_OPTION_CODE",
+    "MQTYPE_RESPONSE_OPTION_CODE",
     "NSID_OPTION_CODE",
     "PADDING_OPTION_CODE",
     "EdnsOption",
@@ -138,6 +142,16 @@ PADDING_OPTION_CODE = 12
 #: be included in any response"), so the short form is what gets printed.
 ERROR_OPTION_CODE = 15
 
+#: OPTION-CODE 20, "MQTYPE-Query" (RFC 10029 section 3.1, IANA table in section 5).
+#: Its payload is a list of QTYPEs rather than opaque octets, so the code is
+#: registered here while the meaning lives in :mod:`namespy.mqtype`.
+MQTYPE_QUERY_OPTION_CODE = 20
+
+#: OPTION-CODE 21, "MQTYPE-Response" (RFC 10029 section 3.1, section 5). Direction
+#: matters: section 3.3 makes an inbound MQTYPE-Response a FORMERR all by itself,
+#: which is why the two numbers could not share one code with a flag inside it.
+MQTYPE_RESPONSE_OPTION_CODE = 21
+
 #: The INFO-CODE is "16 bits, which is the principal contribution of this
 #: document" (RFC 8914 section 2) -- also the largest code the field can hold.
 MAX_EXTENDED_ERROR_CODE = 0xFFFF
@@ -177,6 +191,8 @@ _OPTION_NAMES = {
     COOKIE_OPTION_CODE: "COOKIE",
     PADDING_OPTION_CODE: "PADDING",
     ERROR_OPTION_CODE: "EDE",
+    MQTYPE_QUERY_OPTION_CODE: "MQTYPE-Query",
+    MQTYPE_RESPONSE_OPTION_CODE: "MQTYPE-Response",
 }
 
 #: The "Extended DNS Error Codes" registry as RFC 8914 section 5.2 Table 3
