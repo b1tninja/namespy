@@ -572,6 +572,55 @@ that stands between us and RFC 8020 §2¶5's MUST; then the response-level valid
 erratum 3441, §8.6-§8.9) and `NxdomainPolicy.VALIDATED`; then ECDSA/EdDSA key and signature
 encodings (RFC 6605 §4, RFC 8080 §3) and the verification calls through `namespy[crypto]`.
 
+### Follow-up: cached denials carry their proofs (RFC 8020 §2¶5, RFC 4035 §3.1.1¶3 + §3.2.1)
+
+`NegativeEntry.proofs` — the NSEC/NSEC3 records that denied a name, each followed by its RRSIGs —
+now survives both cache backends, including the `nxdomain_at` lookup that answers a name nobody
+queried, and `namespy.nsec` gained two adapters: `collect_proof_records()` to pull the bundle out of
+a response and `proof_entries()` to feed records into the proof predicates. `test_nsec_cache.py` is
+16 tests over the collector, the adapters and both backends.
+
+**The blocker surfaced by doing this, stated plainly: the resolver never sets the DO bit, so it is
+never sent these records.** RFC 4035 §3.2.1 is not ambiguous — the resolver side of a recursive
+server MUST set DO on outbound requests *regardless* of what the client asked, and the name-server
+side MUST strip DNSSEC RRs when the client didn't ask but MUST NOT strip types the query explicitly
+requested. So the echo RFC 8020 §2¶5 requires is storable today and satisfiable only after the DO
+plumbing lands (client DO carried inward, OPT built with DO outbound). I did not invent a serving
+rule to fill the gap: an echo that ignores the strip half of §3.2.1 would hand DNSSEC records to
+clients that never asked for any, which is a behaviour change with its own failure modes.
+
+**Two rules that shaped the design:**
+* The bundle is whatever §3.1.1¶3 says it is: a proof and its signatures travel together, so an NSEC
+  with no covering RRSIG is *dropped* rather than stored bare. A bare proof reaching a client is
+  worse than none — it arrives from the one server the client trusts, looking authenticated.
+* Pairing is by owner name + Type Covered, not by Signer's Name. The signer is the zone apex; in an
+  NSEC3 response the owner is a base32hex hash resembling neither. The natural implementation
+  (match on signer) fails exactly where proofs matter, so there is a test named for it.
+
+**Storage notes.** The SQLite column needs a real migration: `CREATE TABLE IF NOT EXISTS` is a no-op
+against an existing file, so the schema text alone leaves every on-disk database from an older build
+without `proofs` and every read raising `OperationalError`. `_add_proofs_column` checks
+`PRAGMA table_info` and ALTERs once; old rows read back with no proofs (the truth about them) and
+new writes carry them. An unreadable proofs blob costs the proofs, not the denial — same degradation
+`_decode_soa` already applies, and deleting the entry instead would convert a missing signature
+bundle into a re-query storm. Positive rows write an empty bundle deliberately: their RRSIGs are
+already inside `records`.
+
+**Test failures that were mine, both worth keeping in mind:** `DnsRecord`'s fifth positional argument
+is `rdlength`, not `rdata` (pass rdata by keyword); and the SQLite cache key is
+`DomainName.canonical_text`, which is uppercased and root-terminated — hand-written SQL in a test
+that guessed the spelling silently updated zero rows, which is how a "passing" migration test can
+prove nothing. Both tests now use the code's own key function rather than a guess.
+
+**Verified**: 1075 passed (+16), `ruff check .` / `ruff format --check .` clean, `mypy namespy`
+exits 0.
+
+**Next, in order**: (1) the DO plumbing — OPT with DO outbound, client DO inward, echo proofs on a
+cached denial for DO=1 and strip otherwise (RFC 4035 §3.2.1, RFC 8020 §2¶5); (2) the response-level validators
+(§8.5 with erratum 3441, §8.6-§8.9) and then `NxdomainPolicy.VALIDATED`, which can finally mean
+something once proofs are both present and checked; (3) ECDSA/EdDSA key and signature encodings
+(RFC 6605 §4, RFC 8080 §3) and the verification calls through `namespy[crypto]`.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

@@ -547,6 +547,40 @@ nothing has been tagged or published yet, so `master` is the only version.
   computes its key tag, and refuses only when `rsa_public_key()` is asked, which keeps RFC 4034
   §2.1.2's "judged at verification time" and keeps an operator's ability to say which rule a zone
   broke.
+- Cached denials now keep their proof records. `NegativeEntry` gained a `proofs` field — the
+  NSEC/NSEC3 RRs that denied the name, each followed by the RRSIGs covering it — stored by both
+  backends and readable from both lookups, including `nxdomain_at`, the one that answers a name
+  nobody queried. `namespy.nsec.collect_proof_records(records)` builds the bundle, and
+  `namespy.nsec.proof_entries(records, rtype)` adapts wire records into the `(owner, rdata)` pairs
+  the proof predicates take, so `closest_encloser_proof` can now be fed straight from a response or
+  from the cache.
+  **The bundle is defined by RFC 4035 §3.1.1¶3, not by convenience**: "When placing a signed RRset
+  in the Authority section, the name server MUST also place its RRSIG RRs in the Authority
+  section." A collector that returned bare NSEC records would let a resolver hand a client an
+  authenticated-looking denial from the one server the client trusts, so a proof with no covering
+  RRSIG is dropped rather than half-stored. Pairing is by owner name and Type Covered — never by
+  Signer's Name, which is the zone apex and in an NSEC3 response resembles neither the denied name
+  nor anything else. That distinction is a test of its own, because pairing on the signer is the
+  natural implementation and it fails exactly where proofs matter.
+  `proof_entries` deliberately does *not* require signatures, and the difference from the collector
+  is documented on both: one answers "what does this set assert", which a diagnosis needs even for
+  records it will not trust; the other answers "what may be echoed as authenticated".
+  SQLite needed a column, and a column needs a migration that schema text cannot do: `CREATE TABLE
+  IF NOT EXISTS` is a no-op against a file that already exists, so an on-disk database from an older
+  build has no `proofs` column and every read would raise `OperationalError`. `_add_proofs_column`
+  checks `PRAGMA table_info` and ALTERs once; old rows read back with no proofs, which is the truth
+  about them, and new writes carry them. An unreadable proofs blob costs the proofs and not the
+  denial — the same degradation `_decode_soa` already applies, for the same reason: deleting the
+  entry would turn a missing signature bundle into a re-query storm.
+  **What is not claimed, in one sentence because it is the interesting part: the resolver still does
+  not echo these records, because it never sets the DO bit and so is never sent them.** RFC 4035
+  §3.2.1 is blunt that "the resolver side of a security-aware recursive name server MUST set the DO
+  bit when sending requests, regardless of the state of the DO bit in the initiating request", and
+  that the name-server side MUST strip DNSSEC RRs when the client did not ask but MUST NOT strip
+  types the query explicitly requested. Honouring that pair needs the client's DO state carried
+  into the resolver and an OPT record built with DO on outbound queries — the next increment, after
+  which RFC 8020 §2¶5's MUST becomes satisfiable rather than merely storable. Proofs that do arrive
+  — from a caller that queried DNSSEC types explicitly — are collected, cached and reachable today.
 - Authenticated denial of existence: the NSEC and NSEC3 proof rules, in a new module
   `namespy/nsec.py` (RFC 4034 §6.1, RFC 4035 §5.4, RFC 4592 §3.3.1, RFC 5155 §6-§9).
   `name_order_key`, `canonical_name_before`, `sort_canonical`, `name_between`, `hash_between`,

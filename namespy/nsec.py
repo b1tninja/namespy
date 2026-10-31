@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .dnssec import decode_base32hex
+from .enums import DnsRType
 from .names import DomainName
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; neither module imports this one
@@ -483,3 +484,80 @@ def nsec3_proves_nxdomain(qname, entries, zone) -> Nsec3NxdomainProof:
             f"covering the wildcard {wildcard} (RFC 5155 §8.4)"
         )
     return Nsec3NxdomainProof(closest=closest, wildcard=wildcard, wildcard_entry=covering)
+
+
+# ------------------------------------------------- proof records as they arrive in responses
+#
+# A response is a flat list of records; a proof is a relationship between them. These two helpers
+# are the bridge from one to the other, and they deliberately ask different questions -- one about
+# authentication, one about shape.
+
+
+PROOF_TYPES: frozenset[int] = frozenset({int(DnsRType.NSEC), int(DnsRType.NSEC3)})
+
+
+def proof_entries(records, rtype: int | None = None) -> tuple:
+    """Adapt response records into the ``(owner, rdata)`` pairs these predicates take.
+
+    The owner name lives in the RR header, not in the RDATA, which is why proof checking cannot work
+    from RDATA objects alone -- an NSEC without its owner is just a next name and a bitmap, and an
+    NSEC3 without its owner has lost the hash that placed it in the chain.
+
+    No signature is required here, and that is not an oversight: this answers "what does this record
+    assert", leaving "can it be trusted" to whoever verifies the RRSIGs. Requiring a signature to
+    even build the entries would hide which records exist, which is the one thing a diagnosis needs.
+    Pass ``rtype`` to restrict the result to one proof type, as every entry point of
+    :func:`closest_encloser_proof` and friends expects.
+    """
+    wanted = PROOF_TYPES if rtype is None else {int(rtype)}
+    entries = []
+    for record in records:
+        if int(record.rtype) not in wanted:
+            continue
+        rdata = getattr(record, "rdata", None)
+        if rdata is None:
+            continue
+        entries.append((record.name, rdata))
+    return tuple(entries)
+
+
+def collect_proof_records(records) -> tuple:
+    """The proof RRs in a response **together with the RRSIGs that cover them**, or nothing.
+
+    RFC 8020 §2¶5 obliges a caching resolver to hand back the NSEC or NSEC3 records that
+    authenticated a cached denial, and RFC 4035 §3.1.1¶3 decides what that bundle has to contain:
+    "When placing a signed RRset in the Authority section, the name server MUST also place its RRSIG
+    RRs in the Authority section." A proof without its signature is worse than no proof, because the
+    client is being handed an authenticated-looking denial by a resolver that is the one party it
+    trusts -- so a proof with no covering RRSIG is dropped here rather than passed on half-dressed.
+
+    Pairing is by owner name and Type Covered, which is how an RRSIG identifies the RRset it signs
+    (it shares that RRset's owner name and names its type). Note the two are *not* matched by signer
+    name: the signer is the zone apex and the owner is the denied name, and in an NSEC3 response
+    neither resembles the other.
+
+    Records are returned in the order they arrived, each proof immediately followed by its
+    signatures, so a caller can serialise the bundle without regrouping it.
+    """
+    records = list(records)
+    covering: dict[tuple[tuple[bytes, ...], int], list] = {}
+    for record in records:
+        rdata = getattr(record, "rdata", None)
+        if int(record.rtype) != int(DnsRType.RRSIG) or rdata is None:
+            continue
+        if int(rdata.type_covered) not in PROOF_TYPES:
+            continue
+        covering.setdefault((name_order_key(record.name), int(rdata.type_covered)), []).append(
+            record
+        )
+
+    bundle = []
+    for record in records:
+        if int(record.rtype) not in PROOF_TYPES:
+            continue
+        signatures = covering.get((name_order_key(record.name), int(record.rtype)))
+        if not signatures:
+            continue
+        bundle.append(record)
+        bundle.extend(signatures)
+    return tuple(bundle)

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS rrset_cache (
     expires_at  REAL    NOT NULL,
     authoritative INTEGER NOT NULL DEFAULT 0,
     payload     BLOB    NOT NULL,
+    proofs      BLOB    NOT NULL DEFAULT x'',
     PRIMARY KEY (name, qtype, qclass)
 );
 CREATE INDEX IF NOT EXISTS idx_rrset_expires ON rrset_cache(expires_at);
@@ -103,6 +104,24 @@ def _decode_soa(payload):
     return soa
 
 
+def _unpack_proofs(payload):
+    """Cached NSEC/NSEC3 records and their RRSIGs, or nothing when they cannot be read.
+
+    The same degradation as :func:`_decode_soa`, for the same reason: a database written by an older
+    build has no proofs at all, and a blob that will not parse was truncated. Either way the denial
+    itself is still sound and only the RFC 8020 §2¶5 echo is lost, so the entry is kept rather than
+    the lookup failed -- dropping the entry would turn a missing signature bundle into a re-query
+    storm, and dropping the proofs turns it into an answer with no DNSSEC data.
+    """
+    if not payload:
+        return []
+    try:
+        return _unpack_records(bytes(payload))
+    except (DnsPacketParseError, struct.error, IndexError) as exc:
+        LOGGER.debug("cache_proofs_undecodable(err=%s)", exc)
+        return []
+
+
 class SqliteDnsCache(DnsCache):
     """SQLite-backed :class:`~namespy.cache.DnsCache`.
 
@@ -115,7 +134,23 @@ class SqliteDnsCache(DnsCache):
         super().__init__(time_fn=time_fn)
         self._conn = sqlite3.connect(path)
         self._conn.executescript(_SCHEMA)
+        self._add_proofs_column()
         self._conn.commit()
+
+    def _add_proofs_column(self):
+        """Add ``proofs`` to a database written before cached denials carried proof records.
+
+        ``CREATE TABLE IF NOT EXISTS`` in :data:`_SCHEMA` does nothing at all against an existing
+        file, so a column added to the schema text is invisible to every database on disk until
+        something ALTERs it in. Handling SQLite's missing-column error at each read site would be
+        three places remembering the same detail, and rewriting the table would be a migration
+        script for one blob column.
+        """
+        columns = [row[1] for row in self._conn.execute("PRAGMA table_info(rrset_cache)")]
+        if "proofs" not in columns:
+            self._conn.execute(
+                "ALTER TABLE rrset_cache ADD COLUMN proofs BLOB NOT NULL DEFAULT x''"
+            )
 
     def close(self):
         """Close the connection, tolerating one that is already gone.
@@ -156,13 +191,13 @@ class SqliteDnsCache(DnsCache):
         qc = int(qclass)
         now = self.time_fn()
         row = self._conn.execute(
-            "SELECT kind, rcode, expires_at, authoritative, payload "
+            "SELECT kind, rcode, expires_at, authoritative, payload, proofs "
             "FROM rrset_cache WHERE name=? AND qtype=? AND qclass=? LIMIT 1",
             (key_name, qt, qc),
         ).fetchone()
         if row is None:
             return None
-        (kind, rcode, expires_at, authoritative, payload) = row
+        (kind, rcode, expires_at, authoritative, payload, proofs) = row
         if expires_at <= now:
             self._conn.execute(
                 "DELETE FROM rrset_cache WHERE name=? AND qtype=? AND qclass=?",
@@ -179,7 +214,9 @@ class SqliteDnsCache(DnsCache):
                 expires_at,
                 bool(authoritative),
             )
-        return NegativeEntry(name, qtype, qclass, rcode, _decode_soa(payload), expires_at)
+        return NegativeEntry(
+            name, qtype, qclass, rcode, _decode_soa(payload), expires_at, _unpack_proofs(proofs)
+        )
 
     def nxdomain_at(self, name, qclass):
         key_name = _name_text(name)
@@ -193,14 +230,16 @@ class SqliteDnsCache(DnsCache):
         # key, so the ancestor walk this method feeds costs one indexed read per
         # label rather than a scan.
         row = self._conn.execute(
-            "SELECT qtype, rcode, expires_at, payload FROM rrset_cache "
+            "SELECT qtype, rcode, expires_at, payload, proofs FROM rrset_cache "
             "WHERE name=? AND qclass=? AND kind=? AND expires_at>? LIMIT 1",
             (key_name, qc, _KIND_NXDOMAIN, now),
         ).fetchone()
         if row is None:
             return None
-        row_qtype, rcode, expires_at, payload = row
-        return NegativeEntry(name, row_qtype, qc, rcode, _decode_soa(payload), expires_at)
+        row_qtype, rcode, expires_at, payload, proofs = row
+        return NegativeEntry(
+            name, row_qtype, qc, rcode, _decode_soa(payload), expires_at, _unpack_proofs(proofs)
+        )
 
     def put(self, entry):
         key_name = _name_text(entry.name)
@@ -211,18 +250,23 @@ class SqliteDnsCache(DnsCache):
             rcode = int(DnsResponseCode.NO_ERROR)
             authoritative = 1 if entry.authoritative else 0
             payload = _pack_records(entry.records)
+            # A positive entry needs no proof bundle: its RRSIGs are part of ``records``, which is
+            # how an answer and its signatures stay together. The column exists so the row shape is
+            # uniform, not because an answer has proofs to carry.
+            proofs = b""
         elif isinstance(entry, NegativeEntry):
             rcode_int = int(entry.rcode)
             kind = _KIND_NXDOMAIN if rcode_int == int(DnsResponseCode.NAME_ERROR) else _KIND_NODATA
             rcode = rcode_int
             authoritative = 0
             payload = bytes(entry.soa) if entry.soa is not None else b""
+            proofs = _pack_records(getattr(entry, "proofs", ()))
         else:
             raise TypeError(f"unsupported cache entry: {type(entry).__name__}")
         self._conn.execute(
             "INSERT OR REPLACE INTO rrset_cache "
-            "(name, qtype, qclass, kind, rcode, expires_at, authoritative, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(name, qtype, qclass, kind, rcode, expires_at, authoritative, payload, proofs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key_name,
                 qt,
@@ -232,6 +276,7 @@ class SqliteDnsCache(DnsCache):
                 float(entry.expires_at),
                 authoritative,
                 payload,
+                proofs,
             ),
         )
         self._conn.commit()

@@ -79,6 +79,7 @@ from .edns import (
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType, is_data_rrtype
 from .minimis import QnameMinimiser
 from .names import DomainName
+from .nsec import collect_proof_records
 from .packet import (
     OPT_RTYPE,
     DnsPacket,
@@ -2136,6 +2137,7 @@ def _write_cache(cache, sname, terminal_event, response):
                 DnsResponseCode.NO_ERROR,
                 terminal_event.soa,
                 now + ttl,
+                collect_proof_records(response.nameservers) if response is not None else (),
             )
         )
         return
@@ -2157,6 +2159,7 @@ def _write_cache(cache, sname, terminal_event, response):
                 DnsResponseCode.NAME_ERROR,
                 soa,
                 now + ttl,
+                collect_proof_records(response.nameservers) if response is not None else (),
             )
         )
 
@@ -3174,5 +3177,13 @@ class RecursiveResolver(Resolver):
                     else DnsResponseCode.NO_ERROR
                 )
                 cache.put(
-                    NegativeEntry(sname.qname, entry.qtype, sname.qclass, rcode, soa, now + ttl)
+                    NegativeEntry(
+                        sname.qname,
+                        entry.qtype,
+                        sname.qclass,
+                        rcode,
+                        soa,
+                        now + ttl,
+                        collect_proof_records(response.nameservers),
+                    )
                 )

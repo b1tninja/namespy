@@ -139,9 +139,19 @@ class NegativeEntry(CacheEntry):
     record from the authority section that established the TTL ceiling
     (may be ``None`` if the upstream did not return one — the caller is
     expected to refuse to cache in that case).
+
+    ``proofs`` holds the NSEC or NSEC3 RRs that denied the name, each followed by the RRSIGs that
+    cover it -- build it with :func:`namespy.nsec.collect_proof_records`, which enforces that pairing.
+    It is what RFC 8020 §2¶5 turns the entry from a memory into evidence: "the iterative, caching
+    resolver MUST return these NSEC or NSEC3 records in the response to the triggering query if the
+    query had the DNSSEC OK (DO) bit set", and the records that prove a descendant's nonexistence are
+    the same ones, which is precisely why they have to survive the cache round trip rather than be
+    re-derived. Empty is legitimate -- an unsigned zone has none, and a signed zone's denial reaches
+    a resolver that did not ask for DNSSEC data without them too -- and an empty value only costs the
+    echo, never the denial itself.
     """
 
-    def __init__(self, name, qtype, qclass, rcode, soa, expires_at):
+    def __init__(self, name, qtype, qclass, rcode, soa, expires_at, proofs=()):
         super().__init__(name, qtype, qclass, expires_at)
         try:
             rcode = DnsResponseCode(int(rcode))
@@ -149,9 +159,12 @@ class NegativeEntry(CacheEntry):
             pass
         self.rcode = rcode
         self.soa = soa
+        self.proofs = tuple(proofs)
 
     def __repr__(self):
-        return f"<NegativeEntry {self.name}/{self.qtype} rcode={self.rcode}>"
+        return (
+            f"<NegativeEntry {self.name}/{self.qtype} rcode={self.rcode} proofs={len(self.proofs)}>"
+        )
 
 
 def _cut_key(name, qclass):
