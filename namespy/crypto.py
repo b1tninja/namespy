@@ -28,6 +28,13 @@ from types import ModuleType
 __all__ = [
     "CRYPTO_DISTRIBUTION",
     "CRYPTO_EXTRA",
+    "ECDSA_ALGORITHMS",
+    "ECDSA_FIELD_OCTETS",
+    "EC_KEY_OCTETS",
+    "EC_SIGNATURE_OCTETS",
+    "EDDSA_ALGORITHMS",
+    "EDDSA_KEY_OCTETS",
+    "EDDSA_SIGNATURE_OCTETS",
     "IMPLEMENT_FOR_VALIDATION",
     "MAX_RSA_KEY_BITS",
     "MIN_RSA_KEY_BITS",
@@ -158,13 +165,13 @@ class SignatureAlgorithmSpec:
 #: (Ed25519 and Ed448, 15 and 16). EdDSA has no separate digest -- it is part of the
 #: primitive -- hence None, which is a fact about the scheme and not a gap.
 #:
-#: What this table does *not* settle is the octet encoding of the key and signature fields:
-#: RFC 6605 §4 gives ECDSA signatures as fixed-width r then s rather than DER, RFC 8080 §3
-#: likewise for EdDSA, and RFC 3110 §2's exponent-then-modulus packing plus its leading-zero
-#: rule has its own history. The RSA half of that is now in namespy.dnssec (unpack_rsa_public_key,
-#: rsa_signature_octets) because it turned out to need no dependency at all; the ECDSA and EdDSA
-#: halves still belong to the verification leg, where they can be written against vectors, and are
-#: listed as its homework rather than guessed at here.
+#: What this table does *not* settle is the octet encoding of the key and signature
+#: fields -- that is layout, and layout lives in namespy.dnssec: RFC 3110 §2's
+#: exponent-then-modulus packing and erratum 2811's signature width; RFC 6605 §4's x|y
+#: points and r|s signatures (fixed-width field elements, never DER on the wire); RFC
+#: 8080 §3-§4's bare EdDSA bit strings. What this module owns is the policy side of the
+#: same question: which algorithm number carries which widths, cited to the paragraph
+#: that sets them, so the codec can be handed a bound rather than invent one.
 SIGNATURE_ALGORITHMS: dict[int, SignatureAlgorithmSpec] = {
     5: SignatureAlgorithmSpec(SignatureAlgorithm.RSA, "sha1", "RFC 3110"),
     7: SignatureAlgorithmSpec(SignatureAlgorithm.RSA, "sha1", "RFC 3110"),
@@ -209,6 +216,47 @@ def minimum_rsa_key_bits(algorithm: int) -> int:
     primitive this package does not implement.
     """
     return RSA_MIN_KEY_BITS_BY_ALGORITHM.get(int(algorithm), MIN_RSA_KEY_BITS)
+
+
+# ------------------------------------------------------------- ECC widths (RFC 6605 §4, RFC 8080 §3-§4)
+
+#: The numbers whose DNSKEY Public Key field holds two fixed-width curve coordinates.
+#: Derived from the table above rather than written out again, the same way
+#: :data:`RSA_ALGORITHMS` is.
+ECDSA_ALGORITHMS: frozenset[int] = frozenset(
+    number
+    for number, spec in SIGNATURE_ALGORITHMS.items()
+    if spec.primitive in (SignatureAlgorithm.ECDSA_P256, SignatureAlgorithm.ECDSA_P384)
+)
+
+#: The numbers whose key and signature are single fixed-width bit strings.
+EDDSA_ALGORITHMS: frozenset[int] = frozenset(
+    number
+    for number, spec in SIGNATURE_ALGORITHMS.items()
+    if spec.primitive in (SignatureAlgorithm.ED25519, SignatureAlgorithm.ED448)
+)
+
+#: Octets per field element. RFC 6605 §4¶2: "For P-256, each integer MUST be encoded as
+#: 32 octets; for P-384, each integer MUST be encoded as 48 octets." The same widths serve
+#: both of §4's uses of a field element: x and y in the key (§4¶1), r and s in the
+#: signature (§4¶2). EdDSA needs no entry here because its key and signature are single
+#: values rather than concatenations of integers, and carry their own widths below.
+ECDSA_FIELD_OCTETS: dict[int, int] = {13: 32, 14: 48}
+
+#: The Public Key field, "x | y" (§4¶1), and the Signature field, "r | s" (§4¶2). The
+#: widths coincide today -- both are two field elements -- and are still kept apart,
+#: because they measure different things: a key is wide because of its curve, a signature
+#: because of the same curve's order, and a document could rename one without the other.
+EC_KEY_OCTETS: dict[int, int] = {alg: 2 * width for alg, width in ECDSA_FIELD_OCTETS.items()}
+EC_SIGNATURE_OCTETS: dict[int, int] = {alg: 2 * width for alg, width in ECDSA_FIELD_OCTETS.items()}
+
+#: RFC 8080 §3¶1-¶2: "An Ed25519 public key consists of a 32-octet value... An Ed448
+#: public key consists of a 57-octet value", and §4¶1-¶2 the signatures at 64 and 114.
+#: 57 and 114 are the ones that look wrong and are not: the curves are 456 and 912 bits,
+#: which octet-pad at the high end, so a validator that assumed multiples of eight would
+#: reject every Ed448 key on the wire.
+EDDSA_KEY_OCTETS: dict[int, int] = {15: 32, 16: 57}
+EDDSA_SIGNATURE_OCTETS: dict[int, int] = {15: 64, 16: 114}
 
 
 def validation_requirement(algorithm: int) -> ValidationRequirement:

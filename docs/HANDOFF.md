@@ -790,6 +790,70 @@ liftable; (4) the header AD/CD bits, without which §9.2's rules and this round'
 `via_opt_out` flags honour nothing. The DS-strip question and the `serve --dnssec` DO
 question above remain open.
 
+### Follow-up: the ECC encodings — fixed-width field elements, bare bit strings, and a DER parser that reads each blob once (RFC 6605 §4, RFC 8080 §3–§4, erratum 4935)
+
+The second stage of the staged arc: the key and signature *encodings* for ECDSA and EdDSA,
+with the verification calls still ahead of them. The promise this section keeps is that all
+of it needed no dependency — the last round's note in `namespy/crypto.py` said the ECDSA and
+EdDSA halves "turned out to be layout rather than arithmetic", and they did.
+
+**What shipped.** `namespy/dnssec.py` gained the layout: `pack_ec_public_key` /
+`unpack_ec_public_key` (x‖y at two padded field elements, §4¶1), `ecdsa_signature_from_rs` /
+`ecdsa_signature_from_der` / `ecdsa_signature_to_der` / `ecdsa_signature_octets` (the wire is
+fixed-width r‖s, §4¶2; DER exists only at the backend boundary), and
+`eddsa_public_key_octets` / `eddsa_signature_octets` (bare bit strings at 32/57 and 64/114,
+RFC 8080 §3–§4). `namespy/crypto.py` gained the policy tables beside the algorithm registry:
+`ECDSA_FIELD_OCTETS`, `EC_KEY_OCTETS`, `EC_SIGNATURE_OCTETS`, `EDDSA_KEY_OCTETS`,
+`EDDSA_SIGNATURE_OCTETS`, and the derived `ECDSA_ALGORITHMS` / `EDDSA_ALGORITHMS` sets.
+`RData_DNSKEY` gained `ec_public_key()` / `require_ec_key()` / `eddsa_public_key()` /
+`require_eddsa_key()` next to the RSA pair; parse still never interprets. The DER parser is
+strict where the grammar is permissive to lookalikes — short-form lengths only (two field
+elements plus sign pads cannot reach 128 content octets, so the long form encodes nothing
+these curves sign), minimal INTEGERs, one reading per blob.
+
+**Findings.** (1) *The published examples disagree with copy-paste, in both directions.* The
+RFC 6605 §6.1 key wraps mid-character-group in the .txt and a hand transcription drops the
+`b` at the wrap — caught only because the key-tag and DS-digest tests refuse a key whose
+octets are off by one, which is exactly what those pins exist for; the vectors in
+`test_dnssec_ecc.py` were extracted programmatically and accepted only after §6's own printed
+tags (55648, 10771) and digests matched. (2) *RFC 8080 §6 as printed is wrong*: verified
+erratum 4935 replaced every RRSIG example after the generator script dropped the algorithm
+identifier and counted the root label, and the corrected values are on the erratum page, not
+in the RFC body. The tests pin the corrected Ed25519 and Ed448 signatures **verifying**
+through the backend and the superseded original **failing** — a copy-paste of the document
+alone would have pinned broken values and called them vectors. (3) The coordinate rule is
+RSA's rule inverted: pack pads to field width (FIPS 186-3's fixed-width bit strings) where
+RFC 3110 §2¶3 prohibits leading zeros, because a coordinate's width is the curve's, not the
+value's — and uniqueness matters either way, because the key tag sums the octets a DS
+commits to. (4) DER's zero INTEGER is the single octet `0x00` — a minimality check written as
+"no leading zeros" rejects the canonical encoding of zero; the check now distinguishes the
+sign pad (`0x00` before a high-bit octet, required) from surplus padding (refused) from the
+zero itself (parsed, then refused as not-a-signature, which is where it belongs). (5) Ed448's
+widths are 57 and 114 — not multiples of eight — which the tests name explicitly because the
+natural heuristic fails every Ed448 record on the wire. (6) `cryptography` 50 removed
+`Encoding.Uncompressed` in favour of `Encoding.X962`; the crypto extra's floor (50.0.2) is
+already at that API, and the local venv now installs `namespy[crypto]`, so the backend-gated
+tests run here rather than only in the CI crypto job.
+
+**Not claimed.** Nothing verifies a network response yet: the RFC 4035 §5.3.1 procedure
+(signtime window, protocol 3, key-tag match, algorithm policy per RFC 9904) is the next
+commit, and until it lands `NxdomainPolicy.VALIDATED` stays refused at the door with its
+honest message. The backend signatures verified here are the RFCs' own examples, which pins
+the encodings, not a validator.
+
+**Verified**: 1180 passed (+42: 41 new in `tests/test_dnssec_ecc.py`, plus 1 previously
+backend-skipped test that the now-installed extra enables; 1 skipped is the namespace-shadow
+case that needs the distribution absent), `ruff check .` / `ruff format --check .` clean,
+`mypy namespy` exits 0, `-O` run holds, coverage 91% total with `namespy/dnssec.py` at 99%.
+
+**Next, in order**: (1) the verification calls — RFC 4035 §5.3.1's procedure over
+`namespy[crypto]`: canonical RRset reconstruction (already shipped), RRSIG signtime/protocol/
+key-tag checks, RFC 9904's algorithm policy at the point of use, and the per-primitive
+backend dispatch this encoding work now feeds; (2) trust anchors — the root KSK fetched from
+IANA at implementation time rather than from memory, and the DS→DNSKEY chain; (3)
+`NxdomainPolicy.VALIDATED` wired where `_nxdomain_cut` reads `NegativeEntry`; (4) the header
+AD/CD bits. The DS-strip question and the `serve --dnssec` DO question remain open.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

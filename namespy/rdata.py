@@ -46,7 +46,15 @@ import struct
 from collections.abc import Iterable
 from typing import ClassVar
 
-from .crypto import MAX_RSA_KEY_BITS, RSA_ALGORITHMS, minimum_rsa_key_bits
+from .crypto import (
+    ECDSA_ALGORITHMS,
+    ECDSA_FIELD_OCTETS,
+    EDDSA_ALGORITHMS,
+    EDDSA_KEY_OCTETS,
+    MAX_RSA_KEY_BITS,
+    RSA_ALGORITHMS,
+    minimum_rsa_key_bits,
+)
 from .dnssec import (
     DNSKEY_FLAG_REVOKED,
     DNSKEY_FLAG_SEP,
@@ -55,6 +63,7 @@ from .dnssec import (
     DNSKEY_PROTOCOL_VALUE,
     NSEC3_OPT_OUT_FLAG,
     DigestType,
+    EcdsaPublicKey,
     MalformedRsaKeyError,
     RsaPublicKey,
     decode_base32hex,
@@ -63,6 +72,7 @@ from .dnssec import (
     decode_type_bitmap,
     digest_material,
     ds_digest,
+    eddsa_public_key_octets,
     encode_base32hex,
     encode_base64_field,
     encode_hex_field,
@@ -70,6 +80,7 @@ from .dnssec import (
     key_material,
     known_digest_octets,
     nsec3_hash,
+    unpack_ec_public_key,
     unpack_rsa_public_key,
     unsigned_field,
 )
@@ -990,11 +1001,13 @@ class RData_DNSKEY(RData):
 
     The public key is stored as opaque octets, and nothing on the parse path interprets it:
     §2.1.4 says only that "The format depends on the algorithm of the key being stored and is
-    described in separate documents". Reading those documents turned up no dependency for the RSA
-    ones -- RFC 3110 §2 is integer packing, which is why :meth:`rsa_public_key` and
-    :meth:`require_rsa_key` can decode it here while ECDSA and EdDSA key material still waits on
-    the backend. Everything that never needs a format at all -- the flags, the key tag, the DS a
-    key turns into -- is still computed on the raw octets.
+    described in separate documents". Those documents have now been read -- RFC 3110 §2 is
+    integer packing, RFC 6605 §4 is two fixed-width coordinates, RFC 8080 §3 is a bare
+    bit string -- and :meth:`rsa_public_key`, :meth:`ec_public_key` and
+    :meth:`eddsa_public_key` decode them here on request, with no dependency for any of it:
+    every format turned out to be layout rather than arithmetic. Everything that never needs
+    a format at all -- the flags, the key tag, the DS a key turns into -- is still computed
+    on the raw octets.
 
     Nothing in this class rejects a key it finds unusable, because the RFCs put those
     judgements at verification time: §2.1.2 says a Protocol other than 3 makes the RR
@@ -1092,6 +1105,64 @@ class RData_DNSKEY(RData):
             raise MalformedRsaKeyError(
                 f"DNSKEY modulus is {key.key_bits} bits, over the {MAX_RSA_KEY_BITS}-bit "
                 f"interoperability limit of RFC 3110 §2¶3"
+            )
+        return key
+
+    @property
+    def key_algorithm_is_ecdsa(self) -> bool:
+        """Whether :attr:`algorithm` packs its public key as two field elements (RFC 6605 §4¶1)."""
+        return self.algorithm in ECDSA_ALGORITHMS
+
+    @property
+    def key_algorithm_is_eddsa(self) -> bool:
+        """Whether :attr:`algorithm` carries its public key as a bare bit string (RFC 8080 §3)."""
+        return self.algorithm in EDDSA_ALGORITHMS
+
+    def ec_public_key(self) -> EcdsaPublicKey | None:
+        """The ECDSA curve point this record carries, or None if its algorithm is not ECDSA.
+
+        The width is the curve's and is therefore not a judgement: RFC 6605 §4¶2 says the
+        coordinates MUST be 32 octets each on P-256 and 48 on P-384, so there is no size
+        window to consult the way RSA keys have one -- wrong width is malformed, not weak.
+        Whether the point is *on* the curve is arithmetic, and arrives with the backend.
+        """
+        if not self.key_algorithm_is_ecdsa:
+            return None
+        return unpack_ec_public_key(
+            self.public_key, field_octets=ECDSA_FIELD_OCTETS[self.algorithm]
+        )
+
+    def require_ec_key(self) -> EcdsaPublicKey:
+        """The ECDSA point, refusing a record whose algorithm is not ECDSA.
+
+        Mirrors :meth:`require_rsa_key`: callers reach for this about to verify an ECDSA
+        signature, so a key of another algorithm arriving here is a programming error.
+        """
+        key = self.ec_public_key()
+        if key is None:
+            raise ValueError(
+                f"DNSKEY algorithm {self.algorithm} does not use the RFC 6605 §4 "
+                f"two-coordinate key format"
+            )
+        return key
+
+    def eddsa_public_key(self) -> bytes | None:
+        """The EdDSA key octets at their fixed width, or None if the algorithm is not EdDSA.
+
+        RFC 8080 §3 gives the key as one value of one width -- 32 octets for Ed25519, 57
+        for Ed448 -- so this reads nothing and checks only the length, the sole fact about
+        the blob that needs no arithmetic.
+        """
+        if not self.key_algorithm_is_eddsa:
+            return None
+        return eddsa_public_key_octets(self.public_key, key_octets=EDDSA_KEY_OCTETS[self.algorithm])
+
+    def require_eddsa_key(self) -> bytes:
+        """The EdDSA key octets, refusing a record whose algorithm is not EdDSA."""
+        key = self.eddsa_public_key()
+        if key is None:
+            raise ValueError(
+                f"DNSKEY algorithm {self.algorithm} does not use the RFC 8080 §3 key format"
             )
         return key
 

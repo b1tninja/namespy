@@ -8,6 +8,28 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- The ECDSA and EdDSA encodings (RFC 6605 §4, RFC 8080 §3–§4) — the curve point as two
+  fixed-width field elements, the EdDSA key as a bare 32- or 57-octet bit string, and the
+  signature as fixed-width r‖s, *not* DER: §4¶2 is a MUST with no padding licence beside it,
+  unlike RSA where erratum 2811 made short signatures legitimate history. Coordinates pad
+  to the curve's width rather than minimising like an RSA modulus, because the key tag sums
+  these octets and only one encoding of a point is correct. The DER form the backend speaks
+  is converted at the boundary by a strict hand-written parser — short-form lengths, minimal
+  INTEGERs, one reading per blob — because a signature encoding with two readings is a
+  signature that verifies differently for different verifiers. `pack_ec_public_key`,
+  `unpack_ec_public_key`, `ecdsa_signature_from_rs`, `ecdsa_signature_from_der`,
+  `ecdsa_signature_octets`, `eddsa_public_key_octets`, `eddsa_signature_octets`
+  (`namespy/dnssec.py`); `RData_DNSKEY.ec_public_key()`/`.eddsa_public_key()` and their
+  `require_` twins; the width tables `ECDSA_FIELD_OCTETS`, `EC_KEY_OCTETS`,
+  `EDDSA_KEY_OCTETS`, `EDDSA_SIGNATURE_OCTETS` (`namespy/crypto.py`). The tests pin every
+  published value the RFCs print: RFC 6605 §6's two keys (tags 55648 and 10771 with their
+  DS digests) and both signatures, and RFC 8080 §6 **as corrected by verified erratum 4935**
+  — whose generator script had dropped the RRSIG algorithm identifier and counted the root
+  label — so the corrected Ed25519 and Ed448 signatures are pinned verifying through the
+  backend, and the superseded original is pinned failing. No dependency is imported by the
+  layout itself; the backend only confirms it
+  (`test_dnssec_ecc.py`).
+
 - The response-level validators (RFC 5155 §8.5-§8.9, RFC 4035 §5.4) — the shapes a signed
   response can take, each with the records it owes and the split between *absent* and
   *contradictory*. `nsec3_proves_no_data` is §8.5 **as corrected by verified erratum 3441**,

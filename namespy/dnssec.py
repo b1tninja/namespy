@@ -45,6 +45,9 @@ __all__ = [
     "CanonicalizationError",
     "DigestType",
     "DuplicateRecordError",
+    "EcdsaPublicKey",
+    "EcdsaSignature",
+    "MalformedEcKeyError",
     "MalformedRsaKeyError",
     "Nsec3HashAlgorithm",
     "RsaPublicKey",
@@ -59,6 +62,12 @@ __all__ = [
     "decode_type_bitmap",
     "digest_material",
     "ds_digest",
+    "ecdsa_signature_from_der",
+    "ecdsa_signature_from_rs",
+    "ecdsa_signature_octets",
+    "ecdsa_signature_to_der",
+    "eddsa_public_key_octets",
+    "eddsa_signature_octets",
     "encode_base32hex",
     "encode_base64_field",
     "encode_hex_field",
@@ -68,11 +77,13 @@ __all__ = [
     "key_tag",
     "known_digest_octets",
     "nsec3_hash",
+    "pack_ec_public_key",
     "pack_rsa_public_key",
     "rrsig_label_count",
     "rrsig_signed_data",
     "rsa_signature_octets",
     "signed_owner_name",
+    "unpack_ec_public_key",
     "unpack_rsa_public_key",
     "unsigned_field",
 ]
@@ -1032,3 +1043,277 @@ def rsa_signature_octets(signature, *, key_bits: int) -> bytes:
             f"({length} octet(s)); no signature reduced mod n can be this long"
         )
     return octets.rjust(length, b"\x00")
+
+
+# --------------------------------- ECC key material and signatures (RFC 6605 §4, RFC 8080 §3-§4)
+#
+# Layout again: which algorithm numbers use which layout, and how wide each field is, is
+# the policy in namespy.crypto, which supplies every width below as an argument. Nothing
+# here imports a backend, including the DER work the ECDSA leg needs -- the encoding §4
+# converts to is a SEQUENCE of two INTEGERs, at most 102 content octets for either curve,
+# which is five grammar rules rather than a library.
+
+
+class MalformedEcKeyError(ValueError):
+    """RDATA that cannot be read as an ECDSA/EdDSA key, or a signature that cannot be one.
+
+    The same line :class:`MalformedRsaKeyError` draws: reading badly is one report, and
+    being readable but unusable -- off-curve, wrong for the algorithm's arithmetic -- is
+    another, and the second belongs to whoever does the arithmetic.
+    """
+
+
+class EcdsaPublicKey(NamedTuple):
+    """A decoded ECDSA public key: the curve point Q as its two coordinates (RFC 6605 §4¶1)."""
+
+    x: int
+    y: int
+    field_octets: int
+
+    def to_wire(self) -> bytes:
+        """The DNSKEY Public Key field, :func:`pack_ec_public_key` of these coordinates."""
+        return pack_ec_public_key(self.x, self.y, field_octets=self.field_octets)
+
+    @property
+    def uncompressed_point(self) -> bytes:
+        """0x04 then x|y -- the SEC 1 uncompressed form, for the verification leg only.
+
+        The backend wants a point encoding where the wire keeps none: §4¶1 says Q "is a
+        simple bit string that represents the uncompressed form of a curve point", the
+        prefix byte being exactly what DNSSEC leaves out. Translating once, here, is what
+        keeps that prefix from ever being mistaken for part of a key.
+        """
+        return b"\x04" + self.to_wire()
+
+
+class EcdsaSignature(NamedTuple):
+    """An ECDSA signature as the two integers FIPS 186-3 calls r and s (RFC 6605 §4¶2)."""
+
+    r: int
+    s: int
+    field_octets: int
+
+    def to_wire(self) -> bytes:
+        """RRSIG Signature field: "r | s", each integer padded to the field width (§4¶2)."""
+        width = self.field_octets
+        return self.r.to_bytes(width, "big") + self.s.to_bytes(width, "big")
+
+    def to_der(self) -> bytes:
+        """The CMS/X.690 form: SEQUENCE { INTEGER r, INTEGER s }.
+
+        Both coordinates stay inside two field elements plus a sign pad, so the sequence
+        content never reaches 128 octets and the definite short length form is the only
+        one -- which is why :func:`ecdsa_signature_from_der` can refuse the long form
+        outright rather than parse it.
+        """
+        body = _der_integer(self.r) + _der_integer(self.s)
+        return b"\x30" + bytes([len(body)]) + body
+
+
+def _der_integer(value: int) -> bytes:
+    """One INTEGER's tag-length-content, minimal and non-negative (the form CMS uses)."""
+    value = int(value)
+    if value <= 0:
+        raise MalformedEcKeyError(f"ECDSA signature integer must be positive, got {value}")
+    octets = value.to_bytes((value.bit_length() + 7) // 8, "big")
+    if octets[0] & 0x80:
+        octets = b"\x00" + octets  # the sign pad: an unpadded high bit reads as negative
+    return b"\x02" + bytes([len(octets)]) + octets
+
+
+def pack_ec_public_key(x: int, y: int, *, field_octets: int) -> bytes:
+    """Encode a curve point into DNSKEY RDATA (RFC 6605 §4¶1-¶2).
+
+    Each coordinate is the big-endian bit string *padded* to exactly the field width, so
+    x=1 is thirty-one zero octets and a one. This is the opposite of the RSA leading-zero
+    prohibition (RFC 3110 §2¶3), and the reason is worth recording: an RSA modulus is an
+    integer whose encoding was chosen to be minimal, while a coordinate is a field element
+    whose width is the curve's, not the value's. Padding is also what makes the encoding
+    unique -- and uniqueness matters twice over here, because the key tag sums these
+    octets and a DS commits to the sum.
+    """
+    x, y, width = int(x), int(y), int(field_octets)
+    for name, value in (("x", x), ("y", y)):
+        if value < 0:
+            raise MalformedEcKeyError(f"EC coordinate {name} is negative")
+        if value.bit_length() > width * 8:
+            raise MalformedEcKeyError(
+                f"EC coordinate {name} needs {(value.bit_length() + 7) // 8} octet(s), "
+                f"over the {width}-octet field width"
+            )
+    return x.to_bytes(width, "big") + y.to_bytes(width, "big")
+
+
+def unpack_ec_public_key(blob, *, field_octets: int) -> EcdsaPublicKey:
+    """Read DNSKEY RDATA as a curve point (RFC 6605 §4¶1), strictly on width.
+
+    Q is the bare "x | y", not a SEC 1 point encoding, so there is deliberately no prefix
+    check: a real x can begin with 0x04, with 0x02, or with a run of zero octets, and any
+    heuristic rejecting "looks like a prefix byte" would reject genuine keys. Whether the
+    point lies on the named curve is arithmetic and belongs to the backend. The one
+    arithmetic-free refusal is the all-zero point, which is on no curve and is the blob an
+    attacker reaches for first.
+    """
+    octets = bytes(blob)
+    width = int(field_octets)
+    if len(octets) != 2 * width:
+        raise MalformedEcKeyError(
+            f"ECDSA public key is {len(octets)} octet(s); the field width {width} "
+            f"fixes it at 2 x {width} = {2 * width} (RFC 6605 §4¶1)"
+        )
+    x = int.from_bytes(octets[:width], "big")
+    y = int.from_bytes(octets[width:], "big")
+    if not x and not y:
+        raise MalformedEcKeyError("ECDSA public key is the all-zero point, which is on no curve")
+    return EcdsaPublicKey(x=x, y=y, field_octets=width)
+
+
+def ecdsa_signature_from_rs(octets, *, field_octets: int) -> EcdsaSignature:
+    """Split an RRSIG Signature field into r and s (RFC 6605 §4¶2), strictly on width.
+
+    §4¶2 is a MUST with no padding licence beside it -- unlike RSA, where erratum 2811
+    made short signatures legitimate history, the width here is the curve's and a short
+    signature is a malformed record rather than a conservative signer. A signer that
+    emitted the DER form into RRSIG produced an invalid record; the conversion in
+    :func:`ecdsa_signature_from_der` exists for CMS boundaries and freshly minted
+    signatures, not for reading this sentence generously.
+    """
+    data = bytes(octets)
+    width = int(field_octets)
+    if len(data) != 2 * width:
+        raise MalformedEcKeyError(
+            f"ECDSA signature is {len(data)} octet(s); RFC 6605 §4¶2 fixes each integer "
+            f"at {width}, so the concatenation is exactly {2 * width}"
+        )
+    r = int.from_bytes(data[:width], "big")
+    s = int.from_bytes(data[width:], "big")
+    if not r or not s:
+        raise MalformedEcKeyError(
+            "ECDSA signature carries a zero r or s, and no signature over these curves "
+            "has one (both are required to lie in [1, n-1])"
+        )
+    return EcdsaSignature(r=r, s=s, field_octets=width)
+
+
+def ecdsa_signature_from_der(der, *, field_octets: int) -> EcdsaSignature:
+    """Read the CMS/X.690 ``SEQUENCE { INTEGER r, INTEGER s }`` form (RFC 6605 §4).
+
+    The parser is strict where DER is permissive to lookalikes: definite short-form
+    lengths only (the content cannot reach 128 octets, so anything else is not the
+    canonical encoding of anything this curve signs), minimal INTEGERs with no surplus
+    leading zeros, no negative values, both integers present, no trailing bytes. Each
+    refusal is because the class of input being refused is a crafted blob hoping a lenient
+    reader assigns it a meaning -- and a signature encoding with two readings is a
+    signature that verifies differently for different verifiers.
+    """
+    data = bytes(der)
+    width = int(field_octets)
+    if len(data) < 2 or data[0] != 0x30:
+        raise MalformedEcKeyError("ECDSA signature is not a DER SEQUENCE (RFC 6605 §4)")
+    seq_len = data[1]
+    if seq_len & 0x80:
+        raise MalformedEcKeyError(
+            "ECDSA signature uses a long-form SEQUENCE length, which DER reserves for "
+            f"content of 128 octets or more; two {width}-octet integers never reach that"
+        )
+    if len(data) != 2 + seq_len:
+        raise MalformedEcKeyError(
+            f"ECDSA signature SEQUENCE declares {seq_len} content octet(s) but is "
+            f"followed by {len(data) - 2}"
+        )
+    values = []
+    pos = 2
+    for name in ("r", "s"):
+        if pos + 2 > len(data) or data[pos] != 0x02:
+            raise MalformedEcKeyError(
+                f"ECDSA signature is missing its {name} INTEGER inside the SEQUENCE"
+            )
+        int_len = data[pos + 1]
+        if int_len & 0x80:
+            raise MalformedEcKeyError(f"ECDSA signature {name} uses a long-form INTEGER length")
+        body = data[pos + 2 : pos + 2 + int_len]
+        if len(body) != int_len:
+            raise MalformedEcKeyError(f"ECDSA signature {name} runs past the end of the SEQUENCE")
+        if int_len == 0:
+            raise MalformedEcKeyError(f"ECDSA signature {name} is an empty INTEGER")
+        if int_len > width + 1:
+            raise MalformedEcKeyError(
+                f"ECDSA signature {name} is {int_len} octet(s), wider than field element "
+                f"{width} plus a sign pad"
+            )
+        if body[0] & 0x80:
+            raise MalformedEcKeyError(f"ECDSA signature {name} is negative")
+        if body[0] == 0x00 and int_len > 1 and not (body[1] & 0x80):
+            # A 0x00 pad is DER's sign bit, not padding: permitted only when the next
+            # octet would otherwise read negative. The bare b"\x00" INTEGER (int_len 1)
+            # is DER's canonical zero and belongs to the zero-r-or-s refusal below.
+            raise MalformedEcKeyError(
+                f"ECDSA signature {name} carries a leading zero octet DER does not permit"
+            )
+        values.append(int.from_bytes(body, "big"))
+        pos += 2 + int_len
+    if pos != len(data):
+        raise MalformedEcKeyError("ECDSA signature SEQUENCE holds more than two INTEGERs")
+    r, s = values
+    if not r or not s:
+        raise MalformedEcKeyError("ECDSA signature has a zero r or s, which no signature has")
+    return EcdsaSignature(r=r, s=s, field_octets=width)
+
+
+def ecdsa_signature_to_der(signature, *, field_octets: int) -> bytes:
+    """Wire-form r|s (or an :class:`EcdsaSignature`) to the DER form: the backend's input."""
+    sig = (
+        signature
+        if isinstance(signature, EcdsaSignature)
+        else ecdsa_signature_from_rs(signature, field_octets=field_octets)
+    )
+    return sig.to_der()
+
+
+def ecdsa_signature_octets(signature, *, field_octets: int) -> bytes:
+    """Normalize an ECDSA signature to wire form r|s, accepting either form on the way in.
+
+    A record parsed from the wire arrives as r|s and is width-checked; a freshly signed
+    one arrives as DER from the backend and is converted. This is the mirror of
+    :func:`rsa_signature_octets` for the ECC world, with the difference §4¶2 imposes:
+    exact width in, not a modulus-derived pad.
+    """
+    data = bytes(signature)
+    if len(data) == 2 * int(field_octets):
+        return ecdsa_signature_from_rs(data, field_octets=field_octets).to_wire()
+    if data[:1] == b"\x30":
+        return ecdsa_signature_from_der(data, field_octets=field_octets).to_wire()
+    raise MalformedEcKeyError(
+        f"ECDSA signature of {len(data)} octet(s) is neither the fixed-width r|s of "
+        f"RFC 6605 §4¶2 nor a DER SEQUENCE"
+    )
+
+
+def eddsa_public_key_octets(blob, *, key_octets: int) -> bytes:
+    """Check EdDSA key material at its one fixed width (RFC 8080 §3¶1-¶2).
+
+    There is no structure here to misread -- the key "consists of a 32-octet value" and
+    nothing else -- so the width is the whole check, and enforcing it to the octet is what
+    makes the report honest: an Ed25519 key missing one octet is still 31 bytes of
+    perfectly shaped noise, and a verifier that tolerated the length would hand back
+    "signature invalid" where the truth is "record malformed". Whether the octets decode
+    to a curve point is arithmetic, and the backend's.
+    """
+    octets = bytes(blob)
+    if len(octets) != int(key_octets):
+        raise MalformedEcKeyError(
+            f"EdDSA public key is {len(octets)} octet(s); RFC 8080 §3 fixes it at {key_octets}"
+        )
+    if not any(octets):
+        raise MalformedEcKeyError("EdDSA public key is all zero octets, which decodes to no point")
+    return octets
+
+
+def eddsa_signature_octets(signature, *, signature_octets: int) -> bytes:
+    """Check an EdDSA signature at its one fixed width (RFC 8080 §4¶1-¶2): 64 or 114."""
+    octets = bytes(signature)
+    if len(octets) != int(signature_octets):
+        raise MalformedEcKeyError(
+            f"EdDSA signature is {len(octets)} octet(s); RFC 8080 §4 fixes it at {signature_octets}"
+        )
+    return octets
