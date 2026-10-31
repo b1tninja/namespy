@@ -46,6 +46,7 @@ import struct
 from collections.abc import Iterable
 from typing import ClassVar
 
+from .crypto import MAX_RSA_KEY_BITS, RSA_ALGORITHMS, minimum_rsa_key_bits
 from .dnssec import (
     DNSKEY_FLAG_REVOKED,
     DNSKEY_FLAG_SEP,
@@ -54,6 +55,8 @@ from .dnssec import (
     DNSKEY_PROTOCOL_VALUE,
     NSEC3_OPT_OUT_FLAG,
     DigestType,
+    MalformedRsaKeyError,
+    RsaPublicKey,
     decode_base32hex,
     decode_base64_field,
     decode_hex_field,
@@ -67,6 +70,7 @@ from .dnssec import (
     key_material,
     known_digest_octets,
     nsec3_hash,
+    unpack_rsa_public_key,
     unsigned_field,
 )
 from .dnssec import (
@@ -984,12 +988,13 @@ class RData_HTTPS(RData_SVCB):
 class RData_DNSKEY(RData):
     """``DNSKEY`` RDATA -- Flags, Protocol, Algorithm, Public Key (RFC 4034 §2.1).
 
-    The public key is stored as opaque octets and deliberately never interpreted:
-    §2.1.4 says only that "The format depends on the algorithm of the key being
-    stored and is described in separate documents", and those documents (RFC 3110,
-    RFC 5155, RFC 6605, RFC 8080) are exactly where the dependency question lives.
-    Everything that does not need them -- the flags, the key tag, the DS a key turns
-    into -- is computed here.
+    The public key is stored as opaque octets, and nothing on the parse path interprets it:
+    §2.1.4 says only that "The format depends on the algorithm of the key being stored and is
+    described in separate documents". Reading those documents turned up no dependency for the RSA
+    ones -- RFC 3110 §2 is integer packing, which is why :meth:`rsa_public_key` and
+    :meth:`require_rsa_key` can decode it here while ECDSA and EdDSA key material still waits on
+    the backend. Everything that never needs a format at all -- the flags, the key tag, the DS a
+    key turns into -- is still computed on the raw octets.
 
     Nothing in this class rejects a key it finds unusable, because the RFCs put those
     judgements at verification time: §2.1.2 says a Protocol other than 3 makes the RR
@@ -1034,6 +1039,61 @@ class RData_DNSKEY(RData):
 
     def to_wire(self) -> bytes:
         return struct.pack("!HBB", self.flags, self.protocol, self.algorithm) + self.public_key
+
+    @property
+    def key_algorithm_is_rsa(self) -> bool:
+        """Whether :attr:`algorithm` packs its public key per RFC 3110 §2.
+
+        Derived from `namespy.crypto`'s algorithm table rather than a local list, so this cannot
+        drift from it. Algorithm 1 (RSA/MD5) is deliberately False: RFC 3110 §2's notes moved
+        RSA/SHA-1 onto number 5 to separate it from RFC 2537's RSA/MD5 keys, whose RDATA begins
+        with a key-length header that would be read here as an exponent length.
+        """
+        return self.algorithm in RSA_ALGORITHMS
+
+    def rsa_public_key(self) -> RsaPublicKey | None:
+        """The RSA key this record carries, or None if its algorithm is not RSA-packed.
+
+        Parsing still never interprets the key material -- see the class docstring -- so this is
+        where interpretation happens, on request, and a zone holding a malformed RSA key still
+        yields a record that can be counted, key-tagged and reported.
+        :class:`namespy.dnssec.MalformedRsaKeyError` here means the octets cannot be read as a
+        key at all, which is a different report from a key that is readable but too small.
+        """
+        if not self.key_algorithm_is_rsa:
+            return None
+        return unpack_rsa_public_key(self.public_key)
+
+    def require_rsa_key(self) -> RsaPublicKey:
+        """The RSA key, checked against the size window this algorithm's RFC sets.
+
+        The upper bound is RFC 3110 §2¶3's 4096 bits; the lower one is per-algorithm because
+        RFC 5702 §2.2¶2 demands 1024 bits for RSA/SHA-512 while §3¶9 and §2.1¶2 leave 512 for
+        numbers 5, 7 and 8. Enforcing one constant across all four would accept a 512-bit
+        RSA/SHA-512 key, and since a zone may hold keys of several algorithms, the weakest one is
+        what an attacker would aim at.
+
+        Raises for a non-RSA algorithm as well as for unreadable key material: callers use this
+        precisely when they are about to verify an RSA signature, so a GOST or ECDSA key reaching
+        it is a programming error rather than a hostile record.
+        """
+        key = self.rsa_public_key()
+        if key is None:
+            raise ValueError(
+                f"DNSKEY algorithm {self.algorithm} does not use the RFC 3110 RSA key format"
+            )
+        minimum = minimum_rsa_key_bits(self.algorithm)
+        if key.key_bits < minimum:
+            raise MalformedRsaKeyError(
+                f"DNSKEY algorithm {self.algorithm} requires at least {minimum} bits, "
+                f"this modulus has {key.key_bits}"
+            )
+        if key.key_bits > MAX_RSA_KEY_BITS:
+            raise MalformedRsaKeyError(
+                f"DNSKEY modulus is {key.key_bits} bits, over the {MAX_RSA_KEY_BITS}-bit "
+                f"interoperability limit of RFC 3110 §2¶3"
+            )
+        return key
 
     def to_presentation(self) -> str:
         """``256 3 5 AQPSKmyn...`` (RFC 4034 §2.2).

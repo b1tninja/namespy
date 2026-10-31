@@ -31,6 +31,8 @@ __all__ = [
     "IMPLEMENT_FOR_VALIDATION",
     "MAX_RSA_KEY_BITS",
     "MIN_RSA_KEY_BITS",
+    "RSA_ALGORITHMS",
+    "RSA_MIN_KEY_BITS_BY_ALGORITHM",
     "SIGNATURE_ALGORITHMS",
     "CryptoBackend",
     "MissingCryptoError",
@@ -40,6 +42,7 @@ __all__ = [
     "backend",
     "backend_supports",
     "crypto_available",
+    "minimum_rsa_key_bits",
     "require_backend",
     "validation_requirement",
 ]
@@ -62,6 +65,8 @@ MAX_RSA_KEY_BITS = 4096
 
 #: The same sentence's other end. A 256-bit RSA key fits the RDATA field as happily as a
 #: 2048-bit one and factors in an afternoon, so accepting it would buy validation in name only.
+#: This is the floor of the floors: RFC 5702 §2.2 raises it to 1024 bits for RSA/SHA-512, so use
+#: :func:`minimum_rsa_key_bits` with the algorithm number rather than this constant.
 MIN_RSA_KEY_BITS = 512
 
 
@@ -156,8 +161,10 @@ class SignatureAlgorithmSpec:
 #: What this table does *not* settle is the octet encoding of the key and signature fields:
 #: RFC 6605 §4 gives ECDSA signatures as fixed-width r then s rather than DER, RFC 8080 §3
 #: likewise for EdDSA, and RFC 3110 §2's exponent-then-modulus packing plus its leading-zero
-#: rule has its own history. Those belong to the codec and verification leg, where they can
-#: be written against vectors, and are listed as its homework rather than guessed at here.
+#: rule has its own history. The RSA half of that is now in namespy.dnssec (unpack_rsa_public_key,
+#: rsa_signature_octets) because it turned out to need no dependency at all; the ECDSA and EdDSA
+#: halves still belong to the verification leg, where they can be written against vectors, and are
+#: listed as its homework rather than guessed at here.
 SIGNATURE_ALGORITHMS: dict[int, SignatureAlgorithmSpec] = {
     5: SignatureAlgorithmSpec(SignatureAlgorithm.RSA, "sha1", "RFC 3110"),
     7: SignatureAlgorithmSpec(SignatureAlgorithm.RSA, "sha1", "RFC 3110"),
@@ -168,6 +175,40 @@ SIGNATURE_ALGORITHMS: dict[int, SignatureAlgorithmSpec] = {
     15: SignatureAlgorithmSpec(SignatureAlgorithm.ED25519, None, "RFC 8080"),
     16: SignatureAlgorithmSpec(SignatureAlgorithm.ED448, None, "RFC 8080"),
 }
+
+#: The algorithm numbers whose DNSKEY public key is RFC 3110 §2's exponent-length, exponent,
+#: modulus. Derived from the table above rather than written out again, which is what keeps
+#: algorithm 1 (RSA/MD5) out: RFC 3110 §2's notes moved RSA/SHA-1 onto number 5 precisely to
+#: separate it from RFC 2537's RSA/MD5 keys, which carry a key-length header this reader would
+#: misparse as an exponent length. RFC 9904 makes 1 a MUST NOT in any case.
+RSA_ALGORITHMS: frozenset[int] = frozenset(
+    number
+    for number, spec in SIGNATURE_ALGORITHMS.items()
+    if spec.primitive is SignatureAlgorithm.RSA
+)
+
+#: The lower bound on the modulus, per algorithm. There is not one answer: RFC 3110 §3¶9 sets 512
+#: bits for RSA/SHA-1 (numbers 5 and 7) and RFC 5702 §2.1¶2 repeats it for RSA/SHA-256, but
+#: **RFC 5702 §2.2¶2 sets 1024 bits for RSA/SHA-512** -- "MUST NOT be less than 1024 bits". A
+#: single MIN constant therefore accepts a 512-bit RSA/SHA-512 key that RFC 5702 forbids, which is
+#: the kind of hole that looks like a policy detail and is a downgrade surface: the weakest key
+#: wins, because an attacker picks which key the zone's RRSIGs can be checked against.
+RSA_MIN_KEY_BITS_BY_ALGORITHM: dict[int, int] = {
+    5: MIN_RSA_KEY_BITS,
+    7: MIN_RSA_KEY_BITS,
+    8: MIN_RSA_KEY_BITS,
+    10: 1024,
+}
+
+
+def minimum_rsa_key_bits(algorithm: int) -> int:
+    """The smallest modulus RFC 5702/RFC 3110 allow for one RSA algorithm number.
+
+    Unknown numbers fall back to :data:`MIN_RSA_KEY_BITS`, the general floor: an unregistered
+    algorithm is refused later by policy, and a floor invented here would be a guess about a
+    primitive this package does not implement.
+    """
+    return RSA_MIN_KEY_BITS_BY_ALGORITHM.get(int(algorithm), MIN_RSA_KEY_BITS)
 
 
 def validation_requirement(algorithm: int) -> ValidationRequirement:

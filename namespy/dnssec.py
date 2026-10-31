@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from enum import IntEnum
 from hashlib import sha1, sha256, sha384
 from itertools import pairwise
+from typing import NamedTuple
 
 from .enums import DnsRType
 from .names import DomainName
@@ -43,7 +44,9 @@ __all__ = [
     "CanonicalizationError",
     "DigestType",
     "DuplicateRecordError",
+    "MalformedRsaKeyError",
     "Nsec3HashAlgorithm",
+    "RsaPublicKey",
     "canonical_owner_octets",
     "canonical_rdata_octets",
     "canonical_rr_bytes",
@@ -64,9 +67,12 @@ __all__ = [
     "key_tag",
     "known_digest_octets",
     "nsec3_hash",
+    "pack_rsa_public_key",
     "rrsig_label_count",
     "rrsig_signed_data",
+    "rsa_signature_octets",
     "signed_owner_name",
+    "unpack_rsa_public_key",
     "unsigned_field",
 ]
 
@@ -838,3 +844,164 @@ def rrsig_signed_data(rrsig, owner, rdatas, *, rclass: int = 1) -> bytes:
         rrsig.original_ttl,
         rdatas,
     )
+
+
+# ------------------------------------------------------- RSA key material (RFC 3110 §2-§3)
+#
+# Layout only. Which algorithms use this layout, and how large a key each allows, is algorithm
+# policy and lives in namespy.crypto; nothing here imports it, so a caller supplies the bounds it
+# means to enforce and the dependency direction stays one-way.
+
+
+class MalformedRsaKeyError(ValueError):
+    """RDATA that cannot be read as an RSA public key, or a signature that cannot be one.
+
+    Distinct from a key that is readable but too small or too weak -- that is a size decision the
+    caller makes with :mod:`namespy.crypto`'s bounds, not a reading failure, and an operator needs
+    to be told which of the two happened.
+    """
+
+
+class RsaPublicKey(NamedTuple):
+    """A decoded RSA public key: the exponent and the modulus, as integers."""
+
+    exponent: int
+    modulus: int
+
+    @property
+    def key_bits(self) -> int:
+        """The bit length of the modulus -- RFC 3110 §3¶9's "size of n, including most and least
+        significant bits (which will be 1)", which is the quantity the limits in that section and
+        in RFC 5702 §2.1/§2.2 are written against."""
+        return self.modulus.bit_length()
+
+    def to_wire(self) -> bytes:
+        """RFC 3110 §2 RDATA, i.e. :func:`pack_rsa_public_key` of these two numbers."""
+        return pack_rsa_public_key(self.exponent, self.modulus)
+
+
+def _minimal_octets(value: int, *, what: str) -> bytes:
+    """Big-endian octets with no leading zero, which is what §2¶3's prohibition demands."""
+    length = (value.bit_length() + 7) // 8
+    if not length:
+        raise MalformedRsaKeyError(f"RSA {what} must be a positive integer, got {value}")
+    return value.to_bytes(length, "big")
+
+
+def pack_rsa_public_key(exponent: int, modulus: int, *, max_key_bits: int = 4096) -> bytes:
+    """Encode an RSA key into DNSKEY RDATA (RFC 3110 §2¶2-¶3).
+
+    The exponent's octet count is written as one octet when it is 1-255 and as a zero octet plus
+    two more when longer. §2¶3's phrasing ("is represented as") is prescriptive, so the short form
+    is always chosen when available, and that is not cosmetics: a key tag sums the RDATA octets,
+    so a key encoded the other way has a different tag and therefore a DS matching nothing.
+
+    `max_key_bits` defaults to §2¶3's interoperability ceiling ("the exponent and modulus are each
+    limited to 4096 bits") and is refused rather than silently emitted, since an oversized key is
+    a record no validator may accept. The floor is deliberately *not* applied here because it is
+    per-algorithm: RFC 5702 §2.2 sets 1024 bits for RSA/SHA-512 against 512 elsewhere.
+    """
+    exponent_octets = _minimal_octets(int(exponent), what="exponent")
+    modulus_octets = _minimal_octets(int(modulus), what="modulus")
+    for name, octets in (("exponent", exponent_octets), ("modulus", modulus_octets)):
+        if len(octets) * 8 > int(max_key_bits):
+            raise ValueError(
+                f"RSA {name} is {len(octets) * 8} bits, over the {max_key_bits}-bit limit of "
+                f"RFC 3110 §2¶3"
+            )
+    if len(exponent_octets) <= 255:
+        header = bytes([len(exponent_octets)])
+    else:
+        header = b"\x00" + len(exponent_octets).to_bytes(2, "big")
+    return header + exponent_octets + modulus_octets
+
+
+def unpack_rsa_public_key(blob) -> RsaPublicKey:
+    """Read DNSKEY RDATA as an RSA key, strictly (RFC 3110 §2¶2-¶3).
+
+    Every rule here has a failure mode worth the strictness:
+
+    * A zero first octet selects the 3-octet length form, so a zero-length exponent is
+      unrepresentable in the 1-octet form -- and a 3-octet form announcing zero octets leaves no
+      exponent to read. No MUST says so, so this is read off §2¶2's figure rather than quoted: an
+      exponent of no octets is not a public exponent.
+    * The short form is required whenever the length fits one octet, for the key-tag reason on
+      :func:`pack_rsa_public_key`.
+    * "Leading zero octets are prohibited in the exponent and modulus" (§2¶3), checked on both.
+      The modulus half matters beyond tidiness: the same key with a leading zero has a different
+      key tag, and a key whose tag does not match its DS is unusable while every bit of it is
+      correct.
+    * Lengths are bounds-checked against the RDATA, because this arrives from the network.
+
+    Nothing here judges key size or whether the modulus is a product of two primes.
+    :meth:`namespy.rdata.RData_DNSKEY.require_rsa_key` adds the protocol's size window; primality
+    is the backend's, and `cryptography` refuses a nonsense modulus when it builds the key object.
+    """
+    octets = bytes(blob)
+    if len(octets) < 2:
+        raise MalformedRsaKeyError(
+            f"RSA public key is {len(octets)} octet(s), too short for a length field and a key"
+        )
+    if octets[0]:
+        exponent_len = octets[0]
+        header_len = 1
+    else:
+        if len(octets) < 3:
+            raise MalformedRsaKeyError(
+                "RSA public key announces the 3-octet exponent length form but holds only "
+                f"{len(octets)} octet(s)"
+            )
+        (exponent_len,) = struct.unpack("!H", octets[1:3])
+        header_len = 3
+        if exponent_len == 0:
+            raise MalformedRsaKeyError("RSA public key has a zero-length public exponent")
+        if exponent_len <= 255:
+            raise MalformedRsaKeyError(
+                f"RSA exponent of {exponent_len} octet(s) must use the 1-octet length form "
+                f"(RFC 3110 §2¶3); as written this key has different RDATA, and so a different "
+                f"key tag, from the same key encoded correctly"
+            )
+    end = header_len + exponent_len
+    if len(octets) <= end:
+        raise MalformedRsaKeyError(
+            f"RSA public key announces a {exponent_len}-octet exponent but holds only "
+            f"{len(octets) - header_len} octet(s) before the modulus"
+        )
+    exponent_octets = octets[header_len:end]
+    modulus_octets = octets[end:]
+    if exponent_octets[0] == 0 or modulus_octets[0] == 0:
+        raise MalformedRsaKeyError(
+            "RSA public key carries a leading zero octet, which RFC 3110 §2¶3 prohibits"
+        )
+    return RsaPublicKey(
+        exponent=int.from_bytes(exponent_octets, "big"),
+        modulus=int.from_bytes(modulus_octets, "big"),
+    )
+
+
+def rsa_signature_octets(signature, *, key_bits: int) -> bytes:
+    """Zero-pad an RSA signature to the modulus length, as **erratum 2811** requires.
+
+    RFC 3110 §3¶10 as published read "leading zero bytes are permitted", which suggests a signer
+    may hand back fewer octets than the modulus holds. The verified technical erratum changes
+    "permitted" to "MUST be added ... so that the signature size in bytes is equal to the size of
+    n", citing PKCS #1's I2OSP(s, k): the signature is an octet string of exactly k octets, so the
+    short form was never legal -- the text was.
+
+    That history is why this pads rather than rejects. Records already on the wire, and servers
+    that implemented the published sentence, do send short signatures; refusing them would enforce
+    a rule the erratum exists to clarify. A signature *longer* than the modulus is another matter:
+    a value reduced mod n cannot be that wide, so it is refused rather than trimmed. A backend
+    handed the unpadded form usually fails outright, and that failure looks exactly like a forged
+    RRset.
+    """
+    octets = bytes(signature)
+    length = (int(key_bits) + 7) // 8
+    if not octets:
+        raise MalformedRsaKeyError("RSA signature is empty")
+    if len(octets) > length:
+        raise MalformedRsaKeyError(
+            f"RSA signature is {len(octets)} octet(s), wider than the {key_bits}-bit modulus "
+            f"({length} octet(s)); no signature reduced mod n can be this long"
+        )
+    return octets.rjust(length, b"\x00")

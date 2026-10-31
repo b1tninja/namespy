@@ -508,6 +508,45 @@ nothing has been tagged or published yet, so `master` is the only version.
   `signed_owner_name` does the §3.1.3 wildcard reconstruction (`www.example.com.` with Labels 2 is
   signed as `*.example.com.`), refuses a Labels value larger than the owner has labels rather than
   clamping it, and keeps the `*` in the hashed name as §3.1.3¶4 requires.
+- RSA public keys in DNSKEY, and the width of an RSA signature (RFC 3110 §2-§3, RFC 5702 §2).
+  `pack_rsa_public_key`, `unpack_rsa_public_key`, `rsa_signature_octets`, `RsaPublicKey` and
+  `MalformedRsaKeyError` in `namespy/dnssec.py`; `RData_DNSKEY.key_algorithm_is_rsa`,
+  `rsa_public_key()` and `require_rsa_key()` in `namespy/rdata.py`;
+  `RSA_ALGORITHMS`, `RSA_MIN_KEY_BITS_BY_ALGORITHM` and `minimum_rsa_key_bits()` in
+  `namespy/crypto.py`. Reading RFC 3110 turned up no reason to wait for the backend: §2 is integer
+  packing, so the key material is now decodable on a default install while ECDSA and EdDSA still
+  wait on `namespy[crypto]`.
+  **The RFC's "leading zero octets are prohibited in the exponent and modulus" (§2¶3) is not
+  tidiness — it is key-tag arithmetic.** A key tag sums the RDATA octets, so the same modulus and
+  exponent written with a leading zero produce a different tag and therefore a DS that matches
+  nothing: every bit correct, the key unusable. The same reasoning makes §2¶3's
+  "is represented as" prescriptive about the 1-or-3-octet exponent length field, so
+  `unpack_rsa_public_key` refuses a 3-byte exponent written in the long form rather than forgiving
+  the second encoding. Both directions are tested, including the rare 256-octet exponent that
+  reaches the 3-octet form at all.
+  **`MIN_RSA_KEY_BITS` was not enough on its own, and the gap is a downgrade surface.** RFC 3110
+  §3¶9 and RFC 5702 §2.1¶2 set the modulus floor at 512 bits for algorithms 5, 7 and 8, but
+  **RFC 5702 §2.2¶2 sets it at 1024 for RSA/SHA-512**: one constant accepts a 512-bit RSA/SHA-512
+  key that RFC 5702 forbids. Since a zone may hold keys of several algorithms and a validator picks
+  one, the weakest key is what an attacker aims at, so the floor is now per-algorithm and
+  `require_rsa_key()` looks it up. `MIN_RSA_KEY_BITS` remains as the general floor with a pointer
+  to the function.
+  Algorithm 1 (RSA/MD5) is deliberately *not* read with this format. RFC 3110 §2's notes moved
+  RSA/SHA-1 onto number 5 specifically to separate it from RFC 2537's RSA/MD5 keys, whose RDATA
+  begins with a key-length header that this parser would take for an exponent length and return a
+  plausible wrong key. `RSA_ALGORITHMS` is derived from the existing algorithm table rather than
+  written out again, so the two cannot drift.
+  **Erratum 2811 is why `rsa_signature_octets` pads instead of rejecting.** RFC 3110 §3¶10 as
+  published said "leading zero bytes are permitted" in an RSA signature; the verified technical
+  erratum changes it to "MUST be added ... so that the signature size in bytes is equal to the size
+  of n", citing PKCS #1's `I2OSP(s, k)`. Records written against the published wording exist, and
+  a backend handed a short signature fails in the same shape as a forgery, so a short signature is
+  padded and a signature *wider* than the modulus is refused — that one cannot come from a
+  reduction mod n, so trimming would be guessing.
+  Parsing behaviour is unchanged: a DNSKEY holding unreadable RSA octets still parses, still
+  computes its key tag, and refuses only when `rsa_public_key()` is asked, which keeps RFC 4034
+  §2.1.2's "judged at verification time" and keeps an operator's ability to say which rule a zone
+  broke.
 
 
 ### Fixed

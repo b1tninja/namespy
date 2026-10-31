@@ -454,6 +454,59 @@ infer that padding, so the codec has to; then NSEC/NSEC3 proof checking (§7/§8
 stands between us and RFC 8020 §2¶5's MUST; then the verification calls through
 `namespy[crypto]`, at which point `NxdomainPolicy.VALIDATED` finally has something to mean.
 
+### Follow-up: RSA keys and signature width (RFC 3110 §2-§3, RFC 5702 §2, erratum 2811)
+
+Reading RFC 3110 to write this down removed a stated blocker: §2's DNSKEY public key is integer
+packing, not cryptography, so `unpack_rsa_public_key` / `pack_rsa_public_key` in `namespy/dnssec.py`
+plus `RData_DNSKEY.rsa_public_key()` and `.require_rsa_key()` give us RSA key material on a default
+install. ECDSA and EdDSA key material still waits on `namespy[crypto]`. 16 tests in
+`test_dnssec_rsa.py`, none of which need a backend.
+
+**The leading-zero rule is arithmetic, not tidiness.** §2¶3 prohibits leading zero octets in the
+exponent and modulus; the reason they must be enforced rather than tolerated is that `key_tag` sums
+the RDATA octets, so one extra zero produces a different tag and a DS matching nothing — a correct
+key that cannot be used. The same reasoning settled a question the RFC leaves implicit: is the
+3-octet length form allowed for a 3-byte exponent? §2¶3's "is represented as one octet if it is in
+the range of 1 to 255" reads as prescriptive, and the key-tag consequence confirms it, so
+`unpack_rsa_public_key` refuses the long form when the short one was required. I came in intending
+to enforce "an empty exponent MUST be an error" from memory; searched the corpus, no such sentence
+exists in any RFC, so the code derives that refusal from §2¶2's figure and its docstring says the
+rule is read off the layout rather than quoted.
+
+**`MIN_RSA_KEY_BITS` was one constant too few.** RFC 3110 §3¶9 and RFC 5702 §2.1¶2 set the modulus
+floor at 512 bits (algorithms 5, 7, 8); **RFC 5702 §2.2¶2 sets 1024 for RSA/SHA-512**. The existing
+constant and its test predated that reading, so a validator using it accepted a 512-bit SHA-512 key
+RFC 5702 forbids — and because a zone can hold keys of several algorithms, the weakest is what an
+attacker forges against. Now `RSA_MIN_KEY_BITS_BY_ALGORITHM` / `minimum_rsa_key_bits()` carry it and
+`require_rsa_key()` applies the algorithm's own floor.
+
+**Algorithm 1 is not this format.** RFC 3110 §2's two notes moved RSA/SHA-1 onto number 5 precisely
+to separate it from RFC 2537's RSA/MD5, whose RDATA begins with a key-length header; parsing that
+with this reader yields a confident wrong key rather than an error. `RSA_ALGORITHMS` is derived from
+`SIGNATURE_ALGORITHMS` (`primitive is RSA`) so the two tables cannot drift.
+
+**Erratum 2811 decided a design question that looked arbitrary.** §3¶10 published: "Leading zero
+bytes are permitted in the RSA/SHA1 algorithm signature." Verified technical erratum: MUST be added,
+so the signature is exactly ⌈bits(n)/8⌉ octets (PKCS #1's `I2OSP(s, k)`). Hence
+`rsa_signature_octets` pads short signatures rather than rejecting them — those records exist, and a
+backend handed a short one fails in the same shape as a forgery — and refuses a signature wider than
+the modulus, since no reduction mod n can produce one.
+
+**Also found for the verification leg: RFC 5702 §8.2's downgrade defence is void** (verified erratum
+7090): the claimed protection rests on a signer-side requirement with no validator-side counterpart,
+and RFC 6840 §5.11 says explicitly that a validator need not check that every algorithm is present.
+So the future "pick an RRSIG from the set" step must choose safely among what arrived instead of
+demanding a set shape.
+
+**Verified**: 1033 passed (+16), `ruff check .` / `ruff format --check .` clean, `mypy namespy`
+exits 0.
+
+**Next**: NSEC/NSEC3 proof checking (§7/§8, errata 3441 and 4622), then the `DnsCache` change that
+lets a cached denial carry its proofs (all that stands between us and RFC 8020 §2¶5's MUST), then
+ECDSA/EdDSA key and signature encodings (RFC 6605 §4, RFC 8080 §3 — r‖s, not DER) and the
+verification calls through `namespy[crypto]`, at which point `NxdomainPolicy.VALIDATED` acquires
+meaning.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them
