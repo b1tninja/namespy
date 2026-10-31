@@ -854,6 +854,66 @@ IANA at implementation time rather than from memory, and the DS→DNSKEY chain; 
 `NxdomainPolicy.VALIDATED` wired where `_nxdomain_cut` reads `NegativeEntry`; (4) the header
 AD/CD bits. The DS-strip question and the `serve --dnssec` DO question remain open.
 
+### Follow-up: the verification procedure — §5.3.1 with three outcomes, not two (RFC 4035 §5.3.1, RFC 9904 at point of use)
+
+The third stage of the staged arc: the RFC 4035 §5.3.1 procedure, its dispatch through
+`namespy[crypto]`, and the first signatures verified end to end by this package rather
+than by its encodings alone.
+
+**What shipped.** `namespy/verify.py` — one function, `verify_rrsig(rrsig, owner, rdatas,
+dnskeys, *, now, rclass)`, returning a `SignatureVerdict` over three outcomes; and
+`crypto.verify_dnskey_signature(algorithm, key_material, signature, message)`, the single
+primitive dispatch that owns layout (via `namespy.dnssec`), the DER boundary, erratum
+2811's RSA padding, and the RFC 5702/3110 size window — a key outside its window cannot
+reach arithmetic at all, which is where the downgrade surface actually closes: the zone
+chooses which of its keys the RRSIGs can be checked against, and the weakest one must not
+get a turn. The checks run cheapest-first so the *reason* a validator stopped is the
+first true one: RFC 9904 policy, window, reconstruction, key matching, arithmetic.
+
+**Findings.** (1) *Three outcomes are the deliverable, not garnish.* RFC 9904 §1.2¶3
+marks RSAMD5/DSA MUST NOT "so that recursive resolvers can remove support for validating
+it" — which maps to INVALID, and deliberately *ahead of the backend probe*, so the answer
+cannot vary by install (a test drives it with the backend monkeypatched away). Unreadable
+material, an absent extra, an unregistered algorithm map to UNSUPPORTED instead: RFC
+9080 §3.1 invented Indeterminate because "we could not check" reported as "it is forged"
+is the failure mode that turns a broken path into a denial. (2) *The key tag is a
+weighted checksum, and my own test tripped on it*: constructing a tag-preserving twin by
+trading +1/-1 across *adjacent* key bytes moves the tag by exactly 255 — Appendix B
+shifts alternating octets by eight, the very weighting erratum 4552 is about. Same-parity
+trades preserve it. (3) *No RFC anywhere publishes an RSA RRSIG* — RFC 3110 and RFC 5702
+print keys but no signed example — so the RSA leg is pinned by deterministic PKCS#1 v1.5
+round-trips and the absence is stated in the test docstring rather than papered over; one
+round-trip is RSASHA1, pinning that RFC 9904's MUST for validation survives RFC 9905's
+signing deprecation, because a validator that refused would report live zones bogus.
+(4) *Disqualified candidates must be built tag-recomputed*: flags and protocol are part
+of the RDATA the tag sums, so a protocol-2 DNSKEY no longer matches the published tag —
+the test's first draft landed in the ¶8 "no matching DNSKEY" branch instead of the
+protocol branch it meant to reach. (5) *The backend's Ed25519 loader does not validate
+points* — only length — so a tampered EdDSA key verifies-and-refuses (INVALID, an attempt
+that ran) where a tampered ECDSA key is refused at key-build (UNSUPPORTED, no attempt);
+`attempts` counts only arithmetic that ran, and the two paths document themselves by
+disagreeing. (6) §5.3.1's ¶2/¶3 owner/class/zone equalities are RR-header facts an RDATA
+cannot see, and ¶11-¶13 key authenticity is the trust-anchor stage: the docstring says a
+VALID verdict means "a key in the set you handed me signed these bytes" and nothing more.
+
+**Not claimed.** Nothing consumes `verify_rrsig` yet: the resolver still refuses
+`NxdomainPolicy.VALIDATED` at the door, because without a trust anchor the keys the
+procedure checks are unauthenticated by ¶11-¶13 — honest about what it says, not what it
+proves. The DS→DNSKEY chain and the root anchor (fetched, not embedded from memory) are
+the next commit; AD/CD header bits still outstanding for §9.2.
+
+**Verified**: 1206 passed (+26 in `tests/test_dnssec_verify.py`), `ruff check .` /
+`ruff format --check .` clean, `mypy namespy` exits 0 (21 modules), `-O` run holds,
+coverage 91% total with `namespy/verify.py` at 100% and `namespy/crypto.py` at 94% (the
+rest is the probe's namespace-shadow path and defensive refusals).
+
+**Next, in order**: (1) trust anchors — the root KSK fetched from IANA at implementation
+time rather than from memory, the DS→DNSKEY chain, and the self-signature path §5.3.1
+already handles; (2) `NxdomainPolicy.VALIDATED` wired where `_nxdomain_cut` reads
+`NegativeEntry`, consuming proofs whose records verify through `verify_rrsig` — which is
+finally what makes its door-refusal liftable; (3) the header AD/CD bits. The DS-strip
+question and the `serve --dnssec` DO question remain open.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

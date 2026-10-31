@@ -21,9 +21,21 @@ other and says plainly which side is short.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from enum import Enum
 from types import ModuleType
+
+from .dnssec import (
+    MalformedEcKeyError,
+    MalformedRsaKeyError,
+    ecdsa_signature_from_rs,
+    eddsa_public_key_octets,
+    eddsa_signature_octets,
+    rsa_signature_octets,
+    unpack_ec_public_key,
+    unpack_rsa_public_key,
+)
 
 __all__ = [
     "CRYPTO_DISTRIBUTION",
@@ -45,6 +57,7 @@ __all__ = [
     "MissingCryptoError",
     "SignatureAlgorithm",
     "SignatureAlgorithmSpec",
+    "SignatureMaterialError",
     "ValidationRequirement",
     "backend",
     "backend_supports",
@@ -52,6 +65,7 @@ __all__ = [
     "minimum_rsa_key_bits",
     "require_backend",
     "validation_requirement",
+    "verify_dnskey_signature",
 ]
 
 #: The extra that pulls the backend in, spelled as a user would type it. It belongs in the
@@ -339,3 +353,151 @@ def backend_supports(algorithm: int) -> bool:
     if backend() is None:
         return False
     return int(algorithm) in SIGNATURE_ALGORITHMS
+
+
+# ------------------------------------------------------------------- the arithmetic, dispatched once
+
+
+class SignatureMaterialError(ValueError):
+    """Key or signature bytes the backend cannot be handed at all.
+
+    Deliberately distinct from a verification *failure*: this is the difference between
+    "the arithmetic ran and refused these bytes" and "no arithmetic ran". A signature
+    that fails is evidence about the records -- bogus, in RFC 4033's word. A key that
+    cannot be constructed (RFC 3110 packing that does not parse, a point off the named
+    curve, a modulus outside the window its algorithm is given) is evidence about the
+    record, and reporting it as a failed signature would launder "we could not check"
+    into "it is forged" -- the exact confusion RFC 9080 §3.1's Indeterminate exists to
+    prevent upstream.
+    """
+
+
+def _primitives():
+    """Import the backend's primitive modules lazily, through the probed distribution.
+
+    Named by ``backend().module.__name__`` rather than by a literal import of
+    ``cryptography``, which keeps this module's one-backend-boundary promise literally
+    true: even the arithmetic reaches the library through the probe, and a swapped
+    distribution would be found here and nowhere else.
+    """
+    found = require_backend("verify a DNSSEC signature")
+    root = found.module.__name__
+    part = importlib.import_module
+    return (
+        part(f"{root}.hazmat.primitives.hashes"),
+        part(f"{root}.hazmat.primitives.asymmetric.padding"),
+        part(f"{root}.hazmat.primitives.asymmetric.rsa"),
+        part(f"{root}.hazmat.primitives.asymmetric.ec"),
+        part(f"{root}.hazmat.primitives.asymmetric.ed25519"),
+        part(f"{root}.hazmat.primitives.asymmetric.ed448"),
+        part(f"{root}.exceptions").InvalidSignature,
+    )
+
+
+def verify_dnskey_signature(algorithm: int, key_material, signature, message: bytes) -> bool:
+    """Ask the backend the one arithmetic question, whatever primitive the algorithm names.
+
+    True when the signature verifies over *message* under *key_material*, False when the
+    computation ran and refused it, :class:`SignatureMaterialError` when no computation
+    could run. The key and signature are the raw RDATA fields -- the dispatch owns the
+    layout (namespy.dnssec) and the sizes (this module's tables), because RFC 5702 §2.1¶2
+    and §2.2¶2 write their modulus floors as MUST NOTs of the arithmetic itself: a
+    512-bit RSA/SHA-512 key is not a preference a caller might weigh later, and this is
+    where a key that small cannot be handed to a verification call.
+
+    The RSA signature goes through :func:`namespy.dnssec.rsa_signature_octets` first --
+    erratum 2811's padding -- because signers predating it emitted short signatures and a
+    backend handed those reports failure as if the RRset were forged. The ECDSA signature
+    must arrive in the wire's fixed-width r‖s form (RFC 6605 §4¶2); DER inside an RRSIG is
+    a malformed record, refused as material rather than quietly parsed, which is the same
+    stance the encoding leg took.
+    """
+    spec = SIGNATURE_ALGORITHMS.get(int(algorithm))
+    if spec is None:
+        raise SignatureMaterialError(
+            f"algorithm {int(algorithm)} has no primitive in this package's registry"
+        )
+    material, message = bytes(key_material), bytes(message)
+    try:
+        if spec.primitive is SignatureAlgorithm.RSA:
+            return _verify_rsa(int(algorithm), spec, material, signature, message)
+        if spec.primitive in (SignatureAlgorithm.ECDSA_P256, SignatureAlgorithm.ECDSA_P384):
+            return _verify_ecdsa(int(algorithm), spec, material, signature, message)
+        return _verify_eddsa(int(algorithm), spec, material, signature, message)
+    except (MalformedRsaKeyError, MalformedEcKeyError) as exc:
+        raise SignatureMaterialError(str(exc)) from None
+
+
+def _hash(hashes, name: str):
+    """Instantiate the backend's hasher this algorithm's digest names ("sha256" -> SHA256())."""
+    return getattr(hashes, name.upper())()
+
+
+def _verify_rsa(algorithm: int, spec, material, signature, message) -> bool:
+    key = unpack_rsa_public_key(material)
+    floor = minimum_rsa_key_bits(algorithm)
+    if key.key_bits < floor:
+        raise SignatureMaterialError(
+            f"RSA modulus is {key.key_bits} bits, under the {floor}-bit floor RFC 5702 "
+            f"sets for algorithm {algorithm}"
+        )
+    if key.key_bits > MAX_RSA_KEY_BITS:
+        raise SignatureMaterialError(
+            f"RSA modulus is {key.key_bits} bits, over the {MAX_RSA_KEY_BITS}-bit ceiling "
+            f"of RFC 3110 §2¶3"
+        )
+    hashes, padding, rsa, _ec, _ed1, _ed2, invalid_signature = (
+        _primitives()
+    )  # the exception class, named lowercase for the unpack
+    padded = rsa_signature_octets(signature, key_bits=key.key_bits)
+    try:
+        public = rsa.RSAPublicNumbers(key.exponent, key.modulus).public_key()
+    except ValueError as exc:  # the backend's own refusal of a nonsense modulus
+        raise SignatureMaterialError(f"backend refused the RSA key material: {exc}") from None
+    try:
+        public.verify(padded, message, padding.PKCS1v15(), _hash(hashes, spec.digest))
+    except invalid_signature:
+        return False
+    return True
+
+
+def _verify_ecdsa(algorithm: int, spec, material, signature, message) -> bool:
+    field_octets = ECDSA_FIELD_OCTETS[algorithm]
+    point = unpack_ec_public_key(material, field_octets=field_octets)
+    der = ecdsa_signature_from_rs(signature, field_octets=field_octets).to_der()
+    hashes, _padding, _rsa, ec, _ed1, _ed2, invalid_signature = (
+        _primitives()
+    )  # the exception class, named lowercase for the unpack
+    curve = ec.SECP256R1() if spec.primitive is SignatureAlgorithm.ECDSA_P256 else ec.SECP384R1()
+    try:
+        public = ec.EllipticCurvePublicNumbers(x=point.x, y=point.y, curve=curve).public_key()
+    except ValueError as exc:
+        raise SignatureMaterialError(
+            f"backend refused the ECDSA key material (off the named curve?): {exc}"
+        ) from None
+    try:
+        public.verify(der, message, ec.ECDSA(_hash(hashes, spec.digest)))
+    except invalid_signature:
+        return False
+    return True
+
+
+def _verify_eddsa(algorithm: int, spec, material, signature, message) -> bool:
+    key = eddsa_public_key_octets(material, key_octets=EDDSA_KEY_OCTETS[algorithm])
+    sig = eddsa_signature_octets(signature, signature_octets=EDDSA_SIGNATURE_OCTETS[algorithm])
+    _hashes, _padding, _rsa, _ec, ed25519, ed448, invalid_signature = _primitives()
+    if spec.primitive is SignatureAlgorithm.ED25519:
+        public_class = ed25519.Ed25519PublicKey
+    else:
+        public_class = ed448.Ed448PublicKey
+    try:
+        public = public_class.from_public_bytes(key)
+    except ValueError as exc:
+        raise SignatureMaterialError(
+            f"backend refused the EdDSA key material (not a curve point?): {exc}"
+        ) from None
+    try:
+        public.verify(sig, message)
+    except invalid_signature:
+        return False
+    return True

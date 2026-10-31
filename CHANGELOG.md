@@ -8,6 +8,23 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- The RFC 4035 §5.3.1 verification procedure (`namespy/verify.py`) — `verify_rrsig(rrsig, owner,
+  rdatas, dnskeys)` walks the conditions cheapest-first (RFC 9904 algorithm policy, the signtime
+  window, signed-byte reconstruction, key-tag/protocol/zone-flag matching) and then tries **every**
+  matching key (§5.3.1¶10) through one arithmetic dispatch (`crypto.verify_dnskey_signature`) that
+  owns the layout, the DER boundary and the RSA size window, so no weak or unreadable key ever
+  reaches a verification call. The answer is three-way — VALID, INVALID, UNSUPPORTED — because the
+  resolver's next step differs: RFC 9904's MUST NOT algorithms (RSAMD5, DSA) are INVALID even in an
+  install with no backend at all, while an absent extra, an unregistered algorithm, or a candidate
+  the backend cannot build a key from are UNSUPPORTED, the state RFC 9080 §3.1 created
+  Indeterminate to name — "we could not check" must never launder into "it is forged". The four
+  published vectors authenticate end to end (RFC 6605 §6 ×2, RFC 8080 §6 per **erratum 4935** ×2);
+  RSA has no published RRSIG in any RFC, so its paths are pinned by deterministic PKCS#1 v1.5
+  round-trips — including RSASHA1, which RFC 9905 deprecated for signing while RFC 9904 kept
+  validation a MUST, precisely because refusing to check it would report live zones as bogus.
+  A VALID verdict claims only that a key in the set you supplied signed these bytes: §5.3.1¶11-¶13
+  key authenticity is the trust-anchor stage, still ahead (`test_dnssec_verify.py`, 26 tests).
+
 - The ECDSA and EdDSA encodings (RFC 6605 §4, RFC 8080 §3–§4) — the curve point as two
   fixed-width field elements, the EdDSA key as a bare 32- or 57-octet bit string, and the
   signature as fixed-width r‖s, *not* DER: §4¶2 is a MUST with no padding licence beside it,
