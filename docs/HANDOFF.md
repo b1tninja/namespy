@@ -299,9 +299,10 @@ and the last field taken from wherever the name started. Nothing else in the sui
 noticed until a resolver cached a signature that printed a 1970 expiry.
 
 **Not claimed, in order of what now unblocks what.** The §6.2 canonical-RRset rule and the
-Labels-field wildcard reconstruction (§3.1.3) are verification-side and still absent — and
-**erratum 1062** matters there, since 4034's list of types whose RDATA names get downcased is
-incomplete and RFC 3597 §7 carries the real one. Proof *checking* is absent: `NSEC3` exposes
+Labels-field wildcard reconstruction (§3.1.3) are verification-side and were absent at the time of
+writing — both have since shipped; see the next section. What the two errata on that rule turned
+out to mean is recorded there, because my first account of it ("RFC 3597 §7 carries the real set")
+was wrong. Proof *checking* is absent: `NSEC3` exposes
 `hash_owner()` for a name, but deciding whether a name falls between this record and
 `next_hashed_owner` is §7/§8 work, where **errata 3441 and 4622** both change what a server must
 include for empty non-terminals and NSEC3 owner names. RFC 8020 §2¶5's MUST still cannot be
@@ -408,6 +409,50 @@ passed, 2 skipped), present in the Crypto job (12 passed, 1 skipped).
 **Verified**: `ruff check .` and `ruff format --check .` clean, `mypy namespy` exits 0, and the
 claim that `import namespy` pulls in no third-party module is now proven in a subprocess — the
 only place it can actually be checked.
+
+### Follow-up: the canonical RRset (RFC 4034 §6.2-§6.3, §3.1.3, §3.1.8.1; RFC 3597 §7)
+
+The last DNSSEC work that needs neither a dependency nor a trust anchor: the byte string a
+signature is checked against. `canonical_rrset_bytes` / `rrsig_signed_data` and friends in
+`namespy/dnssec.py`, `canonical_wire()` on `RData` and each name-bearing codec,
+`signed_data_prefix()` on `RData_RRSIG`. `test_dnssec_canonical.py` is 25-odd tests over it.
+
+**I had the downcasing rule wrong last round, and the correction is the interesting part.** I wrote
+that RFC 4034 §6.2 item 3's list is incomplete "and RFC 3597 §7 carries the real one". Reading both
+sections against their errata says otherwise: **erratum 1062** is raised against 4034 and
+**erratum 1063** against 3597, each quoting the other's list, and neither supplies a replacement —
+so the two documents disagree in *both* directions and the working answer is the union (3597 §7¶4's
+pre-2003 types plus RRSIG and NSEC, which only 4034 names). Two consequences worth knowing before
+touching this code: NSEC3 has no embedded domain name to downcase at all (its hashed owner name is
+opaque octets, which is what I had imagined wrongly), and RFC 3597 §7¶5 says types defined *after*
+it never downcase embedded names — so HTTPS/SVCB keep the case of their target-name, RFC 9460 being
+silent on canonical form. A test pins that, because "it has a name in it, downcase it" is the
+natural instinct and it is wrong for the newer half of the registry.
+
+**Three traps this section closed.** (1) §3.1.8.1¶5 repeats owner/type/class/TTL/RDLENGTH *inside
+every RR* of the signed string; a test measures the ten-octet delta between a one-record and a
+two-record set so a future "optimisation" cannot quietly hoist it. (2) §6.3¶2 makes duplicate RDATA
+a protocol error an implementation MUST treat as one, allowing leniency only if all but one copy is
+dropped — `DuplicateRecordError` by default, `tolerate_duplicates=True` for the other reading.
+(3) Canonicalisation is per-codec, not a `lower()` over the RDATA: an MX preference of `0x4142` is
+inside the A-Z byte range, so the shortcut corrupts a number while appearing to canonicalise.
+
+**Where a type is listed but we have no codec** (NAPTR, RP, AFSDB, the 1990s remainder),
+`canonical_rdata_octets` raises `CanonicalizationError` naming the type instead of hashing raw
+octets: guessing where names sit produces a byte string that fails *valid* signatures, and a false
+authentication failure is the one outcome a validator must not manufacture.
+
+**Verified**: 1017 passed (+27), `ruff check .` and `ruff format --check .` clean, `mypy namespy`
+exits 0, `python -O -m pytest -q` clean. Roadmap §6 gained the canonicalisation row and the
+validation row now names precisely what is left.
+
+**Next**, in the order that unblocks the most: RFC 3110 §2's DNSKEY RSA packing (the 1-or-3-octet
+exponent length and the leading-zero prohibition) together with **erratum 2811**, which corrects §3
+to say RSA signature RDATA **MUST** be zero-padded to the modulus length — the backend will not
+infer that padding, so the codec has to; then NSEC/NSEC3 proof checking (§7/§8, errata 3441 and
+4622); then the `DnsCache` change that lets a cached denial carry its proofs, which is all that
+stands between us and RFC 8020 §2¶5's MUST; then the verification calls through
+`namespy[crypto]`, at which point `NxdomainPolicy.VALIDATED` finally has something to mean.
 
 ## Previous round: MQTYPE (RFC 10029)
 

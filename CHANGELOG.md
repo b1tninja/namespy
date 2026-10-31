@@ -468,6 +468,46 @@ nothing has been tagged or published yet, so `master` is the only version.
   either. Implementing verification in pure Python was considered for the RSA numbers and
   rejected: the hazard there is not the modular arithmetic but the PKCS#1 v1.5
   `DigestInfo` parsing, which is where the historical forgery bugs live.
+- The canonical RRset — the exact octets a DNSSEC signature covers (RFC 4034 §6.2, §6.3,
+  §3.1.3, §3.1.8.1; RFC 3597 §7). `canonical_rdata_octets`, `canonical_rr_bytes`,
+  `canonical_rrset_bytes`, `canonical_rrset_rdatas`, `rrsig_signed_data`, `signed_owner_name` and
+  `rrsig_label_count` in `namespy/dnssec.py`, with `canonical_wire()` on `RData` and on every
+  codec that carries a domain name and `signed_data_prefix()` on `RData_RRSIG`. This is the last
+  piece of DNSSEC that needs no dependency and no trust anchor: it produces the byte string a
+  signature is checked against and verifies nothing itself.
+  §3.1.8.1¶5 is the sentence most likely to be read carelessly — `RR(i) = owner | type | class |
+  TTL | RDATA length | RDATA` repeats the owner, type and class **inside every record**, rather
+  than stating them once for the set — so the test counts the ten-octet difference between a
+  one-record and a two-record set instead of trusting that the shapes look right.
+  **Which types downcase the names inside their RDATA turned out to be a two-document question,
+  and my earlier note about it was wrong.** RFC 4034 §6.2 item 3 and RFC 3597 §7¶4 each carry a
+  verified erratum for omitting entries the other has — **1062** against 4034, **1063** against
+  3597 — and the union is what implementations settle on: §7¶4's pre-2003 types plus RRSIG and
+  NSEC, which RFC 4034 adds by name. RFC 3597 §7 is therefore not "the full set", and NSEC3 has no
+  embedded domain name to downcase in the first place (its hashed owner name is opaque octets).
+  More consequentially, §7¶5 says that for any type defined *after* RFC 3597 "the canonical form is
+  such that no downcasing of embedded domain names takes place" — so HTTPS and SVCB keep the case
+  of their target-name even though it is a domain name (RFC 9460 says nothing about canonical
+  form, so §7¶5 governs), and `test_a_type_after_rfc_3597_keeps_the_case_of_its_embedded_name`
+  pins that against the "downcase anything with a name in it" instinct. The list is built from the
+  type registry rather than typed-out numbers, and asserted as mnemonics, so it reads against the
+  RFC's sentence and cannot gain a digit quietly.
+  Two rules that look cosmetic are not. §6.3¶1 orders RDATA as "a left-justified unsigned octet
+  sequence in which the absence of an octet sorts before a zero octet", which is plain bytes
+  comparison — what it rules out is a length-aware or numeric comparator, and a different order is
+  a different signature. §6.3¶2 makes a duplicate record "a protocol error" that MUST be treated as
+  one, permitting leniency only on condition that all but one copy be dropped: both readings are
+  honoured, `DuplicateRecordError` by default and `tolerate_duplicates=True` doing the drop,
+  because sorting two identical members produces a string no signer made.
+  `canonical_wire()` is per-codec rather than one `bytes(...).lower()` on the whole record: an MX
+  preference or an SRV port of `0x4142` is inside the A-Z byte range, and lowering it would corrupt
+  the number while "canonicalising" — `test_canonicalisation_leaves_numeric_fields_alone` exists to
+  keep anyone from taking the shortcut. A type that item 3 lists but this package has no codec for
+  raises `CanonicalizationError` instead of hashing raw octets, because guessing where names sit
+  makes a *valid* signature fail, which is indistinguishable from an attack.
+  `signed_owner_name` does the §3.1.3 wildcard reconstruction (`www.example.com.` with Labels 2 is
+  signed as `*.example.com.`), refuses a Labels value larger than the owner has labels rather than
+  clamping it, and keeps the `*` in the hashed name as §3.1.3¶4 requires.
 
 
 ### Fixed

@@ -20,13 +20,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import struct
 from collections.abc import Iterable
 from enum import IntEnum
 from hashlib import sha1, sha256, sha384
+from itertools import pairwise
 
+from .enums import DnsRType
 from .names import DomainName
 
 __all__ = [
+    "CANONICAL_DOWNCASE_TYPES",
     "DNSKEY_FLAG_REVOKED",
     "DNSKEY_FLAG_SEP",
     "DNSKEY_FLAG_ZONE_KEY",
@@ -36,9 +40,15 @@ __all__ = [
     "NSEC3_OPT_OUT_FLAG",
     "RSA_MD5_ALGORITHM",
     "TYPE_WINDOW_OCTETS",
+    "CanonicalizationError",
     "DigestType",
+    "DuplicateRecordError",
     "Nsec3HashAlgorithm",
     "canonical_owner_octets",
+    "canonical_rdata_octets",
+    "canonical_rr_bytes",
+    "canonical_rrset_bytes",
+    "canonical_rrset_rdatas",
     "decode_base32hex",
     "decode_base64_field",
     "decode_hex_field",
@@ -54,6 +64,9 @@ __all__ = [
     "key_tag",
     "known_digest_octets",
     "nsec3_hash",
+    "rrsig_label_count",
+    "rrsig_signed_data",
+    "signed_owner_name",
     "unsigned_field",
 ]
 
@@ -212,11 +225,13 @@ def canonical_owner_octets(name) -> bytes:
       separate from the names expanded from it. Substituting the matched label here would
       produce a hash that exists in no zone.
 
-    Items 3 and 5 are about RDATA and TTL and so cannot apply to a name on its own. Item 3
-    matters when whole RRs are canonicalised, and **verified erratum 1062** records that its
-    list of types is incomplete -- RFC 3597 §7 gives the full set, which is how an
-    implementation comes to downcase an NSEC3 name inside RDATA. That belongs to the RRset
-    ordering step validation will need, and is noted on the roadmap rather than half-done here.
+    Items 3 and 5 are about RDATA and TTL and so cannot apply to a name on its own. Item 3 does
+    matter when whole RRs are canonicalised, and **verified errata 1062 and 1063** are two halves
+    of one correction: each names the incompleteness of the other document's list, RFC 4034 §6.2
+    omitting types RFC 3597 §7¶4 has and RFC 3597 §7¶4 omitting the RRSIG and NSEC that RFC 4034
+    adds. The reconciled set is :data:`CANONICAL_DOWNCASE_TYPES`, and it is not simply "every type
+    with a name in it" -- RFC 3597 §7¶5 says types defined after it do not downcase at all, which
+    is why NSEC3 (no embedded name in the first place) and SVCB (a real one) are both absent.
 
     Lowercasing the assembled octets is exactly item 2 and nothing more: the only bytes that
     can land in A-Z are label contents, since a length octet is at most 63 and a fully
@@ -576,3 +591,250 @@ def iterations_within_limit(iterations: int, *, key_bits: int) -> bool:
             ceiling = limit
             break
     return int(iterations) <= ceiling
+
+
+# ------------------------------------------- canonical form (RFC 4034 §6, §3.1.8.1)
+#
+# This is what a signature actually covers, so the two rules that look cosmetic are not:
+# which types get their embedded names downcased, and how RDATA sorts.
+
+
+class CanonicalizationError(ValueError):
+    """A record whose canonical form this package cannot compute.
+
+    Raised rather than answered with the raw octets. Guessing here means hashing bytes the
+    signer did not hash, and the only symptom would be a valid signature that fails --
+    indistinguishable from an attack, which is the worst possible confusion to introduce into
+    a validator. The remedy is a codec for the type, and the message says so.
+    """
+
+
+class DuplicateRecordError(ValueError):
+    """An RRset holding two RRs with identical RDATA (RFC 4034 §6.3¶2, RFC 2181 §4.1.3).
+
+    §6.3¶2 makes this "a protocol error" that an implementation "MUST treat as such", and only
+    permits leniency on the condition that all but one copy be dropped for the canonical form.
+    Both halves are honoured here: raise by default, deduplicate on request. Silently sorting
+    two identical members would produce a signed string with an extra RR in it, which is a
+    false negative on somebody else's correctly signed zone.
+    """
+
+
+#: RFC 4034 §6.2 item 3: the types whose canonical form downcases the domain names *inside*
+#: their RDATA. Two verified errata shape this list, and they point at each other -- **1062**
+#: against RFC 4034 §6.2 and **1063** against RFC 3597 §7, each noting that the other
+#: document's set is incomplete. Read together, RFC 4034's is the superset: RFC 3597 §7¶4's
+#: pre-2003 types plus RRSIG and NSEC, which RFC 4034 §6.2 item 3 adds by name.
+#:
+#: What the pair does *not* license is growing the list. RFC 3597 §7¶5 says that for types
+#: defined after it, "the canonical form is such that no downcasing of embedded domain names
+#: takes place" -- so SVCB and HTTPS (RFC 9460, 2023) keep the case of their target-name even
+#: though it is a domain name and RFC 9460 says nothing about canonical form, and NSEC3 has no
+#: name to downcase at all since its hashed owner name is opaque octets. Adding a type here on
+#: the theory that it "has a name in it" changes the bytes a signature covers.
+#:
+#: HINFO appears in both lists and has no domain name; item 3 speaks only of "the DNS names
+#: contained within the RDATA", so its presence changes nothing. That is worth stating because
+#: an implementation that downcased HINFO's CPU and OS strings in the spirit of the list would
+#: corrupt the record it was trying to canonicalise.
+#: Built from the registry rather than from typed-out numbers, so the list reads against the
+#: RFC's sentence and cannot gain a digit by accident. A6 here is 38, the number the IANA
+#: registry carries; RFC 2874 assigned 3847 first, which is why sources disagree.
+CANONICAL_DOWNCASE_TYPES: frozenset[int] = frozenset(
+    int(DnsRType[name])
+    for name in (
+        "NS",
+        "MD",
+        "MF",
+        "CNAME",
+        "SOA",
+        "MB",
+        "MG",
+        "MR",
+        "PTR",
+        "HINFO",
+        "MINFO",
+        "MX",
+        "RP",
+        "AFSDB",
+        "RT",
+        "SIG",
+        "PX",
+        "NXT",
+        "NAPTR",
+        "KX",
+        "SRV",
+        "DNAME",
+        "A6",
+        "RRSIG",
+        "NSEC",
+    )
+)
+
+
+def canonical_rdata_octets(rtype: int, rdata) -> bytes:
+    """RDATA in canonical form (§6.2 items 1 and 3, RFC 3597 §7).
+
+    Two transformations, and only one is conditional. Expansion always applies: the codecs here
+    re-encode names from parsed state instead of copying received octets, so a name that arrived
+    through a compression pointer leaves this function fully expanded, which is what §6.2 item 1
+    requires. Downcasing the names *inside* RDATA applies only to the types in
+    CANONICAL_DOWNCASE_TYPES, per RFC 3597 §7¶5.
+
+    A listed type with no codec here raises rather than returning raw octets: without knowing
+    where the names sit, a byte-level downcase would corrupt the record (item 3 speaks of "the
+    DNS names contained within the RDATA", not of the RDATA), and something that merely looks
+    canonical is how a valid signature starts failing.
+    """
+    blob = bytes(rdata)
+    number = int(rtype)
+    if number not in CANONICAL_DOWNCASE_TYPES:
+        return blob
+    from .rdata import rdata_class_for  # deferred: namespy.rdata imports this module
+
+    codec = rdata_class_for(number)
+    if codec is None:
+        raise CanonicalizationError(
+            f"RR type {number} has embedded domain names that canonicalisation must downcase "
+            f"(RFC 4034 §6.2 item 3) but no codec here to say where they are; add a codec "
+            f"rather than hashing the raw octets"
+        )
+    return codec.parse_from(blob).canonical_wire()
+
+
+def canonical_rr_bytes(owner, rtype: int, rclass: int, ttl: int, rdata) -> bytes:
+    """One RR as a signature covers it: owner | type | class | TTL | RDLENGTH | RDATA.
+
+    That is §3.1.8.1¶5 verbatim, including the detail easy to miss: every RR repeats the owner
+    name, type and class rather than the RRset stating them once. Omitting that costs ten octets
+    per record and fails every signature.
+    """
+    canonical = canonical_rdata_octets(rtype, rdata)
+    return (
+        canonical_owner_octets(owner)
+        + struct.pack("!HHIH", int(rtype), int(rclass), int(ttl) & 0xFFFFFFFF, len(canonical))
+        + canonical
+    )
+
+
+def canonical_rrset_rdatas(
+    rtype: int, rdatas: Iterable, *, tolerate_duplicates: bool = False
+) -> tuple[bytes, ...]:
+    """The canonical RDATA of an RRset, in canonical order (RFC 4034 §6.3¶1-¶2).
+
+    §6.3¶1's order is "a left-justified unsigned octet sequence in which the absence of an octet
+    sorts before a zero octet" -- which is how Python compares bytes, so this sorts rather than
+    inventing a comparator. What that sentence rules out is a length-prefixed or numeric
+    comparison, either of which yields a different order and therefore a different signature.
+
+    Identical RDATA twice is DuplicateRecordError by default; its docstring gives the two readings
+    §6.3¶2 permits.
+    """
+    canonical = sorted(canonical_rdata_octets(rtype, rdata) for rdata in rdatas)
+    duplicates = {a for a, b in pairwise(canonical) if a == b}
+    if duplicates:
+        if not tolerate_duplicates:
+            raise DuplicateRecordError(
+                f"RRset of type {int(rtype)} holds {len(duplicates)} duplicated RDATA value(s); "
+                f"RFC 4034 §6.3¶2 makes this a protocol error"
+            )
+        unique: list[bytes] = []
+        for value in canonical:
+            if not unique or unique[-1] != value:
+                unique.append(value)
+        canonical = unique
+    return tuple(canonical)
+
+
+def canonical_rrset_bytes(
+    owner,
+    rtype: int,
+    rclass: int,
+    original_ttl: int,
+    rdatas: Iterable,
+    *,
+    tolerate_duplicates: bool = False,
+) -> bytes:
+    """Every RR of a set, canonical and canonically ordered, concatenated (§3.1.8.1, §6.3).
+
+    The TTL is the caller's to supply and should be the RRSIG's Original TTL rather than whatever
+    the records arrived carrying: §3.1.8.1¶10 says each RR "MUST have the TTL listed in the RRSIG
+    Original TTL Field", which is also why a cached RRset whose TTL has decayed still verifies.
+    """
+    head = canonical_owner_octets(owner) + struct.pack(
+        "!HHI", int(rtype), int(rclass), int(original_ttl) & 0xFFFFFFFF
+    )
+    out = bytearray()
+    for canonical in canonical_rrset_rdatas(rtype, rdatas, tolerate_duplicates=tolerate_duplicates):
+        out += head + struct.pack("!H", len(canonical)) + canonical
+    return bytes(out)
+
+
+def rrsig_label_count(owner) -> int:
+    """The Labels value a signer would write for this owner name (§3.1.3¶3).
+
+    Neither the root label nor a wildcard counts. The section gives its own examples --
+    "www.example.com." is 3, "*.example.com." is 2, root is 0 -- and all three are in the test,
+    because a count off by one looks exactly like a wrong wildcard decision.
+    """
+    labels = [label for label in DomainName(owner).labels() if label]
+    if labels and labels[0] == b"*":
+        return len(labels) - 1
+    return len(labels)
+
+
+def signed_owner_name(owner, labels: int):
+    """The owner name the signature covers, and whether it came from a wildcard (§3.1.3).
+
+    An answer synthesised from ``*.example.com.`` reaches the client with the expanded owner name,
+    so a validator has to undo the expansion before it can rebuild the signed bytes; Labels is
+    what says whether that happened. Where the count is lower than the owner has labels, the
+    difference is the run of labels the wildcard stood for, and replacing that run with one ``*``
+    recovers the signed name: "www.example.com." with Labels 2 becomes ``*.example.com.``, and so
+    does "a.b.example.com.".
+
+    §3.1.3¶3 requires Labels be "less than or equal to the number of labels in the RRSIG owner
+    name", so a larger value is refused rather than clamped -- it cannot mean anything, and
+    clamping would validate a signature against a name nobody signed.
+
+    Per §3.1.3¶4 the wildcard label is part of the owner name when the signature is computed, so
+    the reconstructed name is used whole: the ``*`` is hashed, not stripped.
+    """
+    parsed = DomainName(owner)
+    present = [label for label in parsed.labels() if label]
+    already_wildcard = bool(present) and present[0] == b"*"
+    counted = rrsig_label_count(parsed)
+    want = int(labels)
+    if want > counted:
+        raise ValueError(
+            f"RRSIG Labels {want} exceeds the {counted} label(s) of owner name {parsed} "
+            f"(RFC 4034 §3.1.3¶3)"
+        )
+    if want == counted:
+        return parsed, already_wildcard
+    tail = present[1:] if already_wildcard else present
+    kept = tail[len(tail) - want :] if want else []
+    text = "*." + ".".join(label.decode("latin-1") for label in kept)
+    return DomainName(text if not kept else f"{text}."), True
+
+
+def rrsig_signed_data(rrsig, owner, rdatas, *, rclass: int = 1) -> bytes:
+    """The exact octets an RRSIG's signature covers (§3.1.8.1).
+
+    ``RRSIG_RDATA | RR(1) | RR(2) | ...``, with RRSIG_RDATA the record's own fields, Signature
+    excluded and the Signer's Name canonical (§3.1.8.1¶4) -- downcased, because RRSIG is one of
+    the types item 3 lists. The owner name goes through :func:`signed_owner_name`, so a
+    wildcard-expanded RRset verifies against the name that was signed rather than the one served.
+
+    This is the one place a validator and this package could agree on every byte and still
+    disagree with a signer, which is why the parts live apart and are tested apart: the ordering,
+    the duplicate rule, the downcase set, and the label arithmetic.
+    """
+    signed_for, _ = signed_owner_name(owner, rrsig.labels)
+    return rrsig.signed_data_prefix() + canonical_rrset_bytes(
+        signed_for,
+        rrsig.type_covered,
+        rclass,
+        rrsig.original_ttl,
+        rdatas,
+    )

@@ -225,6 +225,18 @@ class RData:
         """Canonical RDATA, safe to store or re-parse anywhere."""
         return self.blob
 
+    def canonical_wire(self) -> bytes:
+        """RDATA as a signature covers it (RFC 4034 §6.2, RFC 3597 §7).
+
+        For most types that is simply the wire form: no embedded domain name means nothing to
+        downcase, and the codecs already re-encode names expanded rather than copying pointers.
+        The name-bearing codecs override this; anything that reaches the base implementation and
+        *is* in RFC 4034 §6.2 item 3's list would be silently under-canonicalised, which is why
+        :func:`namespy.dnssec.canonical_rdata_octets` only asks types in that list to prove they
+        have an override by way of the codec existing.
+        """
+        return self.to_wire()
+
     def to_presentation(self) -> str:
         """Master-file form; unknown types use the RFC 3597 section 5 escape."""
         return generic_presentation(self.blob)
@@ -409,6 +421,17 @@ class RData_SingleName(DomainName):
         """The name in uncompressed wire form -- which *is* the whole RDATA."""
         return bytes(DomainName(self.name))
 
+    def canonical_wire(self) -> bytes:
+        """The name downcased, which for this shape means lowering the whole RDATA.
+
+        §6.2 item 2/3 downcase domain names, and here the entire RDATA is one name. Lowering every
+        octet is safe for exactly the reason given in
+        :func:`namespy.dnssec.canonical_owner_octets`: a length octet is at most 63 and the root is
+        0, so the only bytes that can land in A-Z are label contents. MX and SRV cannot use this --
+        they have numeric fields ahead of their name, and a preference of 0x41 is not a letter.
+        """
+        return self.to_wire().lower()
+
     def to_presentation(self) -> str:
         return str(self.name)
 
@@ -545,6 +568,27 @@ class RData_SOA(RData):
         return (
             bytes(self.mname)
             + bytes(self.rname)
+            + struct.pack(
+                self._TIMERS_FMT,
+                self.serial,
+                self.refresh,
+                self.retry,
+                self.expire,
+                self.minimum,
+            )
+        )
+
+    def canonical_wire(self) -> bytes:
+        """Both names downcased, the five timers untouched (§6.2 item 3).
+
+        Lowering the whole record would corrupt a serial or a refresh whose octet happens to land
+        in A-Z, which is why this rebuilds rather than transforms. MNAME and RNAME arrive here
+        expanded already -- :meth:`parse_from` reads them through :func:`_read_name`, which refuses
+        a name that overruns its RDATA -- so item 1 is satisfied by construction.
+        """
+        return (
+            bytes(self.mname).lower()
+            + bytes(self.rname).lower()
             + struct.pack(
                 self._TIMERS_FMT,
                 self.serial,
@@ -716,6 +760,10 @@ class RData_MX(RData_SingleName, RData):
     def to_wire(self) -> bytes:
         return struct.pack(self._FMT, self.preference) + bytes(DomainName(self.name))
 
+    def canonical_wire(self) -> bytes:
+        """Preference untouched, exchange downcased (RFC 4034 §6.2 item 3)."""
+        return struct.pack(self._FMT, self.preference) + bytes(DomainName(self.name)).lower()
+
     @classmethod
     def parse_from(cls, buffer: bytes, offset: int = 0, length: int | None = None):
         blob = cls.rdata_octets(buffer, offset, length)
@@ -794,6 +842,13 @@ class RData_SRV(RData):
 
     def to_wire(self) -> bytes:
         return struct.pack(self._FMT, self.priority, self.weight, self.port) + bytes(self.target)
+
+    def canonical_wire(self) -> bytes:
+        """Priority, weight and port untouched; target downcased (§6.2 item 3)."""
+        return (
+            struct.pack(self._FMT, self.priority, self.weight, self.port)
+            + bytes(self.target).lower()
+        )
 
     def to_presentation(self) -> str:
         return f"{self.priority} {self.weight} {self.port} {self.target}"
@@ -1307,6 +1362,32 @@ class RData_RRSIG(RData):
             + self.signature
         )
 
+    def signed_data_prefix(self) -> bytes:
+        """RRSIG_RDATA with the Signature excluded and the signer downcased (§3.1.8.1¶4).
+
+        That is literally what a signature covers ahead of the RRset: every field of this record
+        except the signature itself, with the Signer's Name in canonical form -- downcased,
+        because RRSIG is the other type RFC 4034 adds to RFC 3597's list. Excluding the signature
+        is not an optimisation: including it would make the signed text depend on the signature.
+        """
+        return (
+            struct.pack(
+                _RRSIG_HEAD_FMT,
+                self.type_covered,
+                self.algorithm,
+                self.labels,
+                self.original_ttl,
+                self.expiration,
+                self.inception,
+                self.key_tag,
+            )
+            + bytes(self.signer_name).lower()
+        )
+
+    def canonical_wire(self) -> bytes:
+        """The whole record less the signature, plus it -- i.e. signer lowered only."""
+        return self.signed_data_prefix() + self.signature
+
     @property
     def covered_type(self) -> str:
         """The RR type this signature covers: mnemonic, else ``TYPE`` form (§3.2¶2)."""
@@ -1414,6 +1495,17 @@ class RData_NSEC(RData):
 
     def to_wire(self) -> bytes:
         return bytes(self.next_domain) + self.type_bitmap
+
+    def canonical_wire(self) -> bytes:
+        """Next Domain Name downcased, bitmap unchanged (§6.2 item 3 lists NSEC).
+
+        NSEC is one of the two types RFC 4034 adds to RFC 3597 §7¶4's list -- the pairing that
+        verified errata 1062 and 1063 exist to reconcile -- and the type its proofs turn on: a
+        canonical walk that compared case-sensitively sorted RRs would order a zone differently
+        from the signer and reject real NSEC records. The bitmap is a bitmap, so nothing in it is
+        a name and nothing in it gets lowered.
+        """
+        return bytes(self.next_domain).lower() + self.type_bitmap
 
     def to_presentation(self) -> str:
         """``next.name. A MX RRSIG NSEC`` -- name then type mnemonics (RFC 4034 §4.2)."""
