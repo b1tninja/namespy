@@ -547,6 +547,67 @@ nothing has been tagged or published yet, so `master` is the only version.
   computes its key tag, and refuses only when `rsa_public_key()` is asked, which keeps RFC 4034
   §2.1.2's "judged at verification time" and keeps an operator's ability to say which rule a zone
   broke.
+- Authenticated denial of existence: the NSEC and NSEC3 proof rules, in a new module
+  `namespy/nsec.py` (RFC 4034 §6.1, RFC 4035 §5.4, RFC 4592 §3.3.1, RFC 5155 §6-§9).
+  `name_order_key`, `canonical_name_before`, `sort_canonical`, `name_between`, `hash_between`,
+  the NSEC predicates (`nsec_matches`, `nsec_proves_nxdomain`, `nsec_proves_no_type`,
+  `nsec_proves_no_wildcard`, `nsec_owner_is_explicit`, `find_nsec_matching`,
+  `find_nsec_covering`), the NSEC3 predicates (`nsec3_owner_digest`, `nsec3_matches`,
+  `nsec3_covers`, `nsec3_proves_nothing`, `nsec3_proves_no_type`, the two finders, `usable_nsec3`,
+  `nsec3_record_is_from_proper_zone`), the §8.3 algorithm as `closest_encloser_proof` returning a
+  `ClosestEncloserProof`, `wildcard_at`, and §8.4's full Name Error check as
+  `nsec3_proves_nxdomain` returning an `Nsec3NxdomainProof`. Like the canonicalisation work, this
+  authenticates nothing: it reports what a set of records asserts, and verifying those records
+  remains the verification leg's job.
+  **Two error types, because the two situations ask the resolver for opposite things.** An
+  `IncompleteProofError` means the records were not in the response, which RFC 4035 §5.4¶6 says a
+  resolver MUST act on by asking again — typically over TCP, since truncation is what drops proof
+  records, and the third record of an NSEC3 denial is the one usually lost. A
+  `ContradictoryProofError` means the records cannot all be true, where retrying is pointless and
+  the answer is bogus. Collapsing the two is how a resolver ends up either hammering a server that
+  is correctly refusing it, or accepting a forged denial because it retried its way to something
+  that looked better.
+  **The span has to wrap, and the naive reading of a zone's last record silently breaks it.** The
+  last NSEC points back at the apex (RFC 4034 §4.1.1¶1) and the last NSEC3 back at the first hash
+  (RFC 5155 §7.1¶19), so its second endpoint sorts *before* its first. Compare them the obvious way
+  and that record appears to cover nothing: every name after the zone's final owner — which is what
+  a passer-by probes, since it is where the chain ends — comes back unproven, and a legitimate
+  NXDOMAIN is reported as bogus. `name_between` and `hash_between` both carry the wrap branch, and
+  the single-owner-name case (endpoints equal, span covering everything else) falls out of the same
+  expression rather than needing its own rule.
+  Two bitmap rules are MUST-NOT-reads that implementations commonly get wrong in the permissive
+  direction: RFC 4035
+  §5.4¶7 requires ignoring the NSEC and RRSIG bits in an NSEC RR, because a validated NSEC already
+  proves both exist at its owner name — so a signer that left them out of the bitmap must not be
+  able to have it disprove the record carrying it; and RFC 5155 §7.1¶5 means a signed zone never
+  lists NSEC3 in its own Type Bit Maps, so the same reasoning excludes that bit. §8.5¶2's related
+  case — an empty non-terminal's record has an *empty* bitmap and correctly denies everything — is
+  tested as well.
+  **`closest_encloser_proof` implements RFC 5155 §8.3's algorithm literally, including an
+  asymmetry that is easy to "simplify" into a bug.** The flag means "the name one label longer is
+  covered", it is cleared only when a name has no matching record, and it survives the step up to
+  the parent — which is the whole point, since the encloser is found by inheriting the flag its
+  child raised. A name that matches while the flag is clear is *bogus* (§8.3¶10), not merely
+  unhelpful: the server is denying a name it has just proven exists. §8.3¶12's proper-zone test is
+  applied to the encloser's record — a DNAME there, or an NS without an SOA, means this server is
+  not authoritative below the name it is denying, so the proof denies nothing however well signed.
+  §8.4 then requires the wildcard at the encloser to be covered as well, which is the half that
+  stops a server denying `hostile.example.com.` on the strength of having no such name while a
+  `*.example.com.` answers for it. RFC 4592 §3.3.1¶4 is what makes that a single name to test
+  rather than a wildcard search, and §3.3.1¶6-¶7 the reason no "closest wildcard" fallback exists.
+  `usable_nsec3` applies §8.1 (ignore unknown hash algorithms) and §8.2¶1 (ignore Flags other than
+  zero or one) as filters, then refuses mixed algorithm/iterations/salt sets under §8.2¶2's MAY:
+  hashes from different parameters are not comparable, so a mixed set lets a server pair a matching
+  record with a covering record computed differently and produce two proofs that together prove
+  nothing. Opt-Out spans get `nsec3_proves_nothing` (§6¶3 — an Opt-Out record asserts nothing about
+  what it covers, and reading it as a denial is the attack rather than an optimisation) and
+  `ClosestEncloserProof.via_opt_out`, which is how the resolver will know not to set AD when
+  RFC 5155 §9.2¶1 forbids it.
+  **Not claimed.** §8.5's amended text from **erratum 3441** (a No Data response caused by an empty
+  non-terminal under an Opt-Out span must carry the closest provable encloser proof) belongs with
+  the No-Data validators, and §8.6-§8.9 (DS no-data, wildcard no-data, wildcard answers, referrals
+  to unsigned subzones) are not implemented yet; neither is any of this wired to a `DnsPacket`,
+  which needs the cache to hold proof records alongside a negative answer.
 
 
 ### Fixed

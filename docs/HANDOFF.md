@@ -507,6 +507,71 @@ ECDSA/EdDSA key and signature encodings (RFC 6605 §4, RFC 8080 §3 — r‖s, n
 verification calls through `namespy[crypto]`, at which point `NxdomainPolicy.VALIDATED` acquires
 meaning.
 
+### Follow-up: the denial-of-existence proof rules (RFC 4034 §6.1, RFC 4035 §5.4, RFC 4592 §3.3.1, RFC 5155 §6-§9)
+
+New module `namespy/nsec.py`, 26 tests in `test_nsec_proofs.py`. It decides what a set of NSEC or
+NSEC3 records *asserts* about a name; it authenticates nothing, exactly as the canonicalisation work
+doesn't, so the verification leg still owns the question of whether the records are genuine.
+
+**The most valuable thing here is the error split.** `IncompleteProofError` means the proof records
+were not in the response — RFC 4035 §5.4¶6 obliges a resolver to ask again (truncation is why they go
+missing, and the third NSEC3 record is the usual casualty), so the caller's move is TCP retry.
+`ContradictoryProofError` means the records cannot all be true, where the move is bogus. One error
+type for both produces either a retry loop against a correctly-answering server or a forged denial
+accepted because retrying eventually looked better.
+
+**Three traps, all now pinned by tests:**
+
+1. *The span wraps.* A zone's last NSEC points at the apex (§4.1.1¶1) and its last NSEC3 at the
+   first hash (§7.1¶19), so the second endpoint sorts before the first. The obvious `start < key <
+   end` makes that record cover nothing, and every name after the final owner reports unproven —
+   i.e. real NXDOMAINs become bogus. Both `name_between` and `hash_between` carry the branch, and
+   the one-name zone (equal endpoints) falls out of the same expression.
+2. *Some bitmap bits must not be read.* RFC 4035 §5.4¶7 forbids reading the NSEC and RRSIG bits — a
+   validated NSEC already proves both exist at its owner, so a signer that omitted them from the
+   bitmap must not have it disprove the record carrying it. RFC 5155 §7.1¶5 gives the same reasoning
+   for the NSEC3 bit. `test_the_nsec_and_rrsig_bits_are_never_read` and
+   `test_nsec3_denies_a_type_at_a_matching_name_only` hold the line; §8.5¶2's empty-bitmap ENT case
+   is tested next to them.
+3. *§8.3's flag has to survive the step up.* The encloser is found because its child was covered, so
+   clearing the flag on a matching parent — the intuitive tidy-up — destroys the proof. Implemented
+   literally, in the RFC's own bullet order, and the bogus branch (§8.3¶10: matching while the flag
+   is clear means the name exists) is distinguished from incomplete.
+
+Also enforced: §8.3¶12's proper-zone test on the encloser's record (a DNAME, or NS without SOA, means
+this server is not authoritative below the name it denies); §8.4's wildcard half, which is what stops
+"no such name here" being read as "no answer was due" when `*.example.com.` exists — with RFC 4592
+§3.3.1¶4 making that one name to test rather than a wildcard hunt, and §3.3.1¶6-¶7 the reason there
+is no fallback to a nearer wildcard; and §8.1/§8.2 filters, including refusing a record set that
+mixes algorithm/iterations/salt, since hashes computed under different parameters are incomparable
+and a mixed set lets a matching record be paired with an incomparable covering one.
+
+Opt-Out is handled as an assertion problem rather than a flag: `nsec3_proves_nothing` says a covering
+Opt-Out record asserts nothing about what it covers (§6¶3 — reading it as a denial is the attack), and
+`ClosestEncloserProof.via_opt_out` exists so the resolver can obey RFC 5155 §9.2¶1's AD-bit
+prohibition when it gets there.
+
+**My own arithmetic error, caught by the tests:** I asserted `*.example.` sorts between `a.example.`
+and `z.example.`. The asterisk is 0x2A, below every letter, so it sorts between the apex and
+`a.example.` — the test failed, the span logic was right, and the corrected test now documents where
+the label actually falls (the same lesson RFC 4034 §6.1¶4's vector teaches with \001 and \200).
+
+**Not claimed**: §8.5 as amended by **erratum 3441** (No Data for an empty non-terminal under an
+Opt-Out span must carry the closest *provable* encloser proof) and §8.6-§8.9 (DS no-data, wildcard
+no-data, wildcard answers, referrals to unsigned subzones). Nothing is wired to a `DnsPacket` yet.
+Note also **erratum 4622** on the *server* side (§7.2.8): as published its second condition can never
+hold, because the NSEC3 type exists at its own owner name — relevant when we have to *accept* such
+NXDOMAIN answers.
+
+**Verified**: 1059 passed (+26), `ruff check .` / `ruff format --check .` clean, `mypy namespy`
+exits 0, `python -O -m pytest -q` clean.
+
+**Next**, in the order that unblocks most: the `DnsCache` change that lets a cached negative answer
+carry its proof records — that is what connects this module to a real response, and it is also all
+that stands between us and RFC 8020 §2¶5's MUST; then the response-level validators (§8.5 with
+erratum 3441, §8.6-§8.9) and `NxdomainPolicy.VALIDATED`; then ECDSA/EdDSA key and signature
+encodings (RFC 6605 §4, RFC 8080 §3) and the verification calls through `namespy[crypto]`.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them
