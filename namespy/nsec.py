@@ -15,6 +15,10 @@ Two shapes of one argument, not interchangeable:
 * **NSEC3** (RFC 5155 §8) compares *hashes* of owner names. Same shape, but the comparison values
   come from the record's own Hash Algorithm, Iterations and Salt, and a span with the Opt-Out flag
   set proves nothing about what it covers (§6¶3).
+
+The response-shape validators compose those parts into what each shape of response owes --
+RFC 5155 §8.5-§8.9 and, without hashes, RFC 4035 §5.4: which record must match, which must
+cover, and which combination of records is a contradiction rather than a missing record.
 """
 
 from __future__ import annotations
@@ -484,6 +488,585 @@ def nsec3_proves_nxdomain(qname, entries, zone) -> Nsec3NxdomainProof:
             f"covering the wildcard {wildcard} (RFC 5155 §8.4)"
         )
     return Nsec3NxdomainProof(closest=closest, wildcard=wildcard, wildcard_entry=covering)
+
+
+# ---------------------------------------------------------------- response-shape validators
+#
+# §8.3 and §8.4 built the parts. RFC 5155 §8.5-§8.9 then says what a complete response of
+# each shape owes -- No Data for an ordinary type, No Data for DS, wildcard No Data, a
+# wildcard answer, a referral into an unsigned subzone -- and RFC 4035 §5.4 is the same
+# claim about NSEC. These validators consume a response's proof records and name the ones
+# the response's shape rests on, keeping the split this module was built around: a record
+# that is absent means ask again (RFC 4035 §5.4¶6), a record that contradicts its own
+# response means no retry will help.
+#
+# Nothing here verifies a signature, and that costs these functions nothing: the shape is
+# what a response owes before its RRSIGs are read at all, and the records a proof names are
+# exactly the ones the verification leg will need.
+
+
+@dataclass(frozen=True)
+class NodataProof:
+    """A No Data proof (RFC 5155 §8.5, §8.6): the record that denied QTYPE at QNAME.
+
+    Either the NSEC3 that matches QNAME with the denied bits clear, or -- when the chain
+    holds no record at QNAME at all -- the closest provable encloser proof for a name that
+    exists only as an insecure delegation the zone carries no record of.
+    """
+
+    qname: DomainName
+    qtype: int
+    matching: Nsec3Entry | None
+    closest: ClosestEncloserProof | None
+
+    @property
+    def via_opt_out(self) -> bool:
+        """Whether the proof rests on an Opt-Out span, which forbids AD (RFC 5155 §9.2¶1)."""
+        return self.closest is not None and self.closest.via_opt_out
+
+
+def _nsec3_no_data(qname, qtype: int, entries, zone) -> NodataProof:
+    """The machinery §8.5 and §8.6 share: one shape, two pairs of bits to check.
+
+    Erratum 3441 amended §8.5 into its two-bracket form, and §8.6 was built that way from
+    the start: when the chain matches QNAME, its bitmap must leave QTYPE (or DS) and CNAME
+    clear; when it does not, only a closest provable encloser proof whose next-closer
+    record has Opt-Out set may stand in -- the shape RFC 5155 §6¶1 gives an insecure
+    delegation that owns no NSEC3 of its own, which is what the erratum's "Empty
+    Non-Terminal derived from an insecure delegation" answers to. The erratum's reporter
+    called the case a multi-label Opt-Out delegation; the validator never needs the word,
+    because it checks the shape.
+    """
+    qname = DomainName(qname)
+    usable = usable_nsec3(entries)
+    matching = find_nsec3_matching(qname, usable, zone)
+    if matching is not None:
+        _, record = _entry(*matching)
+        if int(qtype) == int(DnsRType.NSEC3):
+            raise ContradictoryProofError(
+                f"an NSEC3 RR matches {qname}, so the name sits in the chain and holds an "
+                f"NSEC3 of its own, which the No Data response then denies: §7.1¶5 keeps "
+                f"NSEC3 out of every bitmap, so absence proves nothing, and the record's "
+                f"own existence is the proof there is no absence to find (RFC 5155 §8.5¶1)"
+            )
+        if record.has_type(qtype):
+            raise ContradictoryProofError(
+                f"the NSEC3 RR matching {qname} lists type {int(qtype)} in its bitmap, so "
+                f"the RRset exists and the response denies it anyway (RFC 5155 §8.5¶1, §8.6¶1)"
+            )
+        if record.has_type(DnsRType.CNAME):
+            raise ContradictoryProofError(
+                f"the NSEC3 RR matching {qname} lists CNAME, so a CNAME answer was due and "
+                f"the response is neither the No Data it claims nor the CNAME its bitmap "
+                f"says (RFC 5155 §8.5¶1, §8.6¶1)"
+            )
+        # §8.5¶2's note rides along unasked for: an empty non-terminal's matching record
+        # has an empty Type Bit Maps field, and an empty bitmap clears every bit §8.5 reads.
+        return NodataProof(qname=qname, qtype=int(qtype), matching=matching, closest=None)
+
+    # No matching record. What may stand in is an Opt-Out proof of insecurity and nothing
+    # else: an *asserting* record covering the next closer would prove QNAME does not
+    # exist, while the No Data response -- the type-specific answer to a name that exists
+    # -- says it does. The two claims cannot both stand, which is why the failed Opt-Out
+    # test is a contradiction rather than a shrug towards incompleteness.
+    closest = closest_encloser_proof(qname, usable, zone)
+    if not closest.via_opt_out:
+        raise ContradictoryProofError(
+            f"no NSEC3 RR matches {qname}, and the record covering its next closer "
+            f"{closest.next_closer} asserts rather than opts out, so it denies the very "
+            f"existence the No Data response claims (RFC 5155 §8.5 as amended by erratum "
+            f"3441, §8.6¶2)"
+        )
+    return NodataProof(qname=qname, qtype=int(qtype), matching=None, closest=closest)
+
+
+def nsec3_proves_no_data(qname, qtype: int, entries, zone) -> NodataProof:
+    """RFC 5155 §8.5, as corrected by verified erratum 3441: No Data, QTYPE is not DS.
+
+    Erratum 3441 is what makes this function branch at all. As published, §8.5 demanded a
+    matching record unconditionally -- and an Opt-Out chain holds no record at an insecure
+    delegation (§6¶1: delegations may exist "without a corresponding NSEC3 RR at the hashed
+    owner name"), so the corrected text accepts the closest provable encloser proof with an
+    Opt-Out next closer for exactly that case, and only for it. DS queries belong to
+    :func:`nsec3_proves_no_ds`; handing this function a DS QTYPE works, because the shape is
+    identical, but §8.6 is where that case lives.
+    """
+    return _nsec3_no_data(qname, qtype, entries, zone)
+
+
+def nsec3_proves_no_ds(qname, entries, zone) -> NodataProof:
+    """RFC 5155 §8.6: No Data for a DS query -- the response that establishes an insecure delegation.
+
+    This is the most load-bearing denial in the whole protocol: it is what tells a resolver
+    to stop validating everything below QNAME. §6¶4 says the matching record's clear DS bit
+    *is* that establishment, and it is why the matching branch accepts an Opt-Out record at
+    QNAME where a covering one asserts nothing (§6¶3): a record asserts at its own owner
+    name whatever its flag says; it is the span that Opt-Out empties.
+    """
+    return _nsec3_no_data(qname, int(DnsRType.DS), entries, zone)
+
+
+@dataclass(frozen=True)
+class WildcardNodataProof:
+    """RFC 5155 §8.7: the encloser proof, plus the wildcard that exists but lacks QTYPE."""
+
+    qname: DomainName
+    qtype: int
+    closest: ClosestEncloserProof
+    wildcard: DomainName
+    wildcard_entry: Nsec3Entry
+
+    @property
+    def via_opt_out(self) -> bool:
+        """§9.2¶1's prohibition attaches to the encloser proof this response carries."""
+        return self.closest.via_opt_out
+
+
+def nsec3_proves_wildcard_no_data(qname, qtype: int, entries, zone) -> WildcardNodataProof:
+    """RFC 5155 §8.7: No Data that a wildcard's existence explains, and its bitmap disposes of.
+
+    "MUST find an NSEC3 RR present in the response that **matches** the wildcard name" --
+    matches, not covers. §8.4 denies the wildcard to prove a Name Error; §8.7 rests on its
+    existence to explain why a name that does not exist earned No Data instead. A record
+    set that denies the wildcard outright contradicts the shape of the response handed with
+    it, so it is reported as a contradiction; a set holding neither record is what
+    truncation costs a resolver, and RFC 4035 §5.4¶6 answers that by asking again.
+    """
+    qname = DomainName(qname)
+    usable = usable_nsec3(entries)
+    closest = closest_encloser_proof(qname, usable, zone)
+    wildcard = wildcard_at(closest.encloser)
+    if closest.via_opt_out:
+        raise ContradictoryProofError(
+            f"the encloser proof for {qname} runs through an Opt-Out span at "
+            f"{closest.next_closer}, which puts the path to QNAME below an insecure "
+            f"delegation -- and {wildcard}, one label above that next closer, cannot be "
+            f"what answered beneath it: synthesis does not cross a zone cut, and a signed "
+            f"zone asserts nothing below the delegation (RFC 5155 §6¶3, §8.7; RFC 4592 §2.1)"
+        )
+    matching = find_nsec3_matching(wildcard, usable, zone)
+    if matching is None:
+        if find_nsec3_covering(wildcard, usable, zone) is not None:
+            raise ContradictoryProofError(
+                f"the response denies the existence of the wildcard {wildcard} on which "
+                f"its No Data answer rests -- that pair of records is the shape of a Name "
+                f"Error (RFC 5155 §8.7 against §8.4)"
+            )
+        raise IncompleteProofError(
+            f"the response proves the closest encloser {closest.encloser} but holds no "
+            f"NSEC3 RR matching the wildcard {wildcard} (RFC 5155 §8.7)"
+        )
+    _, record = _entry(*matching)
+    if record.has_type(qtype) or record.has_type(DnsRType.CNAME):
+        raise ContradictoryProofError(
+            f"the NSEC3 RR matching the wildcard {wildcard} lists type {int(qtype)} or "
+            f"CNAME in its bitmap, so the wildcard could have answered the query and the "
+            f"No Data response is not the answer its own proof describes (RFC 5155 §8.7)"
+        )
+    return WildcardNodataProof(qname, int(qtype), closest, wildcard, matching)
+
+
+@dataclass(frozen=True)
+class WildcardAnswerProof:
+    """RFC 5155 §8.8: the record proving QNAME itself did not exist, under a wildcard answer."""
+
+    qname: DomainName
+    wildcard: DomainName
+    encloser: DomainName
+    next_closer: DomainName
+    next_closer_entry: Nsec3Entry
+
+    @property
+    def via_opt_out(self) -> bool:
+        """§9.2¶1's AD prohibition reaches the wildcard answer's proof too."""
+        return nsec3_proves_nothing(self.next_closer_entry)
+
+
+def nsec3_proves_wildcard_answer(qname, wildcard, entries, zone) -> WildcardAnswerProof:
+    """RFC 5155 §8.8: the answer was synthesised, so prove the name was not there to be found.
+
+    The synthesising name never appears in the answer -- the records carry QNAME's -- and it
+    is not on the wire at all: the caller derives it from the covering RRSIG's Labels field
+    (RFC 4034 §3.1.4), the one number in a signature that remembers which wildcard the
+    answer came through. This function therefore *takes* the synthesising name and checks
+    what §8.8 checks: an NSEC3 covering the "next closer" name, the one label under the
+    encloser on the path toward QNAME. That record proves QNAME itself did not exist and
+    that this was the nearest wildcard permitted to answer -- RFC 4592 §3.3.1's "no search
+    for an alternate" made verifiable.
+    """
+    wildcard = DomainName(wildcard)
+    wlabels = [label for label in wildcard.labels() if label]
+    if not wlabels or wlabels[0] != b"*":
+        raise ValueError(
+            f"{wildcard} is not a synthesising name: RFC 5155 §8.8's wildcard is the "
+            f"answer's owner with its first label replaced by the asterisk"
+        )
+    qname = DomainName(qname)
+    qlabels = [label for label in qname.labels() if label]
+    encloser = DomainName(".".join(label.decode("latin-1") for label in wlabels[1:]) + ".")
+    elabels = [label for label in encloser.labels() if label]
+    if len(qlabels) <= len(elabels) or qlabels[len(qlabels) - len(elabels) :] != elabels:
+        raise ValueError(
+            f"{qname} does not sit beneath {encloser}, so {wildcard} cannot have synthesised it"
+        )
+    base = "" if not elabels else str(encloser)
+    # The next closer is the encloser with ONE label more -- the label of QNAME sitting
+    # directly above the encloser, not QNAME's leftmost label: for x.y.example.com. under
+    # example.com. it is y.example.com., the name whose absence makes the wildcard the
+    # nearest possible source of data (§5's definition, §8.3's walk, RFC 4592 §3.3.1).
+    next_label = qlabels[len(qlabels) - len(elabels) - 1]
+    next_closer = DomainName(f"{next_label.decode('latin-1')}.{base}")
+    usable = usable_nsec3(entries)
+    if find_nsec3_matching(qname, usable, zone) is not None:
+        raise ContradictoryProofError(
+            f"an NSEC3 RR matches {qname}, so the name exists and was answered from itself "
+            f"rather than through {wildcard} (RFC 5155 §8.8¶2)"
+        )
+    covering = find_nsec3_covering(next_closer, usable, zone)
+    if covering is None:
+        raise IncompleteProofError(
+            f"no NSEC3 RR covers the next closer name {next_closer}, which is what §8.8¶2 "
+            f"requires of a wildcard answer: without it nothing proves {qname} did not "
+            f"exist, and that {wildcard} was the right wildcard to answer with"
+        )
+    return WildcardAnswerProof(qname, wildcard, encloser, next_closer, covering)
+
+
+@dataclass(frozen=True)
+class InsecureDelegationProof:
+    """RFC 5155 §8.9: the parent's word that a referred-to zone is not signed.
+
+    ``via_opt_out`` is true only for the span branch; a matching record asserts at its own
+    owner name whatever its flag (§6¶4), so the Opt-Out bit there changes nothing about
+    what the record proves.
+    """
+
+    delegation: DomainName
+    matching: Nsec3Entry | None
+    closest: ClosestEncloserProof | None
+
+    @property
+    def via_opt_out(self) -> bool:
+        """Whether insecurity rests on an Opt-Out span rather than a matching record."""
+        return self.closest is not None and self.closest.via_opt_out
+
+
+def nsec3_proves_unsigned_delegation(delegation, entries, zone) -> InsecureDelegationProof:
+    """RFC 5155 §8.9: validating a referral into a zone that is not signed.
+
+    The delegation name is the owner of the referral's NS RRset, and this is the check that
+    decides whether validation stops at the cut or follows the descent into it. The
+    matching record must read NS-set and DS-clear -- a delegation that exists and carries
+    no trust to inherit -- and SOA-clear, which is §8.9¶2's test for the record being the
+    *parent's*: only an apex owns SOA, so a record matching the delegation name while
+    listing SOA is the child zone's own, quoted as though it were the parent's word.
+    §8.9¶3 makes the NS bit imply the DNAME bit clear, so that proper-zone worry is
+    answered by the NS check itself.
+    """
+    delegation = DomainName(delegation)
+    usable = usable_nsec3(entries)
+    matching = find_nsec3_matching(delegation, usable, zone)
+    if matching is not None:
+        _, record = _entry(*matching)
+        if not record.has_type(DnsRType.NS):
+            raise ContradictoryProofError(
+                f"the NSEC3 RR matching the delegation {delegation} does not list NS, so "
+                f"it denies the very delegation the referral asserts (RFC 5155 §8.9¶2)"
+            )
+        if record.has_type(DnsRType.DS):
+            raise ContradictoryProofError(
+                f"the NSEC3 RR matching the delegation {delegation} lists DS, so the child "
+                f"is secure and the referral cannot be validated as a step into an "
+                f"unsigned zone (RFC 5155 §8.9¶2)"
+            )
+        if record.has_type(DnsRType.SOA):
+            raise ContradictoryProofError(
+                f"the NSEC3 RR matching {delegation} lists SOA, so it belongs to the child "
+                f"zone rather than the parent whose denial it is serving as (RFC 5155 §8.9¶2)"
+            )
+        return InsecureDelegationProof(delegation=delegation, matching=matching, closest=None)
+    closest = closest_encloser_proof(delegation, usable, zone)
+    if not closest.via_opt_out:
+        raise ContradictoryProofError(
+            f"the record covering {closest.next_closer} asserts rather than opting out, so "
+            f"it denies the existence of the delegation {delegation} it is offered here to "
+            f"mark unsigned (RFC 5155 §8.9¶4, §6¶3)"
+        )
+    return InsecureDelegationProof(delegation=delegation, matching=None, closest=closest)
+
+
+# ---------------------------------------------------------------------- NSEC, response level
+#
+# RFC 4035 §5.4 states the two proof bullets and leaves the algorithm to the reader; RFC
+# 5155 §8.3 later wrote the walk down, hashed. The walk below is that algorithm with
+# owner-name comparisons -- the geometry is identical, and where a rule is cited to the
+# NSEC3 section that is because that is where it was written down, not because it needs
+# hashes to hold.
+
+
+def nsec_record_is_from_proper_zone(entry) -> bool:
+    """The NSEC mirror of :func:`nsec3_record_is_from_proper_zone`.
+
+    A server holds no NSEC records below a DNAME or a bare delegation, so a "proof"
+    anchored at either is quoted from a zone the responder does not speak for -- which is
+    exactly the reason RFC 5155 §8.3¶12 gives, and none of it is about hashes.
+    """
+    _, record = _entry(*entry)
+    if record.has_type(DnsRType.DNAME):
+        return False
+    return not record.has_type(DnsRType.NS) or record.has_type(DnsRType.SOA)
+
+
+def _nsec_closest_encloser(qname, entries):
+    """The §8.3 walk over NSEC records: (encloser, its record, next closer, its coverer).
+
+    The flag discipline is RFC 5155 §8.3¶7-¶8's bullet order kept literal -- see
+    :func:`closest_encloser_proof` for why the order is not cosmetic -- and it needs no
+    change to serve NSEC, because matching and covering are owner-name tests here instead
+    of hash tests. An empty set is refused before the walk as an *incomplete* proof: what
+    RFC 4035 §5.4¶6 says a missing record costs is a retry, not a verdict.
+    """
+    entries = list(entries)
+    if not entries:
+        raise IncompleteProofError(
+            f"the response holds no NSEC RR at all, so nothing denies {DomainName(qname)} "
+            f"(RFC 4035 §5.4¶6)"
+        )
+    sname = DomainName(qname)
+    flag = False
+    flagged_name: DomainName | None = None
+    covering: NsecEntry | None = None
+    while True:
+        matching = find_nsec_matching(sname, entries)
+        coverer = find_nsec_covering(sname, entries)
+        if matching is None:
+            flag = False
+            covering = None
+        if coverer is not None:
+            flag = True
+            covering = coverer
+            flagged_name = sname
+        if matching is not None and flag:
+            if covering is None or flagged_name is None:  # pragma: no cover - flag implies both
+                raise ContradictoryProofError(
+                    f"the NSEC RR matching {sname} is itself covered by another record, "
+                    f"which cannot happen for a name that exists (RFC 4035 §5.4¶3)"
+                )
+            if not nsec_record_is_from_proper_zone(matching):
+                raise ContradictoryProofError(
+                    f"the NSEC RR matching {sname} carries a DNAME, or an NS without an "
+                    f"SOA, so this server is not authoritative below it and cannot deny "
+                    f"names there (RFC 5155 §8.3¶12, stated for either proof record)"
+                )
+            return sname, matching, flagged_name, covering
+        if matching is not None:
+            raise ContradictoryProofError(
+                f"the response offers a closest encloser proof for {sname}, but an NSEC RR "
+                f"matches it, so the name exists (RFC 4035 §5.4¶3 against §5.4¶4; cf. RFC "
+                f"5155 §8.3¶10)"
+            )
+        labels = [label for label in sname.labels() if label]
+        if not labels:
+            raise IncompleteProofError(
+                f"no NSEC RR matches or covers {DomainName(qname)} or any ancestor of it "
+                f"up to the root (RFC 4035 §5.4¶6)"
+            )
+        sname = (
+            DomainName(".".join(label.decode("latin-1") for label in labels[1:]) + ".")
+            if len(labels) > 1
+            else DomainName(".")
+        )
+
+
+@dataclass(frozen=True)
+class NsecNxdomainProof:
+    """RFC 4035 §5.4¶4's Name Error proof: the encloser, its covered child, the denied wildcard."""
+
+    encloser: DomainName
+    encloser_entry: NsecEntry
+    next_closer: DomainName
+    next_closer_entry: NsecEntry
+    wildcard: DomainName
+    wildcard_entry: NsecEntry
+
+
+def nsec_proves_nxdomain_response(qname, entries) -> NsecNxdomainProof:
+    """RFC 4035 §5.4¶4 in full: a covered name *and* a denied wildcard.
+
+    §5.4¶4 is the half a bare assembly forgets: covering QNAME proves the name is absent,
+    but "it is possible that a wildcard could be used to match the requested RR owner name
+    and type", and RFC 4592 §3.3.1 fixes the one wildcard that could -- the asterisk at the
+    closest encloser. A record matching that wildcard says a wildcard did stand there,
+    which makes Name Error the wrong answer outright rather than an unproven one.
+    """
+    encloser, matching, next_closer, covering = _nsec_closest_encloser(qname, entries)
+    wildcard = wildcard_at(encloser)
+    if find_nsec_matching(wildcard, entries) is not None:
+        raise ContradictoryProofError(
+            f"an NSEC RR matches the wildcard {wildcard}, so a wildcard stood at the "
+            f"encloser and the owed answer was No Data at worst -- not the Name Error "
+            f"these records are offered to prove (RFC 4035 §5.4¶4; RFC 5155 §8.7 for the "
+            f"shape this one belongs to)"
+        )
+    denier = find_nsec_covering(wildcard, entries)
+    if denier is None:  # pragma: no cover - unreachable by construction
+        # The asterisk is 0x2A and sorts before every other label character, so *.encloser
+        # is the first name under the encloser: whenever the encloser's own record exists
+        # -- which the walk just required -- its span holds the wildcard as a match or a
+        # cover, and both of those branches are decided above. This raise survives only as
+        # the function's stated promise that a missing wildcard denial is a retry.
+        raise IncompleteProofError(
+            f"the response proves the closest encloser {encloser} but holds no NSEC RR "
+            f"covering the wildcard {wildcard}, and §5.4¶4 makes the absent name only "
+            f"half of what an NXDOMAIN must prove"
+        )
+    return NsecNxdomainProof(encloser, matching, next_closer, covering, wildcard, denier)
+
+
+@dataclass(frozen=True)
+class NsecNoDataProof:
+    """A No Data proof under NSEC: either QNAME's own record or the wildcard that failed."""
+
+    qname: DomainName
+    qtype: int
+    matching: NsecEntry | None
+    wildcard: DomainName | None
+    wildcard_entry: NsecEntry | None
+    owner_explicit: bool | None
+
+
+def nsec_proves_no_data(
+    qname, qtype: int, entries, *, rrsig: RData_RRSIG | None = None
+) -> NsecNoDataProof:
+    """RFC 4035 §5.4¶3's No Data check, assembled across both shapes the answer can take.
+
+    When QNAME has a record of its own the name exists, and §5.4¶3's bitmap test is the
+    whole claim -- plus the Labels equality of ¶3's second sentence, which is why an
+    optional covering RRSIG is accepted: equal counts are what prove the response's NSEC
+    was signed as QNAME's own record rather than carried down a wildcard, and a caller
+    holding the bundle of :func:`collect_proof_records` has it to hand. Without a record
+    at QNAME the name does not exist, and the No Data answer is right only because a
+    wildcard stands at the encloser without QTYPE: §5.4¶6 makes that half of proving the
+    RRset absent, and RFC 5155 §8.7 is its NSEC3 restatement.
+
+    The CNAME bit is checked in both shapes although §5.4¶3 never mentions it, because RFC
+    5155 §8.5¶1 says plainly why it is read ("both the QTYPE and the CNAME type are not
+    set") and the reason belongs to the record, not the algorithm: a bitmap that lists
+    CNAME contradicts the response that withheld the CNAME.
+    """
+    qname = DomainName(qname)
+    if int(qtype) in (int(DnsRType.NSEC), int(DnsRType.RRSIG)):
+        raise ContradictoryProofError(
+            f"No Data for type {int(qtype)} is unprovable by construction: a validated "
+            f"NSEC proves both NSEC and RRSIG exist at its owner name, which is exactly "
+            f"why §5.4¶7 says a validator MUST ignore those two bits (RFC 4035 §5.4¶7)"
+        )
+    matching = find_nsec_matching(qname, entries)
+    if matching is not None:
+        _, record = _entry(*matching)
+        if record.has_type(qtype):
+            raise ContradictoryProofError(
+                f"the NSEC RR matching {qname} lists type {int(qtype)} in its bitmap, so "
+                f"the RRset exists and the response denies it anyway (RFC 4035 §5.4¶3)"
+            )
+        if record.has_type(DnsRType.CNAME):
+            raise ContradictoryProofError(
+                f"the NSEC RR matching {qname} lists CNAME, so a CNAME answer was due and "
+                f"the response is neither the No Data it claims nor the CNAME its bitmap "
+                f"says (RFC 4035 §5.4¶3; RFC 5155 §8.5¶1 for the bit named)"
+            )
+        explicit = None
+        if rrsig is not None:
+            explicit = nsec_owner_is_explicit(matching, rrsig)
+            if not explicit:
+                raise ContradictoryProofError(
+                    f"the covering RRSIG carries {rrsig.labels} labels against an owner "
+                    f"name with more, so the NSEC it signs was synthesised through a "
+                    f"wildcard and cannot vouch for {qname}'s own existence "
+                    f"(RFC 4035 §5.4¶3)"
+                )
+        return NsecNoDataProof(
+            qname=qname,
+            qtype=int(qtype),
+            matching=matching,
+            wildcard=None,
+            wildcard_entry=None,
+            owner_explicit=explicit,
+        )
+    encloser, _, _, _ = _nsec_closest_encloser(qname, entries)
+    wildcard = wildcard_at(encloser)
+    wildcard_entry = find_nsec_matching(wildcard, entries)
+    if wildcard_entry is None:
+        if find_nsec_covering(wildcard, entries) is not None:
+            raise ContradictoryProofError(
+                f"the response denies the existence of the wildcard {wildcard} on which "
+                f"its No Data answer rests -- that pair of records is the shape of a Name "
+                f"Error (RFC 4035 §5.4¶4; contrast RFC 5155 §8.7)"
+            )
+        raise IncompleteProofError(  # pragma: no cover - unreachable by construction
+            # Same geometry as in :func:`nsec_proves_nxdomain_response`: the encloser's own
+            # record, which the walk required, spans the wildcard because the asterisk is
+            # the first label character of any name beneath the encloser. NSEC3 has no
+            # such theorem -- hashes reorder -- which is why §8.7's incomplete branch has
+            # a test and this one has a comment.
+            f"no NSEC RR matches the wildcard {wildcard} that the No Data answer rests on "
+            f"(RFC 4035 §5.4¶6 asks again)"
+        )
+    _, record = _entry(*wildcard_entry)
+    if record.has_type(qtype) or record.has_type(DnsRType.CNAME):
+        raise ContradictoryProofError(
+            f"the NSEC RR matching the wildcard {wildcard} lists the very type the "
+            f"response says it has no data for, or CNAME (RFC 4035 §5.4¶3, ¶6)"
+        )
+    return NsecNoDataProof(
+        qname=qname,
+        qtype=int(qtype),
+        matching=None,
+        wildcard=wildcard,
+        wildcard_entry=wildcard_entry,
+        owner_explicit=None,
+    )
+
+
+@dataclass(frozen=True)
+class NsecWildcardAnswerProof:
+    """RFC 5155 §8.8's requirement under NSEC: the span that covers QNAME."""
+
+    qname: DomainName
+    wildcard: DomainName
+    covering_entry: NsecEntry
+
+
+def nsec_proves_wildcard_answer(qname, wildcard, entries) -> NsecWildcardAnswerProof:
+    """The mirror of :func:`nsec3_proves_wildcard_answer` for a zone signed with NSEC.
+
+    RFC 4035 has no section for the synthesised answer because §5.4¶4 already states the
+    whole requirement: an NSEC whose span contains QNAME proves the name did not exist and
+    so could only have been answered through a wildcard. The synthesising name itself comes
+    from the covering RRSIG's Labels field (RFC 4034 §3.1.4), as on the NSEC3 leg, and is
+    checked here only for the shape §8.8 names it by: a synthesising name begins with the
+    asterisk label.
+    """
+    qname = DomainName(qname)
+    wildcard = DomainName(wildcard)
+    wlabels = [label for label in wildcard.labels() if label]
+    if not wlabels or wlabels[0] != b"*":
+        raise ValueError(
+            f"{wildcard} is not a synthesising name: RFC 5155 §8.8's wildcard is the "
+            f"answer's owner with its first label replaced by the asterisk"
+        )
+    if find_nsec_matching(qname, entries) is not None:
+        raise ContradictoryProofError(
+            f"an NSEC RR matches {qname}, so the name exists and was answered from itself "
+            f"rather than through {wildcard} (RFC 5155 §8.8¶2)"
+        )
+    covering = find_nsec_covering(qname, entries)
+    if covering is None:
+        raise IncompleteProofError(
+            f"no NSEC RR's span covers {qname}, so nothing proves the synthesised answer "
+            f"came by wildcard rather than by the name existing (RFC 4035 §5.4¶4)"
+        )
+    return NsecWildcardAnswerProof(qname=qname, wildcard=wildcard, covering_entry=covering)
 
 
 # ------------------------------------------------- proof records as they arrive in responses

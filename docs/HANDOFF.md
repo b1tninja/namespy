@@ -714,6 +714,82 @@ question above, and whether `serve --dnssec` should imply DO outbound unconditio
 first sentence rather than by flag — currently a server can serve DO=1 clients without ever asking,
 which satisfies the strip half and quietly misses the ask half.
 
+### Follow-up: what each response shape owes — the response-level validators (RFC 5155 §8.5-§8.9 with erratum 3441, RFC 4035 §5.4)
+
+The chosen scope for this arc is the full one — validators, ECDSA/EdDSA encodings, and the
+verification calls, in staged commits, so that `NxdomainPolicy.VALIDATED` will mean what its
+name says; this is the first of those stages, and the door-refusal at `resolver.py` stays
+until the chain exists.
+
+**What shipped.** Eight entry points compose the §8.3/§8.4 parts into per-response-shape
+validators: `nsec3_proves_no_data` (§8.5 as corrected by verified erratum 3441),
+`nsec3_proves_no_ds` (§8.6), `nsec3_proves_wildcard_no_data` (§8.7),
+`nsec3_proves_wildcard_answer` (§8.8), `nsec3_proves_unsigned_delegation` (§8.9), and the
+NSEC mirrors `nsec_proves_no_data`, `nsec_proves_nxdomain_response`,
+`nsec_proves_wildcard_answer` (RFC 4035 §5.4's two bullets, walked with the §8.3 algorithm
+and the §8.3¶12 proper-zone test, neither of which needs hashes). Every result names the
+records the shape rests on, every failure distinguishes `IncompleteProofError` (§5.4¶6's
+ask-again) from `ContradictoryProofError` (§8.3¶10's no-retry-will-help), every NSEC3 entry
+point filters through `usable_nsec3` first, and every proof carries `via_opt_out` — §9.2¶1's
+AD prohibition, pre-computed for the header bit the roadmap still marks ⬜.
+
+**What the reading taught, three findings.**
+
+1. *Erratum 3441 is a branch, not a footnote.* Published §8.5 demanded a matching NSEC3
+   unconditionally; Opt-Out chains hold no record at an insecure delegation (§6¶1), so the
+   corrected text lets the closest *provable* encloser proof stand for exactly that case —
+   and its first paragraph still reads the bitmap of every matching record. Both paragraphs
+   have their own test, and the asserting-cover failure is a contradiction, not a shrug:
+   a record that *asserts* QNAME's absence contradicts the No Data response's claim that
+   QNAME exists, so retrying changes nothing.
+2. *A matching record asserts whatever its span denies* (§6¶4). The matching branches of
+   §8.5/§8.6 accept an Opt-Out-flagged record at QNAME — its clear DS bit *is* what
+   establishes an insecure delegation — while §8.7 refuses an Opt-Out *encloser proof*: the
+   wildcard stands one label above the next closer, synthesis does not cross a zone cut,
+   and a signed zone asserts nothing below an insecure delegation.
+3. *The asterisk sorts first — a theorem, and two branches fell out of it.* `*.encloser` is
+   the first name beneath the encloser, so the encloser's own NSEC span always holds the
+   wildcard: as an endpoint (the wildcard exists) or as a cover (it does not). On the NSEC
+   side "the wildcard record is missing entirely" is therefore unreachable — the two
+   defensive raises carry `# pragma: no cover` with the geometry spelled out, and two tests
+   pin the contrapositives: a response whose records *match* the wildcard cannot claim Name
+   Error, one whose records *deny* it cannot claim No Data. NSEC3 has no such theorem —
+   hashes reorder the zone — which is why §8.7's missing-wildcard case has a test at all.
+
+**My own arithmetic error, caught by the tests again**: I derived §8.8's next closer from
+QNAME's leftmost label, which for `x.y.example.com.` under `example.com.` produced
+`x.example.com.`. The next closer is the encloser with *one* label added — `y.example.com.`,
+per §5's definition and the tested §8.3 walk. The implementation had the wrong index; the
+test's assertion was right. Same lesson as the asterisk-sorting one above it: derive from
+the definition, not from the shape of the name string.
+
+**A pre-existing flake, fixed in its own commit**: the name round-trip fuzzer placed
+`assume(len(bytes(name)) <= MAX_NAME_OCTETS)` *after* the encoding that raises when the
+budget is blown — a stored six-label counterexample (39-to-40 octet labels) made every
+local run red where CI's fresh `.hypothesis/` database stayed green. The bound is now
+arithmetic over the labels before `from_labels`, in both properties that had it inverted.
+
+**Not claimed**: nothing consumes the validators yet — same position §8.3/§8.4 shipped in,
+the consumer is the validation pipeline — and nothing verifies a signature;
+`NxdomainPolicy.VALIDATED` stays refused at the door until the chain exists, its message
+still honest. Erratum 4622 on the *server* side (§7.2.8) still waits for the day this
+server has to *accept* such NXDOMAIN answers rather than compose them.
+
+**Verified**: 1138 passed (+44 in `tests/test_nsec_responses.py`; the fuzz fix changes no
+counts), `ruff check .` / `ruff format --check .` clean, `mypy namespy` exits 0, `-O` run
+holds, coverage 91% total with `namespy/nsec.py` at 98%.
+
+**Next, in order**: (1) ECDSA/EdDSA key and signature encodings (RFC 6605 §4, RFC 8080 §3) —
+fixed-width r‖s rather than DER, which is exactly the trap that section exists to warn
+about — then the verification calls through `namespy[crypto]`, RFC 4035 §5.3.1's procedure
+with RFC 9904's policy table; (2) trust anchors and the DS→DNSKEY chain (root KSK fetched
+from IANA at implementation time, not from memory — rolling it is roadmap ⬜ and an embedded
+stale anchor would fail every query); (3) `NxdomainPolicy.VALIDATED` wired where
+`_nxdomain_cut` reads `NegativeEntry`, which is finally what makes its door-refusal
+liftable; (4) the header AD/CD bits, without which §9.2's rules and this round's
+`via_opt_out` flags honour nothing. The DS-strip question and the `serve --dnssec` DO
+question above remain open.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

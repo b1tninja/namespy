@@ -8,6 +8,41 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- The response-level validators (RFC 5155 §8.5-§8.9, RFC 4035 §5.4) — the shapes a signed
+  response can take, each with the records it owes and the split between *absent* and
+  *contradictory*. `nsec3_proves_no_data` is §8.5 **as corrected by verified erratum 3441**,
+  which is what makes it branch at all: as published it demanded a matching NSEC3
+  unconditionally, and an Opt-Out chain holds no record at an insecure delegation (§6¶1),
+  so the amended text accepts a closest *provable* encloser proof whose next closer is
+  covered by an Opt-Out span — and only that. `nsec3_proves_no_ds` (§8.6) is the same shape
+  reading the DS bit, the most load-bearing denial in the protocol because it is what tells
+  a validator to stop below an unsigned child; §6¶4 is why its matching branch accepts an
+  Opt-Out record while §6¶3 is why a covering one asserts nothing.
+  `nsec3_proves_wildcard_no_data` (§8.7) rests on the wildcard's *existence* — matched, not
+  covered, which is the difference between a No Data answer and the Name Error its records
+  would otherwise describe. `nsec3_proves_wildcard_answer` (§8.8) takes the synthesising
+  name the caller read from the covering RRSIG's Labels field and demands the span over the
+  "next closer", which is RFC 4592 §3.3.1's "no search for an alternate" made verifiable.
+  `nsec3_proves_unsigned_delegation` (§8.9) validates a referral into an unsigned zone, and
+  its SOA-bit check is the parent test: a record that matches the delegation name while
+  listing SOA is the child's own, quoted as the parent's word. `nsec_proves_no_data`,
+  `nsec_proves_nxdomain_response` and `nsec_proves_wildcard_answer` assemble the thinner RFC
+  4035 §5.4 text into the same shapes, with the §5.4¶3 Labels equality for callers holding
+  the covering RRSIG and the CNAME-bit check RFC 5155 §8.5¶1 spells out and RFC 4035 leaves
+  to the reader. Every entry point filters through `usable_nsec3` first, every result names
+  the records a proof rests on and flags whether it runs through an Opt-Out span — the AD
+  prohibition of RFC 5155 §9.2¶1, pre-computed and waiting for a header that can model the
+  bit — and every failure is an `IncompleteProofError` (§5.4¶6: ask again) or a
+  `ContradictoryProofError` (no retry will help). Nothing here verifies a signature yet;
+  the shapes are what a response owes before its RRSIGs are read at all.
+  `tests/test_nsec_responses.py` (44 tests), including the two findings of writing it:
+  under NSEC the wildcard of an encloser can never be *missing* — `*.encloser` sorts
+  directly above the encloser, inside the encloser's own span, so both proof halves ride
+  on one record — which is a geometric fact NSEC3's hashed order does not have; and the
+  erratum's asserting-span refusal is a contradiction rather than an incomplete proof,
+  because a record asserting QNAME's absence while the response asserts its presence is
+  two claims that cannot both stand.
+
 - Extended DNS Errors (RFC 8914) — the `ERROR` option, EDNS option code 15, is composed
   *and* consumed. `ExtendedDNSError` in `namespy.edns` holds an INFO-CODE and the
   EXTRA-TEXT that followed it and interprets neither: §2 says the text "is intended for
@@ -694,6 +729,16 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 
 ### Fixed
+
+- **The name round-trip fuzzer could raise instead of skipping.**
+  `test_names_survive_encode_parse_and_back` assumed the 255-octet limit away *after*
+  encoding — `assume(len(bytes(name)) <= MAX_NAME_OCTETS)` — and the encoding is exactly
+  what raises `DomainNameError` once the budget is blown, so the assumption guarded
+  nothing and a stored six-label counterexample (39-to-40 octet labels) turned every
+  local run red while CI's fresh `.hypothesis/` database and lower example count stayed
+  green. The bound is now computed from the label octets before `from_labels` can raise,
+  and the same ordering mistake in the unregistered-types property (the 0xFFFF record
+  budget) is fixed the same way.
 
 - **Ten test fixtures held an HTTPS record that cannot be parsed.** The octets
   `b"\x00\x00\x00\x01"` were used as HTTPS RDATA across `test_bundle.py` and
