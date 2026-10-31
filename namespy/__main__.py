@@ -479,6 +479,17 @@ def build_parser():
         "exposure -- --trace marks the probes",
     )
     p.add_argument(
+        "--dnssec",
+        action="store_true",
+        help="ask every server for its DNSSEC records by setting EDNS(0)'s DO bit (RFC 6891 "
+        "section 6.1.4), which is what dig +dnssec does: signatures arrive, are printed, and a "
+        "denial answered from cache comes with the NSEC/NSEC3 records that prove it (RFC 8020 "
+        "section 2). Off by default, because nothing here verifies those signatures yet and the "
+        "extra records can push an answer over the 512-octet UDP ceiling into a TCP retry (RFC 3225 "
+        "section 2). When serving, a client that did not set DO still gets the records stripped "
+        "(RFC 4035 section 3.2.1)",
+    )
+    p.add_argument(
         "--mqtype",
         action="append",
         type=_parse_qtype,
@@ -726,6 +737,7 @@ async def cli_query(args) -> int:
             edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
             edns_options=_outbound_options(args),
             qname_min=args.qname_min,
+            dnssec_ok=args.dnssec,
             glue_policy=_glue_policy(args),
             failure_cache=_failure_cache(args),
             nxdomain_cut=_nxdomain_cut(args),
@@ -814,6 +826,7 @@ async def serve(args) -> int:
                 edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
                 edns_options=_outbound_options(args),
                 qname_min=args.qname_min,
+                dnssec_ok=args.dnssec,
                 glue_policy=_glue_policy(args),
                 failure_cache=_failure_cache(args),
                 nxdomain_cut=_nxdomain_cut(args),

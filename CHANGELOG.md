@@ -604,6 +604,32 @@ nothing has been tagged or published yet, so `master` is the only version.
   currently no correct source for an `ad` flag at all; printing nothing is the honest answer until
   they are, which is now a roadmap item — and a prerequisite for RFC 5155 §9.2's AD prohibition,
   which cannot be obeyed by a resolver that cannot set the bit.
+- The serving rule that makes the request worth making: the proof echo a DO=1 client is owed, and the
+  strip a DO=0 client is owed. `namespy.dnssec.DNSSEC_SECURITY_TYPES` (RRSIG, DNSKEY, NSEC, NSEC3,
+  NSEC3PARAM) is the set RFC 4035 §3.2.1¶1 makes conditional on the client, and
+  `DnsServer._strip_dnssec` withdraws it from every section of a reply — recomputing the header
+  counts, which are stored rather than derived, so an answer that drops two RRSIGs while still
+  claiming four records is a message lying about its own length. `_synthesize_response` attaches a
+  cached denial's stored proofs to its answer, which is what makes RFC 8020 §2¶5's MUST satisfiable
+  rather than merely storable: "the iterative, caching resolver MUST return these NSEC or NSEC3
+  records in the response to the triggering query if the query had the DNSSEC OK (DO) bit set". The
+  guard deciding whether to strip exists in exactly one place — `_reply`, just before `_apply_edns` —
+  so the resolver assembles the full answer, the cache never loses evidence, and no policy is split
+  across two components. Three readings the spec leaves open are recorded in the code and tested:
+  **QTYPE=\* is not an explicit request for RRSIG** (§3.2.1's exception covers types a query
+  "explicitly requested", and RFC 3225 §2¶5 makes client willingness binary — otherwise one wildcard
+  type defeats the strip, to the benefit of nobody, since §2¶3's resolvers that fail on DNSSEC records
+  are precisely the ones that send ANY); **a QTx in RFC 10029's list counts as explicitly requested**,
+  because a client that named RRSIG among the types it wanted asked for that type, whichever option
+  carried it; and **DS is not in the set**, on the reading that it is data rather than decoration.
+  That last choice has an operational consequence — a DO=1 walk can now carry a DS in a referral on to
+  a DO=0 client, which §3.1.4's referral rule arguably wants and RFC 3225 §2¶3 would rather avoid —
+  so it is filed as an open question on the roadmap instead of being presented as settled.
+  `namespy lookup --dnssec` puts the whole path within reach of a user: DO outbound, signatures and
+  proofs printed, and a `namespy serve --dnssec` operator gets both halves of §3.2.1. A known gap: the
+  SOA that rides along with an echoed denial is unsigned, because an RRSIG over the SOA is not a proof
+  of anything and was never stored with the proofs. `tests/test_dnssec_serving.py`, 12 tests over the
+  echo, the strip, both exceptions, and the funnel.
 - Authenticated denial of existence: the NSEC and NSEC3 proof rules, in a new module
   `namespy/nsec.py` (RFC 4034 §6.1, RFC 4035 §5.4, RFC 4592 §3.3.1, RFC 5155 §6-§9).
   `name_order_key`, `canonical_name_before`, `sort_canonical`, `name_between`, `hash_between`,

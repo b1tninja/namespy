@@ -1621,6 +1621,7 @@ def resolve_steps(
     nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
     failures=None,
     extra_qtypes: tuple = (),
+    dnssec_ok: bool = False,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1633,6 +1634,12 @@ def resolve_steps(
     ``Answer``/``Done`` or ``Nxdomain``/``Nodata``/``Done`` on a hit. After
     a real authoritative response classifies as a terminal event, the
     result is written back to the cache.
+
+    ``dnssec_ok`` says this resolver asked the authorities for DNSSEC data, and it is what lets a
+    cached denial answer a lookup with the NSEC/NSEC3 records that prove it attached rather than as a
+    bare RCODE 3 (RFC 8020 §2¶5 makes those records part of the answer). It is the instance knob and
+    not a client's DO bit: the walk has no client. What a particular client may see is decided once,
+    on the way out, by :class:`namespy.server.DnsServer` -- see RFC 4035 §3.2.1.
 
     ``nxdomain_cut`` decides whether a denial cached at or above the name may
     answer for it without a query (RFC 8020 §2 -- see :class:`NxdomainPolicy`). It
@@ -1741,7 +1748,7 @@ def resolve_steps(
                     yield Nxdomain()
                 else:
                     yield Nodata(hit.soa)
-                yield Done(_synthesize_response(sname, hit))
+                yield Done(_synthesize_response(sname, hit, dnssec_ok))
                 return
             if cut_enabled:
                 cut = _nxdomain_cut(cache, sname.qname, sname.qclass)
@@ -1754,7 +1761,7 @@ def resolve_steps(
                     entry, denied_by = cut
                     yield NxdomainCut(str(sname.qname), str(denied_by))
                     yield Nxdomain()
-                    yield Done(_synthesize_response(sname, entry))
+                    yield Done(_synthesize_response(sname, entry, dnssec_ok))
                     return
         if failures is not None:
             blocked = failures.match(sname.qname, sname.qtype, sname.qclass)
@@ -2053,12 +2060,29 @@ def _nxdomain_cut(cache, name, qclass):
     return None
 
 
-def _synthesize_response(sname, hit):
+def _synthesize_response(sname, hit, dnssec_ok: bool = False):
     """Build a synthetic :class:`Response` from a cache hit.
 
     The resolver's outer code expects a :class:`Response` from a successful
     resolution (it stamps the original packet's ``ID`` onto it); we manufacture
     one whose AN/NS sections reflect the cached entry.
+
+    *dnssec_ok* decides whether the denial's proof records travel with it, and it means "this
+    resolver asked the authorities for DNSSEC data" -- the instance knob, not a client's DO bit.
+    RFC 8020 §2¶5 is a MUST with a condition on the *query*: "the iterative, caching resolver MUST
+    return these NSEC or NSEC3 records in the response to the triggering query if the query had the
+    DNSSEC OK (DO) bit set". Answering the condition here by looking at the client would split the
+    policy across two components, so the full answer is assembled now and a server that served a
+    DO=0 client withdraws it on the way out (RFC 4035 §3.2.1, ``DnsServer._strip_dnssec``). One
+    place decides what a client may see; the cache, which knows nothing about clients, just does not
+    lose the evidence.
+
+    A known limitation of echoing the bundle: the SOA that rides along is unsigned, because an RRSIG
+    covering the SOA is not a proof of anything and so was never stored with the proofs. RFC
+    4035 §3.1.1¶3's "MUST also place its RRSIG RRs in the Authority section" is addressed to an
+    authoritative server composing a reply from the zone, not to a recursive server's synthetic
+    response, so this is a gap in what a client could validate rather than a rule broken -- and it is
+    on the roadmap next to the response-level validators, which will want that signature anyway.
     """
     questions = list(sname.questions)
     if isinstance(hit, PositiveEntry):
@@ -2071,6 +2095,10 @@ def _synthesize_response(sname, hit):
         )
     rcode = hit.rcode if isinstance(hit.rcode, DnsResponseCode) else DnsResponseCode(int(hit.rcode))
     nameservers = [hit.soa] if hit.soa is not None else []
+    if dnssec_ok:
+        # getattr, not an attribute read: the cache protocol is duck-typed, and a third-party
+        # backend written before proofs existed must answer lookups rather than raise.
+        nameservers.extend(getattr(hit, "proofs", ()) or ())
     return Response(
         QR=DnsQR.RESPONSE,
         AA=False,
@@ -2900,6 +2928,7 @@ class RecursiveResolver(Resolver):
                         glue_policy=self.glue_policy,
                         nxdomain_cut=self.nxdomain_cut,
                         failures=self.failure_cache,
+                        dnssec_ok=self.dnssec_ok,
                     )
                     sub_response = await self._drive(sub_gen, child_trace, depth + 1)
                     if not isinstance(sub_response, Response):
@@ -3011,6 +3040,7 @@ class RecursiveResolver(Resolver):
             nxdomain_cut=self.nxdomain_cut,
             failures=self.failure_cache,
             extra_qtypes=tuple(extra_qtypes),
+            dnssec_ok=self.dnssec_ok,
         )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):

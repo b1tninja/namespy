@@ -478,6 +478,28 @@ async def test_a_plain_lookup_filters_glue_and_says_nothing_about_it(monkeypatch
     assert "BELIEVED" not in capsys.readouterr().err
 
 
+async def test_the_dnssec_flag_reaches_the_resolver(monkeypatch, capsys):
+    """--dnssec is worth nothing until the bit goes out on the wire, so follow it to the resolver.
+
+    The knob lives on the instance because it applies to every hop, which is also what RFC 4035
+    section 3.2.1 says: the resolver side asks regardless of what the client asked.
+    """
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["--dnssec", "example.com"])) == 0
+
+    assert made[0][1].dnssec_ok is True
+
+
+async def test_dnssec_is_off_unless_it_is_asked_for(monkeypatch, capsys):
+    """Asking costs octets on every query, so the default must not ask."""
+    made = _stub_endpoints(monkeypatch, _answered)
+
+    assert await cli.cli_query(_args(["example.com"])) == 0
+
+    assert made[0][1].dnssec_ok is False
+
+
 def test_failure_caching_defaults_to_on():
     """RFC 9520 suppression is what a plain run does; switching it off is opt-in."""
     assert _args(["example.com"]).no_failure_cache is False

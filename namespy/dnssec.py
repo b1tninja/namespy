@@ -37,6 +37,7 @@ __all__ = [
     "DNSKEY_FLAG_ZONE_KEY",
     "DNSKEY_HEAD_OCTETS",
     "DNSKEY_PROTOCOL_VALUE",
+    "DNSSEC_SECURITY_TYPES",
     "NSEC3_ITERATION_LIMITS",
     "NSEC3_OPT_OUT_FLAG",
     "RSA_MD5_ALGORITHM",
@@ -646,6 +647,32 @@ class DuplicateRecordError(ValueError):
 #: Built from the registry rather than from typed-out numbers, so the list reads against the
 #: RFC's sentence and cannot gain a digit by accident. A6 here is 38, the number the IANA
 #: registry carries; RFC 2874 assigned 3847 first, which is why sources disagree.
+#: The RR types that exist only to authenticate other records.
+#:
+#: RFC 4035 §3.1 introduces three of them ("a security-aware authoritative name server for a signed
+#: zone MUST include additional RRSIG, NSEC, and DS RRs" is §3.1¶1 telling the server where they go)
+#: and RFC 5155 adds NSEC3 and NSEC3PARAM, which its §11 registers in IANA's "DNS SECURITY RR Type"
+#: registry alongside the first three. This is the set RFC 4035 §3.2.1 makes conditional on the
+#: client: if the initiating query's DO bit is clear, "the name server side MUST strip any
+#: authenticating DNSSEC RRs from the response but MUST NOT strip any DNSSEC RR types that the
+#: initiating query explicitly requested".
+#:
+#: DS is deliberately *not* here, though §3.1¶1 lists it among what a signed zone adds to a
+#: DO=1 response. A DS is data a client asks for by name, and withdrawing one from a referral would
+#: break the walk rather than hide anything: the strip exists to spare non-DNSSEC clients records it
+#: cannot parse (RFC 3225 §2¶3 reports such resolvers failing outright), not to withhold a resource
+#: record. DNSKEY is included even though it only ever appears when queried directly, because the
+#: query-matches-type exception below is what protects it in that case.
+DNSSEC_SECURITY_TYPES: frozenset[int] = frozenset(
+    {
+        int(DnsRType.RRSIG),
+        int(DnsRType.DNSKEY),
+        int(DnsRType.NSEC),
+        int(DnsRType.NSEC3),
+        int(DnsRType.NSEC3PARAM),
+    }
+)
+
 CANONICAL_DOWNCASE_TYPES: frozenset[int] = frozenset(
     int(DnsRType[name])
     for name in (

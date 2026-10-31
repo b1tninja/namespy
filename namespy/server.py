@@ -100,6 +100,7 @@ import asyncio
 import logging
 
 from . import enable_path_mtu_discovery
+from .dnssec import DNSSEC_SECURITY_TYPES
 from .edns import (
     COOKIE_OPTION_CODE,
     ERROR_OPTION_CODE,
@@ -295,6 +296,13 @@ class DnsServer(asyncio.Protocol):
         self, response, addr, request=None, extended_errors=(), mqtype_answered=None
     ) -> None:
         if request is not None:
+            # Order matters: the strip judges the answer the resolver produced, while
+            # _apply_edns composes a reply OPT from what the client asked for. Stripping after that
+            # would examine a record this server just built for the client rather than one that came
+            # from the zone. A request of None means the datagram never parsed, and the only caller
+            # in that state is _error(), whose response carries no records to withdraw.
+            if not request.dnssec_ok:
+                self._strip_dnssec(request, response, mqtype_answered)
             self._apply_edns(request, response, extended_errors, mqtype_answered)
         wire = bytes(response)
         self.log.debug(
@@ -655,6 +663,45 @@ class DnsServer(asyncio.Protocol):
         """
         for section, count in _SECTIONS:
             setattr(response, count, len(getattr(response, section)))
+
+    @staticmethod
+    def _strip_dnssec(request, response, mqtype_answered=None) -> None:
+        """Withdraw the authenticating records from an answer to a client that did not ask.
+
+        RFC 4035 §3.2.1¶1, second sentence, in the client's terms: "If the DO bit in an initiating
+        query is not set, the name server side MUST strip any authenticating DNSSEC RRs from the
+        response but MUST NOT strip any DNSSEC RR types that the initiating query explicitly
+        requested." The set is :data:`~namespy.dnssec.DNSSEC_SECURITY_TYPES`; the exception is read
+        off the question, and the QTx list of a RFC 10029 multi-type query counts with it -- a client
+        that named RRSIG among the types it wanted asked for that type explicitly, whatever the OPT
+        option's encoding suggests about sections.
+
+        Three details worth their weight:
+
+        * QTYPE=* is not an explicit request for RRSIG. RFC 3225 §2¶5 makes client willingness
+          binary -- "either the client is willing to receive all DNSSEC security RRs or it is not
+          willing to accept any" -- and DO is the bit that decides which. A wildcard question asks
+          for every type at a name, not for permission to receive records the client cannot parse.
+        * OPT is not in the set and so is not touched here: RFC 6891 §6.1.1 forbids forwarding it, and
+          :meth:`_apply_edns` builds the reply's own copy immediately after.
+        * The counts have to be recomputed. ANCOUNT is stored, not derived, so an answer that drops
+          two RRSIGs while still claiming four records is a message that lies about its own length
+          -- see :meth:`_recount`.
+        """
+        requested = {int(question.qtype) for question in request.questions}
+        requested.update(int(qtype) for qtype in mqtype_answered or ())
+        withdraw = DNSSEC_SECURITY_TYPES - requested
+        if not withdraw:
+            return
+        changed = False
+        for section, _count in _SECTIONS:
+            records = getattr(response, section)
+            kept = [record for record in records if int(record.rtype) not in withdraw]
+            if len(kept) != len(records):
+                setattr(response, section, kept)
+                changed = True
+        if changed:
+            DnsServer._recount(response)
 
     @staticmethod
     def _record_key(record):

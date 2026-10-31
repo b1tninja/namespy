@@ -662,6 +662,58 @@ erratum 3441, §8.6–§8.9) wired to `namespy/nsec.py`, then `NxdomainPolicy.VA
 something once proofs are both present and checked; (3) ECDSA/EdDSA encodings (RFC 6605 §4, RFC 8080
 §3) and the verification calls through `namespy[crypto]`.
 
+### Follow-up: serving what was asked for — the echo and the strip (RFC 4035 §3.2.1¶1, RFC 8020 §2¶5, RFC 3225 §2)
+
+Asking for DNSSEC data is only half of §3.2.1. The other half is what happens to that data on the way
+back to a client, and this closes it: `DNSSEC_SECURITY_TYPES` in `namespy/dnssec.py` (RRSIG, DNSKEY,
+NSEC, NSEC3, NSEC3PARAM), `DnsServer._strip_dnssec` withdrawing that set from every section and
+recomputing the header counts, and `_synthesize_response` attaching a cached denial's stored proofs to
+the answer so RFC 8020 §2¶5's MUST is finally satisfiable end to end. `namespy lookup --dnssec`
+reaches all of it from a shell.
+
+**The architectural choice worth keeping**: exactly one line decides whether a client sees these
+records — `if not request.dnssec_ok` in `_reply`, immediately before `_apply_edns`. The resolver
+always assembles the *complete* answer (its `dnssec_ok` says "I asked the authorities", not "my client
+may see this"), and the server narrows it. The tempting alternative — passing the client's DO inward
+and having the walk build two kinds of answer — splits one policy across two components and makes the
+cache's behaviour depend on who happened to ask, which is how a resolver ends up serving an answer
+whose shape depends on cache state from an unrelated client.
+
+**Three judgment calls, all tested, none obvious:**
+
+* *QTYPE=\* is not an explicit request for RRSIG.* §3.2.1's exception is for types the query
+  "explicitly requested", and RFC 3225 §2¶5 makes willingness binary: "either the client is willing to
+  receive all DNSSEC security RRs or it is not willing to accept any". Letting ANY count would let one
+  question type switch the strip off — and the clients §2¶3 reports as *failing* on DNSSEC records are
+  exactly the ones that send ANY.
+* *A QTx in RFC 10029's bundle list counts as an explicit request.* The QT list is OPT RDATA rather
+  than the question section, so reading only `request.questions` would strip the RRSIGs from the answer
+  to a client that named RRSIG as a type it wanted. The exception is about what was requested, not
+  which field carried the request.
+* *DS is not in the set.* §3.1¶1 lists DS among what a signed zone adds for a DO=1 query, so a set
+  built from that sentence alone sweeps referrals away — and a DS is a resource record a client can
+  name. **The consequence is uncomfortable and is on the roadmap**: a DO=1 walk now carries DS records
+  in referrals to DO=0 clients, which §3.1.4 arguably wants and §2¶3 of RFC 3225 argues against. I
+  have not measured how many such clients a given deployment would see, so this is recorded as an open
+  question rather than resolved by preference.
+
+**Two things this does not do.** The SOA riding along with an echoed denial is unsigned: an RRSIG over
+the SOA proves nothing about nonexistence, so it was never stored with the proofs — a gap in what a
+client could validate, not a rule broken (§3.1.1¶3 addresses an authoritative server composing from the
+zone). And nothing verifies any signature yet: `--dnssec` *shows* records, it does not vouch for them,
+which is why the strip is worth having before the validation is.
+
+**Verified**: 1095 passed (+12: 10 serving, 2 CLI), `ruff check .` / `ruff format --check .` clean,
+`mypy namespy` exits 0, `-O` run holds, `--dnssec` in `lookup --help`.
+
+**Next, in order**: (1) the response-level validators — §8.5 with erratum 3441, §8.6–§8.9, wired to
+`namespy/nsec.py` — then `NxdomainPolicy.VALIDATED`; (2) ECDSA/EdDSA encodings (RFC 6605 §4, RFC 8080
+§3) and the verification calls through `namespy[crypto]`; (3) the header AD/CD bits (roadmap), without
+which RFC 5155 §9.2's AD rules cannot be honoured. Also worth deciding before a release: the DS strip
+question above, and whether `serve --dnssec` should imply DO outbound unconditionally per §3.2.1's
+first sentence rather than by flag — currently a server can serve DO=1 clients without ever asking,
+which satisfies the strip half and quietly misses the ask half.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them
