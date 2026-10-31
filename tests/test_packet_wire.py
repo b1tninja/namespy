@@ -333,7 +333,7 @@ def test_opt_ad_flag_and_payload_size() -> None:
     """RFC 6891 sections 6.1.3-6.1.4: FLAGS live in OPT's TTL low half, CLASS carries the size."""
     parsed, _ = DnsPacket.parse(_with_opt(ttl=1 << 15))
     assert parsed.opt() is not None
-    assert parsed.ad
+    assert parsed.dnssec_ok
     assert not parsed.cd
     assert parsed.requestor_payload_size == 1232
 
@@ -361,7 +361,7 @@ def test_no_opt_means_header_rcode() -> None:
     )
     assert parsed.opt() is None
     assert parsed.extended_rcode == 9
-    assert not parsed.ad
+    assert not parsed.dnssec_ok
 
 
 def test_header_rcode_above_fifteen_needs_opt() -> None:

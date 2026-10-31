@@ -226,10 +226,11 @@ def _format_response(response, args, elapsed_ms, bundle=None, cut=None):
         flags.append("rd")
     if response.RA:
         flags.append("ra")
-    if response.ad:
-        flags.append("ad")
-    if response.cd:
-        flags.append("cd")
+    # No "ad" or "cd" here on purpose. Those are header bits 5 and 4 (RFC 6895), and this
+    # package does not model the header's copy of either yet; the bits that were printed here came
+    # from the response's OPT record, where bit 15 is DO -- a request the server granted, not data
+    # anyone validated. Printing them in the header line told users their answer was authenticated.
+    # The EDNS line below is where the OPT flags belong, and they are named there correctly.
 
     lines.append(";; Got answer:")
     lines.append(
@@ -304,8 +305,8 @@ def _format_response(response, args, elapsed_ms, bundle=None, cut=None):
 def _opt_flags(response):
     """The EDNS(0) flag mnemonics set in a response, in dig's order."""
     out = []
-    if response.ad:
-        out.append("ad")
+    if response.dnssec_ok:
+        out.append("do")
     if response.cd:
         out.append("cd")
     return out

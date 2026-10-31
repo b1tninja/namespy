@@ -578,9 +578,32 @@ nothing has been tagged or published yet, so `master` is the only version.
   bit when sending requests, regardless of the state of the DO bit in the initiating request", and
   that the name-server side MUST strip DNSSEC RRs when the client did not ask but MUST NOT strip
   types the query explicitly requested. Honouring that pair needs the client's DO state carried
-  into the resolver and an OPT record built with DO on outbound queries — the next increment, after
-  which RFC 8020 §2¶5's MUST becomes satisfiable rather than merely storable. Proofs that do arrive
+  into the resolver and an OPT record built with DO on outbound queries — done in the entry below,
+  which turns RFC 8020 §2¶5's MUST from storable into satisfiable. Proofs that do arrive
   — from a caller that queried DNSSEC types explicitly — are collected, cached and reachable today.
+- Outbound DO, and the DO/AD confusion that was hiding behind a property name.
+  `RecursiveResolver(dnssec_ok=True)` sets EDNS(0)'s DNSSEC OK bit on every query (new
+  `namespy.packet.EDNS_DO_BIT` / `EDNS_CD_BIT` constants, used by the readers), which is what makes
+  the proofs above arrive at all — an authoritative server sends NSEC/NSEC3 records to a resolver
+  that asks for them, and RFC 4035 §3.2.1 is explicit that "the resolver side of a security-aware
+  recursive name server MUST set the DO bit when sending requests, regardless of the state of the DO
+  bit in the initiating request". Off by default and deliberately so: that MUST binds the recursive
+  *name server* serving DNSSEC-aware clients, and this package is a resolver library until a caller
+  makes it one; the option costs octets per query and can force a TCP re-ask, so it is an operator's
+  decision rather than a default. The EDNS fallback path drops DO along with the OPT record it is
+  re-asking without, so a server that rejected EDNS is not asked for DNSSEC data a second time.
+  **`DnsMessage.ad` was reading OPT FLAGS bit 15, which is DO, not Authentic Data.** AD is header
+  bit 5 (RFC 6895) and asserts "this responder validated the answer"; DO is a *request* — "please
+  include DNSSEC records" — and an authoritative server echoes it back in its response OPT whether or
+  not anything was authenticated. The property is now `DnsMessage.dnssec_ok`, and the consequence is
+  user-visible: `namespy lookup` printed `ad` in the header flag list from that bit, so **every
+  response from a DNSSEC-aware server claimed "authenticated data" to a CLI that had not verified a
+  single signature.** The header flags list no longer prints it, and `_opt_flags` now reports the
+  bit where it belongs and by its right name — `flags: do` on the EDNS line, as dig does.
+  The header's own AD and CD bits are not modelled by this package's wire format yet, so there is
+  currently no correct source for an `ad` flag at all; printing nothing is the honest answer until
+  they are, which is now a roadmap item — and a prerequisite for RFC 5155 §9.2's AD prohibition,
+  which cannot be obeyed by a resolver that cannot set the bit.
 - Authenticated denial of existence: the NSEC and NSEC3 proof rules, in a new module
   `namespy/nsec.py` (RFC 4034 §6.1, RFC 4035 §5.4, RFC 4592 §3.3.1, RFC 5155 §6-§9).
   `name_order_key`, `canonical_name_before`, `sort_canonical`, `name_between`, `hash_between`,

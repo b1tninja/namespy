@@ -580,14 +580,14 @@ queried, and `namespy.nsec` gained two adapters: `collect_proof_records()` to pu
 a response and `proof_entries()` to feed records into the proof predicates. `test_nsec_cache.py` is
 16 tests over the collector, the adapters and both backends.
 
-**The blocker surfaced by doing this, stated plainly: the resolver never sets the DO bit, so it is
-never sent these records.** RFC 4035 §3.2.1 is not ambiguous — the resolver side of a recursive
-server MUST set DO on outbound requests *regardless* of what the client asked, and the name-server
-side MUST strip DNSSEC RRs when the client didn't ask but MUST NOT strip types the query explicitly
-requested. So the echo RFC 8020 §2¶5 requires is storable today and satisfiable only after the DO
-plumbing lands (client DO carried inward, OPT built with DO outbound). I did not invent a serving
-rule to fill the gap: an echo that ignores the strip half of §3.2.1 would hand DNSSEC records to
-clients that never asked for any, which is a behaviour change with its own failure modes.
+**The blocker this created, and where it stands: the resolver never set the DO bit, so it was never
+sent these records.** RFC 4035 §3.2.1 is not ambiguous — the resolver side of a recursive server MUST
+set DO on outbound requests *regardless* of what the client asked, and the name-server side MUST strip
+DNSSEC RRs when the client didn't ask but MUST NOT strip types the query explicitly requested. The
+first half is done (section below: `dnssec_ok`); the strip half needs the client's DO carried inward
+from `namespy/server.py`, and that serving rule is the remaining piece of RFC 8020 §2¶5. I did not
+invent an echo to fill the gap: an echo that ignores the strip half of §3.2.1 would hand DNSSEC
+records to clients that never asked for any, which is a behaviour change with its own failure modes.
 
 **Two rules that shaped the design:**
 * The bundle is whatever §3.1.1¶3 says it is: a proof and its signatures travel together, so an NSEC
@@ -620,6 +620,47 @@ cached denial for DO=1 and strip otherwise (RFC 4035 §3.2.1, RFC 8020 §2¶5); 
 (§8.5 with erratum 3441, §8.6-§8.9) and then `NxdomainPolicy.VALIDATED`, which can finally mean
 something once proofs are both present and checked; (3) ECDSA/EdDSA key and signature encodings
 (RFC 6605 §4, RFC 8080 §3) and the verification calls through `namespy[crypto]`.
+
+### Follow-up: the DO bit, and the AD that was pretending to be it (RFC 6891 §6.1.3–§6.1.4, RFC 4035 §3.2.1, RFC 6895)
+
+Storage was finished last increment; this one opens the tap. `RecursiveResolver(dnssec_ok=True)` puts
+EDNS(0)'s DO bit on every outbound query, behind new `EDNS_DO_BIT`/`EDNS_CD_BIT` constants in
+`namespy/packet.py` that the readers use rather than a bare `0x8000`. The EDNS fallback re-ask drops
+DO with the OPT record it removes: a server that just said it cannot do EDNS is not asked for DNSSEC
+data a second time (test). Default off, argued in the attribute's own docstring: RFC 4035 §3.2.1's
+MUST addresses "the resolver side of a security-aware recursive name server", which is what a caller
+becomes when it serves DNSSEC-aware clients; a library that verifies nothing would pay octets per
+query and an occasional TCP re-ask for records it cannot use.
+
+**The bug this surfaced, which was shipping**: `DnsMessage.ad` read OPT FLAGS bit 15. Bit 15 is DO —
+"please include DNSSEC records". Authentic Data is *header* bit 5 (RFC 6895) and means "I validated
+this". Nothing checked the signature, so the CLI's header line printed `ad` for every answer from a
+DNSSEC-aware server: a granted request rendered as verified data, in the one place a user looks to
+decide whether to trust the answer. The property is `dnssec_ok` now, the CLI reports the bit where it
+lives and by its right name (`flags: do` on the EDNS line, as dig prints it), and the header flag
+list prints neither `ad` nor `cd`.
+
+**Why the fix removes a flag rather than moving it**: this package's wire format does not model the
+header's AD and CD bits at all — the flags field is packed from AA/TC/RD/RA, so bits 5 and 4 neither
+parse nor serialise. There was no correct value to print. Restoring `ad` means modelling those two
+bits first, which is on the roadmap and is a prerequisite for RFC 5155 §9.2¶1's "MUST NOT set AD when
+Opt-Out covers the next closer": a rule about when not to set a bit needs the bit to exist.
+
+**Closed the loop the previous increment left open**: a test drives the resolver's own cache-write
+path (`_write_cache`) with a signed NXDOMAIN — SOA, an unrelated MX, NSEC and its RRSIG in one
+authority section — and asserts the stored `NegativeEntry` carries exactly the NSEC and its signature
+in wire order, MX dropped. That is the only place the three roles separate, so it is where a
+regression silently turns an authenticating denial into a bare NXDOMAIN.
+
+**Verified**: 1083 passed (+8 net: 6 DO tests, 2 cache-write tests; 1075 before), `ruff check .` /
+`ruff format --check .` clean, `mypy namespy` exits 0.
+
+**Next, in order**: (1) the serving rule — carry the client's DO inward from `namespy/server.py`, echo
+proofs on a cached denial to a DO=1 client, strip DNSSEC RRs for DO=0 while never stripping a type the
+query asked for explicitly (RFC 4035 §3.2.1¶1-¶2); (2) the response-level validators (§8.5 with
+erratum 3441, §8.6–§8.9) wired to `namespy/nsec.py`, then `NxdomainPolicy.VALIDATED`, which can mean
+something once proofs are both present and checked; (3) ECDSA/EdDSA encodings (RFC 6605 §4, RFC 8080
+§3) and the verification calls through `namespy[crypto]`.
 
 ## Previous round: MQTYPE (RFC 10029)
 

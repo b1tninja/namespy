@@ -236,8 +236,10 @@ def test_record_row_uses_class_mnemonic_for_unknown_classes():
 
 def _response_with_opt():
     # OPT's TTL is EXTENDED-RCODE | VERSION over FLAGS | Z, so this says
-    # "extended rcode 1" (BADVERS), version 0, with AD set -- a response no
-    # 4-bit header could express on its own.
+    # "extended rcode 1" (BADVERS), version 0, with DO set -- a response no
+    # 4-bit header could express on its own. DO, not AD: bit 15 of the OPT FLAGS
+    # is the request for DNSSEC records (RFC 6891 section 6.1.4), while Authentic
+    # Data is header bit 5, and this response carries no header AD at all.
     opt = DnsRecord(
         DomainName.root_label(),
         DnsRType.OPT,
@@ -260,8 +262,13 @@ def test_response_renders_dig_sections():
     text = _format_response(_response_with_opt(), _args(["example.com"]), 12.9)
     assert "; <<>> namespy <<>> example.com A IN" in text
     assert ";; ->>HEADER<<- opcode: QUERY, status: BADVERS, id: 4660" in text
-    assert "qr rd ra ad" in text
+    assert "qr rd ra" in text
+    # OPT bit 15 is DO, not the header's AD. Printing it in the header line would tell the user the
+    # answer was validated because a server agreed to send DNSSEC records.
+    assert " ad " not in text
+    assert "ra ad" not in text
     assert ";; OPT PSEUDOSECTION:" in text
+    assert "flags: do;" in text, "DO belongs on the EDNS line, named for what it is"
     assert "udpsize: 1232" in text
     assert ";; ANSWER SECTION:" in text
     assert "93.184.216.34" in text

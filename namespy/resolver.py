@@ -81,6 +81,7 @@ from .minimis import QnameMinimiser
 from .names import DomainName
 from .nsec import collect_proof_records
 from .packet import (
+    EDNS_DO_BIT,
     OPT_RTYPE,
     DnsPacket,
     DnsPacketParseError,
@@ -251,6 +252,17 @@ class Resolver(asyncio.Protocol):
     #: query (RFC 6891 section 6.2.3); ``0`` or ``None`` sends no OPT at all.
     edns_payload_size = EDNS_PAYLOAD_SIZE
 
+    #: Whether to set EDNS(0)'s DO bit on outbound queries, asking each server for the DNSSEC
+    #: records alongside the answer (RFC 6891 section 6.1.4). Off by default: this package is a
+    #: resolver library, not yet the "security-aware recursive name server" RFC 4035 section 3.2.1
+    #: addresses when it says the resolver side "MUST set the DO bit when sending requests,
+    #: regardless of the state of the DO bit in the initiating request". A caller that *is* serving
+    #: DNSSEC-aware clients is exactly the entity that sentence binds, and should turn this on --
+    #: otherwise the NSEC/NSEC3 proofs that RFC 8020 section 2 requires echoing back are never sent
+    #: in the first place, however well they are cached. Setting it costs extra octets per query and
+    #: occasionally a TCP fallback, so it is a decision rather than a default.
+    dnssec_ok = False
+
     #: EDNS(0) options to attach to the OPT record of every outbound query --
     #: :class:`~namespy.edns.EdnsOption` instances, or ``(code, value)`` pairs.
     #: Asking for a Name Server Identifier (RFC 5001) is the intended use: an
@@ -303,7 +315,11 @@ class Resolver(asyncio.Protocol):
             # selectively, so the responder never has to guess and the
             # 512-octet truncation regime becomes the fallback rather than
             # the default.
-            dns_packet.add_edns(self._advertised_payload(ip), options=options)
+            dns_packet.add_edns(
+                self._advertised_payload(ip),
+                options=options,
+                flags=EDNS_DO_BIT if self.dnssec_ok else 0,
+            )
         else:
             # No OPT record, so nothing can carry an option: RFC 10029 section 3.1's
             # QT list is OPT RDATA, not a section of its own. A bundle asked for under
@@ -402,7 +418,11 @@ class Resolver(asyncio.Protocol):
                 # unextended re-ask would surrender the advertised payload size too.
                 dns_packet.remove_edns()
                 options = tuple(o for o in options if o.code != MQTYPE_QUERY_OPTION_CODE)
-                dns_packet.add_edns(self._advertised_payload(ip), options=options)
+                dns_packet.add_edns(
+                    self._advertised_payload(ip),
+                    options=options,
+                    flags=EDNS_DO_BIT if self.dnssec_ok else 0,
+                )
                 bundle_in_flight = False
                 continue
             return response
@@ -2306,6 +2326,7 @@ class RecursiveResolver(Resolver):
         qname_min: bool = False,
         glue_policy: GluePolicy = GluePolicy.STRICT,
         nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
+        dnssec_ok: bool = False,
     ):
         """Build a resolver without touching the network.
 
@@ -2376,6 +2397,7 @@ class RecursiveResolver(Resolver):
         self.max_alias_hops = max(1, int(max_alias_hops))
         self.query_timeout = max(0.05, float(query_timeout))
         self.edns_payload_size = 0 if edns_payload_size is None else max(0, int(edns_payload_size))
+        self.dnssec_ok = bool(dnssec_ok)
         # Frozen into a tuple: the value is read once per outbound query and a
         # caller who mutates the list they passed in would otherwise be
         # changing the wire format of queries already in flight.

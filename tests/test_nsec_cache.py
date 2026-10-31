@@ -24,7 +24,7 @@ from namespy.dnssec import encode_base32hex, nsec3_hash
 from namespy.enums import DnsRClass, DnsResponseCode, DnsRType
 from namespy.names import DomainName
 from namespy.nsec import closest_encloser_proof, collect_proof_records, proof_entries
-from namespy.packet import DnsRecord
+from namespy.packet import DnsRecord, Response
 from namespy.rdata import RData_NSEC, RData_NSEC3, RData_RRSIG
 
 ZONE = "example.com."
@@ -65,10 +65,22 @@ def _digest(name, salt=SALT):
     return nsec3_hash(name, iterations=0, salt=salt)
 
 
-def _soa(name=ZONE):
+def _soa(name=ZONE, minimum=3600):
     from namespy.rdata import RData_SOA
 
-    return _record(name, DnsRType.SOA, RData_SOA("ns." + name, "host." + name, serial=1))
+    return _record(
+        name,
+        DnsRType.SOA,
+        RData_SOA(
+            DomainName("ns." + name),
+            DomainName("host." + name),
+            1,
+            7200,
+            3600,
+            1209600,
+            minimum,
+        ),
+    )
 
 
 # ------------------------------------------------------ collecting proofs out of a response
@@ -270,3 +282,70 @@ def test_an_unreadable_proof_blob_costs_the_proofs_not_the_denial(sqlite_cache):
     assert hit is not None
     assert hit.proofs == ()
     assert hit.rcode == DnsResponseCode.NAME_ERROR
+
+
+# --------------------------------------------------- the resolver's own cache-write path
+
+
+def test_writing_a_cached_denial_collects_the_proofs_alongside_the_soa():
+    """The resolver, not just the cache, has to remember the evidence.
+
+    A signed zone's denial arrives as SOA + NSEC + RRSIG in one authority section. This is the
+    single place those three are separated into "the record that sets the TTL ceiling" and "the
+    records that will be echoed later" (RFC 8020 §2¶5), so it is the place a regression silently
+    turns an authenticating denial into a bare NXDOMAIN.
+    """
+    from types import SimpleNamespace
+
+    from namespy.resolver import Nxdomain, _write_cache
+
+    soa = _soa()
+    nsec = _nsec("missing.example.com.", "other.example.com.")
+    signature = _record(
+        "missing.example.com.", DnsRType.RRSIG, _rrsig(NSEC, "missing.example.com.")
+    )
+    noise = _record("other.example.com.", DnsRType.MX, b"\x00\x0a\x00\x00")
+    response = Response(
+        ID=1,
+        QR=1,
+        AA=True,
+        RCODE=DnsResponseCode.NAME_ERROR,
+        questions=[],
+        nameservers=[soa, noise, nsec, signature],
+    )
+    cache = MemoryDnsCache(time_fn=lambda: NOW)
+    sname = SimpleNamespace(
+        qname=DomainName("missing.example.com."), qtype=A, qclass=int(DnsRClass.IN)
+    )
+
+    _write_cache(cache, sname, Nxdomain(), response)
+
+    hit = cache.get("missing.example.com.", A, int(DnsRClass.IN))
+    assert hit is not None, "a denial with an SOA must be cached"
+    assert [bytes(r) for r in hit.proofs] == [bytes(nsec), bytes(signature)]
+
+
+def test_an_unsigned_denial_is_cached_without_proofs_and_still_cuts():
+    """The other half: nothing signed arrived, so nothing is stored, and the denial is still valid."""
+    from types import SimpleNamespace
+
+    from namespy.resolver import Nxdomain, _write_cache
+
+    response = Response(
+        ID=1,
+        QR=1,
+        AA=True,
+        RCODE=DnsResponseCode.NAME_ERROR,
+        questions=[],
+        nameservers=[_soa(), _nsec("missing.example.com.", "other.example.com.")],
+    )
+    cache = MemoryDnsCache(time_fn=lambda: NOW)
+    sname = SimpleNamespace(
+        qname=DomainName("missing.example.com."), qtype=A, qclass=int(DnsRClass.IN)
+    )
+
+    _write_cache(cache, sname, Nxdomain(), response)
+
+    hit = cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN))
+    assert hit is not None
+    assert hit.proofs == ()

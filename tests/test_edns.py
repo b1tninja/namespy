@@ -43,7 +43,7 @@ from namespy.edns import (
 )
 from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from namespy.names import DomainName
-from namespy.packet import DnsPacket, DnsQuestion, DnsRecord, Query, Response
+from namespy.packet import EDNS_DO_BIT, DnsPacket, DnsQuestion, DnsRecord, Query, Response
 from namespy.resolver import (
     Answer,
     RecursiveResolver,
@@ -127,7 +127,7 @@ def test_add_edns_places_version_in_bits_16_to_23_and_flags_in_the_low_half() ->
     assert int(opt.ttl) == (2 << 16) | 0x8000
     packet = parse_sent(bytes(query))
     assert packet.edns_version == 2
-    assert packet.ad  # DO is TTL bit 15 (RFC 3225 section 3)
+    assert packet.dnssec_ok  # DO is TTL bit 15 (RFC 3225 section 3)
     assert not packet.cd
 
 
@@ -247,7 +247,7 @@ def test_version_and_flags_round_trip() -> None:
     query = Query().add_edns(1232, version=2, flags=0x8000)
     parsed, _ = DnsPacket.parse(bytes(query))
     assert 2 == parsed.edns_version
-    assert parsed.ad is True
+    assert parsed.dnssec_ok is True
     assert parsed.cd is False
     cd = Query().add_edns(1232, flags=0x4000)  # RFC 6955 section 4
     assert DnsPacket.parse(bytes(cd))[0].cd is True
@@ -379,6 +379,85 @@ async def test_edns_can_be_disabled_whole() -> None:
     assert not has_opt(first_query)
     future.set_result(answer_for(first_query))
     assert await task is not None
+
+
+# ------------------------------------------------- DO: asking a server for its DNSSEC records
+#
+# RFC 6891 section 6.1.4 defines the bit; RFC 4035 section 3.2.1 says who must set it -- "the
+# resolver side of a security-aware recursive name server MUST set the DO bit when sending requests,
+# regardless of the state of the DO bit in the initiating request". These tests are about the
+# request only. What RFC 4035 section 3.2.1 asks in return is the other half of the sentence: the
+# name-server side MUST strip DNSSEC RRs for a client that did not ask, and that serving rule lands
+# with the response-level proof validators.
+
+
+def test_do_is_written_and_read_by_the_same_named_bit() -> None:
+    """The encoder, the wire and the reader agree, with the constant named rather than a literal.
+
+    Byte-level on purpose: bit 15 of the OPT FLAGS sits in the TTL's third octet, which is the same
+    place an encoder has previously put VERSION, and a mistake there reads as plain Z -- a DO bit
+    that vanishes silently is worse than one that fails loudly.
+    """
+    query = Query(questions=[DnsQuestion(QNAME, DnsQType.A)])
+    query.add_edns(1232, flags=EDNS_DO_BIT)
+    wire = bytes(query)
+    assert wire.endswith(b"\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00")
+    packet = parse_sent(wire)
+    assert packet.dnssec_ok
+    assert not packet.cd, "DO is bit 15; CD is bit 14 and must stay clear"
+
+
+def test_a_plain_edns_query_asks_for_no_dnssec_data() -> None:
+    query = Query(questions=[DnsQuestion(QNAME, DnsQType.A)]).add_edns(1232)
+    assert not parse_sent(bytes(query)).dnssec_ok
+
+
+async def test_dnssec_ok_puts_do_on_the_outbound_query() -> None:
+    resolver = make_resolver(dnssec_ok=True)
+    task, first_query, future = await start_query(resolver)
+    assert first_query.dnssec_ok, "the operator asked for DNSSEC data and the query must say so"
+    future.set_result(answer_for(first_query))
+    assert await task is not None
+
+
+async def test_do_is_absent_unless_the_caller_asks_for_dnssec_data() -> None:
+    # Default off, deliberately: DO buys nothing for a lookup that will not use the records, costs
+    # octets on every query, and can force the TCP re-ask. The MUST in RFC 4035 section 3.2.1 binds
+    # the recursive name server that serves DNSSEC-aware clients, and that is a caller's decision to
+    # make -- so the knob is here, and the choice is not made for them.
+    resolver = make_resolver()
+    task, first_query, future = await start_query(resolver)
+    assert not first_query.dnssec_ok
+    future.set_result(answer_for(first_query))
+    assert await task is not None
+
+
+async def test_the_edns_fallback_drops_do_with_the_record() -> None:
+    """A server that rejects EDNS must not be re-asked with DNSSEC still requested.
+
+    The fallback removes the OPT wholesale, and DO lives inside it -- so the re-ask is a plain RFC
+    1035 query. Re-adding DO there would be asking the server, again, for the thing it just said it
+    could not do.
+    """
+    resolver = make_resolver(dnssec_ok=True)
+    task, first_query, future = await start_query(resolver)
+    assert first_query.dnssec_ok
+    future.set_result(answer_for(first_query, rcode=int(DnsResponseCode.FORMAT_ERROR)))
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if len(resolver.transport.sent) == 2:
+            break
+    second = sent_queries(resolver)[1]
+    assert not has_opt(second)
+    assert not second.dnssec_ok
+    resolver.queue[next(iter(resolver.queue))][1].set_result(answer_for(second))
+    assert await task is not None
+
+
+def test_recursive_resolver_plumbs_dnssec_ok() -> None:
+    assert Resolver.dnssec_ok is False
+    assert RecursiveResolver().dnssec_ok is False
+    assert RecursiveResolver(dnssec_ok=True).dnssec_ok is True
 
 
 def test_recursive_resolver_plumbs_the_knob() -> None:

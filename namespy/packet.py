@@ -280,6 +280,18 @@ class DnsRecord:
 #: RR type of the EDNS(0) pseudo-record (RFC 6891 section 6.1.2).
 OPT_RTYPE = 41
 
+#: EDNS(0) OPT FLAGS, carried in the low 16 bits of OPT's TTL field (RFC 6891 section 6.1.3
+#: lays that field out as EXTENDED-RCODE | VERSION | FLAGS). DO is section 6.1.4's "DNSSEC OK";
+#: CD is checking-disabled, from the same section and RFC 2931.
+#:
+#: Named constants because the pair is constantly mistaken for the *header* bits of similar name.
+#: AD is header bit 5 (RFC 6895) and asserts "this responder validated the answer"; DO is an OPT
+#: flag and asks "please include DNSSEC records". A server echoes DO back whether or not anything
+#: was authenticated, so a flag read from the wrong place reports a granted request as verified
+#: data -- which is precisely the confusion the property below used to fall into.
+EDNS_DO_BIT = 1 << 15
+EDNS_CD_BIT = 1 << 14
+
 
 class DnsPacket:
     """A DNS message: header plus a question section and three RR sections.
@@ -405,27 +417,35 @@ class DnsPacket:
         return (extended << 4) | (header & 0xF)
 
     @property
-    def ad(self) -> bool:
-        """Authentic Data (DO) -- OPT FLAGS bit 15 (RFC 6891 sections 6.1.3-6.1.4).
+    def dnssec_ok(self) -> bool:
+        """DNSSEC OK (DO) -- OPT FLAGS bit 15 (RFC 6891 sections 6.1.3-6.1.4).
 
-        OPT's TTL reads as EXTENDED-RCODE (bits 24-31) | VERSION (bits 16-23)
-        | FLAGS (bits 0-15); DO is the flags field's own bit 15. (The section
-        6.1.3 drawing shows octet 2 as ``DO|Z`` -- octet 2 *begins* with DO
-        and Z fills the rest, so DO lands on TTL bit 15, which is also what
-        ``dig +dnssec`` puts in its QUERY MESSAGE OPT hdrlen field.)
+        OPT's TTL reads as EXTENDED-RCODE (bits 24-31) | VERSION (bits 16-23) | FLAGS (bits
+        0-15); DO is the flags field's own bit 15, which is what ``dig +dnssec`` sets in its
+        QUERY MESSAGE OPT hdrlen field. (The section 6.1.3 drawing shows octet 2 as ``DO|Z``:
+        octet 2 *begins* with DO and Z fills the rest, so DO lands on TTL bit 15.)
+
+        **This is not the header's Authentic Data bit.** AD is header bit 5 (RFC 6895) and means
+        "I validated this"; DO means "send me DNSSEC records", and an authoritative server echoes
+        it back in its response OPT whether or not anything was authenticated. This property used
+        to be called ``ad``, and every reader of it inherited that confusion -- a CLI printing
+        ``ad`` from here was claiming verified data on the strength of a request being granted.
+        The header's AD and CD bits are not modelled by this package yet, so there is currently no
+        correct source for an ``ad`` flag; see the roadmap.
         """
         record = self.opt()
-        return record is not None and bool(int(record.ttl) & (1 << 15))
+        return record is not None and bool(int(record.ttl) & EDNS_DO_BIT)
 
     @property
     def cd(self) -> bool:
         """Checking Disabled -- OPT FLAGS bit 14 (RFC 6891 section 6.1.3, RFC 6955 section 4).
 
-        Same FLAGS-in-low-16-bits layout as :attr:`ad`; CD is the flags
-        field's bit 14.
+        Same FLAGS-in-low-16-bits layout as :attr:`dnssec_ok`; CD is the flags field's bit 14.
+        Note this *is* an OPT flag, unlike the header's CD of RFC 2931 memory: the two share a
+        name and a purpose while sitting in different fields.
         """
         record = self.opt()
-        return record is not None and bool(int(record.ttl) & (1 << 14))
+        return record is not None and bool(int(record.ttl) & EDNS_CD_BIT)
 
     @property
     def requestor_payload_size(self) -> int | None:

@@ -404,7 +404,7 @@ async def test_an_upstream_opt_is_never_forwarded_as_our_own() -> None:
 
     reply = transport.replies[0]
     assert RESPONDER_PAYLOAD_SIZE == reply.requestor_payload_size, "the 512 was theirs"
-    assert not reply.ad, "a DO bit borrowed from an upstream answer claims nothing"
+    assert not reply.dnssec_ok, "a DO bit borrowed from an upstream answer claims nothing"
     assert 1 == sum(1 for r in reply.additional_records if int(r.rtype) == OPT_RTYPE)
 
 

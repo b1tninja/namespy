@@ -739,7 +739,7 @@ class DnsServer(asyncio.Protocol):
             int(primary.RCODE) == int(other.RCODE)
             and bool(primary.AA) == bool(other.AA)
             and bool(primary.TC) == bool(other.TC)
-            and bool(primary.ad) == bool(other.ad)
+            and bool(primary.dnssec_ok) == bool(other.dnssec_ok)
         )
 
     def _prospective_size(self, request, response, answered) -> int:
