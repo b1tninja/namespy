@@ -914,6 +914,70 @@ already handles; (2) `NxdomainPolicy.VALIDATED` wired where `_nxdomain_cut` read
 finally what makes its door-refusal liftable; (3) the header AD/CD bits. The DS-strip
 question and the `serve --dnssec` DO question remain open.
 
+### Follow-up: trust anchors and the first live chain (RFC 9718 §2-§3, RFC 4035 §5.2, RFC 4034 §5)
+
+The fourth stage: a trust point that arrives from its live publication rather than a
+constant, and the DS→DNSKEY link that lets `verify_rrsig`'s answer mean something. For the
+first time this package authenticated a response from the running Internet — the root
+itself — and says so in a test.
+
+**What shipped.** `namespy/anchors.py` — `TrustAnchor` (RFC 9718 §2.2's KeyDigest in
+object form, including the optional PublicKey/Flags pair §2.2¶12 added), `parse_root_anchors`
+(the §2.1 RELAX-NG schema enforced line by line), `fetch_root_anchors` (§3.1¶3's URL over
+HTTPS, transport injectable), `active_anchors` and the §2.2¶7 windows, and
+`matches_dnskey` (RFC 4035 §5.2¶4's tag+algorithm+digest, RFC 4034 §5.2¶1's bit-7 proviso).
+`namespy/verify.py` gained `authenticate_dnskey_rrset` — §5.2¶2-¶5 for one zone, returning
+SECURE/BOGUS/INDETERMINATE with the matched key tag — composing `verify_rrsig` for the
+apex self-signature rather than re-doing any of it.
+
+**Findings.** (1) *RFC 7958 is obsolete, superseded by RFC 9718 (2025-01)* — every handle
+on "the root anchor file" from memory points at the wrong document. 9718 removed the
+self-signed PGP message and the CSR (§3.3: they mixed out-of-band trust of authentication
+keys with out-of-band trust of the DNSSEC keys) and left TLS as the content-and-origin
+assurance (§3.2¶4), with the detached CMS signature optional. The module therefore does
+not pretend to authenticate the file: schema plus transport, and says so. (2) *The live
+file already carries three keys* — the withdrawn 19036 (validUntil 2019-01-11), 20326,
+and the 2024 KSK 38696 — and the two current ones now ship their public keys inside the
+XML, so the §2.2¶7 window logic is load-bearing on day one, not at some hypothetical future
+rollover. (3) *The fixtures cross-check each other*: the DS digests computed from the DNSKEY
+RRset fetched from DNS equal the Digest elements from the independently-fetched IANA file,
+for both live KSKs — the pin that makes an embedded fixture trustworthy without asking anyone
+to trust the session that captured it. (4) *Getting signed data out of this network was its
+own investigation*: UDP/53 is intercepted (forged 12–17-byte answers to the root servers'
+anycast addresses) and the first DoH answers came back identical-but-unsigned from two
+providers — which was my own one-octet-short OPT record killing the DO bit silently. Two
+independent providers agreeing on an unsigned 842-byte answer is exactly what a stripping
+middlebox looks like, and the fix was to check the query bytes, not the network story; the
+corrected query returned the signed set (1139 octets, RRSIG included). (5) *The ZSK trap*:
+flags 256 IS the zone-key bit (0x0100) — a DS may legitimately point at a ZSK — and the
+first draft of the §5.2¶1 test asserted the opposite with a 256-flags record and passed
+nothing; the real non-zone-key case is flags 1. (6) *¶5 means the matched key's own
+signature*: 20326 matches an active anchor and sits in the RRset, but only 38696 signed
+it, so trusting 20326 alone is BOGUS — the KSK-ceremony moment that a
+"any-verified-key-will-do" shortcut would silently wave through. (7) *Tag collisions are
+refused before arithmetic*: a signature bearing the matched key's tag but signed by another
+zone (signer "com.") is not evidence about the root; the signer comparison is §5.2¶5's, and
+16 bits cannot carry it.
+
+**Not claimed.** The resolver still consumes none of this: `NxdomainPolicy.VALIDATED`
+refuses at the door until the walk fetches DS RRsets across zone cuts and feeds them here.
+One link is verified, not the chain end-to-end below the root — a child zone's DS fetch,
+insecure-delegation handling via proved-nonexistence of DS (§5.2¶7), and RFC 8509-style
+anchor maintenance remain open; nothing refreshes the anchor document on its own schedule,
+and the detached CMS signature (§3.2¶3) is deliberately unimplemented, matching the
+document's own trust model.
+
+**Verified**: 1249 passed (+43 in `tests/test_dnssec_anchors.py`), `ruff check .` /
+`ruff format --check .` clean, `mypy namespy` exits 0 (22 modules), `-O` run holds,
+coverage 91% total with `namespy/anchors.py` at 94% (the rest is the urllib transport
+body, which tests inject past) and `namespy/verify.py` at 98%.
+
+**Next, in order**: (1) `NxdomainPolicy.VALIDATED` — the resolver walk fetching DS RRsets
+at each cut, `authenticate_dnskey_rrset` composing them root-down, §5.2¶7/¶10 routing
+insecure and unsupported children, and `NegativeEntry` proofs whose records verify through
+`verify_rrsig`; (2) the header AD/CD bits (§9.2, 6895, 8145). The DS-strip question and the
+`serve --dnssec` DO question remain open.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

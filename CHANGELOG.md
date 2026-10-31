@@ -8,6 +8,28 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- Trust anchors and the first live chain (`namespy/anchors.py`, `verify.authenticate_dnskey_rrset`) —
+  the trust point the verification stage kept deferring to. The root's anchors are read from their
+  live publication rather than embedded from memory: `parse_root_anchors` enforces the RFC 9718 §2.1
+  schema literally (7958 is obsolete, and its PGP/CSR forms were withdrawn precisely because they
+  mixed trust models — in 9718's the transport carries content and origin, §3.2¶4, so this is TLS
+  plus a schema and no invented signature check), `fetch_root_anchors` retrieves it over HTTPS at
+  the operator's direction with an injectable transport, and `TrustAnchor.active` enforces the
+  §2.2¶7 validity windows — the published file already carries three keys, the withdrawn 2010 KSK
+  *and* the 2024 one, and an implementation that ignores the windows is broken at the next ceremony
+  rather than today. `authenticate_dnskey_rrset` then walks the RFC 4035 §5.2¶2-¶5 link: a DNSKEY
+  matching a trusted DS by tag, algorithm and §5.1.4 digest (RFC 4034 §5.2's zone-flag proviso
+  excluding the pair, with its own reportable reason), that matched key's own signature over the
+  apex RRset verified through the existing §5.3.1 procedure, and the signer's name deciding which
+  zone a colliding 16-bit tag actually speaks for. The outcome is three-way again — a digest type
+  that cannot be computed is §5.2¶10's "treat as unsigned", an absent backend is Indeterminate, and
+  neither is ever reported as forged. The tests pin the live IANA document byte for byte and a real
+  signed-root response captured with DO=1: the published digests pick out the live keys, the live
+  response's key tags recompute to the published numbers, the chain lands SECURE on KSK 38696, and
+  every severance — withdrawn anchor, edited key octet, flipped signature octet, matched-but-unsigned
+  KSK, foreign signer — refuses for exactly its own reason (`test_dnssec_anchors.py`, 43 tests).
+  Nothing consumes this from the resolver yet — that is the `NxdomainPolicy.VALIDATED` wiring.
+
 - The RFC 4035 §5.3.1 verification procedure (`namespy/verify.py`) — `verify_rrsig(rrsig, owner,
   rdatas, dnskeys)` walks the conditions cheapest-first (RFC 9904 algorithm policy, the signtime
   window, signed-byte reconstruction, key-tag/protocol/zone-flag matching) and then tries **every**

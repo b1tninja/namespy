@@ -1,6 +1,13 @@
 """The RFC 4035 §5.3.1 check: does this signature authenticate this RRset under these keys.
 
-One function, one question. Everything the answer needs is on the table already: the
+Two functions, one question each. :func:`verify_rrsig` asks it of an RRset and a zone's
+DNSKEY RRset; :func:`authenticate_dnskey_rrset` asks the question one link up -- whether
+the apex DNSKEY RRset itself is authenticated by a trusted DS or trust anchor, the
+RFC 4035 §5.2 step that decides whether any :func:`verify_rrsig` answer means anything.
+The chain of trust is these two questions composed, and they stay two because their
+failures mean different things: a failed RRset signature is a forged answer, a failed
+chain link is a broken or absent path, and a resolver walks away from each differently.
+Everything the answers need is on the table already: the
 canonical-RRset reconstruction from `namespy.dnssec`, the key and signature layouts from
 the encoding legs, the algorithm policy from `namespy.crypto`. What this module owns is
 the *procedure* -- the order the conditions are checked in, which failures mean *invalid*
@@ -11,7 +18,7 @@ to use" and MUST try each.
 What a VALID verdict does **not** mean: that the response is secure. §5.3.1¶11 is explicit
 that authentication "is only meaningful if the validator authenticates the DNSKEY RR
 before using it", and ¶12-¶13 make that a question about the apex DNSKEY RRset and the
-parent's DS -- the trust-anchor stage, not this one. A VALID verdict here means *some key
+parent's DS -- what :func:`authenticate_dnskey_rrset` answers, one link up. A VALID verdict here means *some key
 in the set you handed me signed these bytes*, and nothing about what that key is worth.
 Likewise ¶2 (same owner and class as the RRSIG) and ¶3 (the signer's name is the zone
 that contains the RRset) are equalities across RR headers this codec layer cannot see --
@@ -52,12 +59,26 @@ from .crypto import (
     validation_requirement,
     verify_dnskey_signature,
 )
-from .dnssec import DNSKEY_PROTOCOL_VALUE, rrsig_signed_data
+from .dnssec import (
+    DNSKEY_PROTOCOL_VALUE,
+    ds_digest,
+    known_digest_octets,
+    rrsig_signed_data,
+)
+from .enums import DnsRType
+from .names import DomainName
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; the records arrive duck-typed
-    from .rdata import RData_DNSKEY, RData_RRSIG
+    from .rdata import RData_DNSKEY, RData_DS, RData_RRSIG
 
-__all__ = ["SignatureOutcome", "SignatureVerdict", "verify_rrsig"]
+__all__ = [
+    "ChainOutcome",
+    "ChainVerdict",
+    "SignatureOutcome",
+    "SignatureVerdict",
+    "authenticate_dnskey_rrset",
+    "verify_rrsig",
+]
 
 
 class SignatureOutcome(Enum):
@@ -236,4 +257,165 @@ def verify_rrsig(
         algorithm=algorithm,
         key_tag=rrsig.key_tag,
         attempts=0,
+    )
+
+
+# ----------------------------------------------------------------------- one link of the chain
+
+
+class ChainOutcome(Enum):
+    """RFC 4033 §5's vocabulary for a zone's keys, at the DS-to-DNSKEY link.
+
+    SECURE: the anchor's key signed the apex RRset. BOGUS: the link exists and is wrong
+    -- no key matches the trusted digest, or the matching key's signature does not
+    verify. INDETERMINATE: the link could not be examined (RFC 9080 §3.1's state), which
+    a validator must not report as either of the others.
+    """
+
+    SECURE = "secure"
+    BOGUS = "bogus"
+    INDETERMINATE = "indeterminate"
+
+
+@dataclass(frozen=True)
+class ChainVerdict:
+    """The link's answer: outcome, operator's words, and the key that closed it."""
+
+    outcome: ChainOutcome
+    reason: str
+    matched_key_tag: int | None = None
+    attempts: int = 0
+
+    @property
+    def secure(self) -> bool:
+        return self.outcome is ChainOutcome.SECURE
+
+
+def authenticate_dnskey_rrset(
+    zone,
+    dnskeys: Iterable[RData_DNSKEY],
+    rrsigs: Iterable[RData_RRSIG],
+    trusted: Iterable[RData_DS],
+    *,
+    now: float | None = None,
+    rclass: int = 1,
+) -> ChainVerdict:
+    """Answer RFC 4035 §5.2¶2 for one zone: does a trusted DS introduce these keys?
+
+    ``trusted`` is a parent's already-authenticated DS RRset -- or, at the top of the
+    walk, the trust anchors of `namespy.anchors` in their DS form. ¶5's three conjuncts
+    run in order: a DNSKEY whose tag, algorithm and owner-plus-RDATA digest match a
+    trusted DS (with RFC 4034 §5.2's bit-7 proviso deciding which pairs may even be
+    considered); that key's private key having signed this very apex DNSKEY RRset; and
+    the resulting RRSIG verifying -- which is :func:`verify_rrsig` again, run with the
+    RRset as both subject and key pool, the self-signature shape §5.3.1¶13 describes.
+
+    ¶3 -- that the DS itself was authenticated by the parent -- is the *caller's*
+    conjunct, and deliberately not this function's: at the root the anchors stand in by
+    definition, and one level up the resolver has already run this same function to say
+    so. A function that re-checked its own trust point could only check it against
+    itself.
+
+    The failure taxonomy is where the care went: digest types this package cannot
+    compute yield INDETERMINATE, not BOGUS (§5.2¶8 and §5.2¶10 route the
+    no-supported-algorithm case to "treat the child as unsigned", a different
+    operational answer from "the parent lied"), while a matched key whose signature
+    every candidate RRSIG fails is the §5.2¶5 refusal -- bogus, and no retry changes it.
+    """
+    records = list(dnskeys)
+    if not records:
+        raise ValueError("authenticate_dnskey_rrset needs the apex DNSKEY RRset: dnskeys is empty")
+    trust_points = list(trusted)
+    if not trust_points:
+        raise ValueError(
+            "authenticate_dnskey_rrset needs at least one trust point: trusted is empty"
+        )
+    signatures = list(rrsigs)
+
+    pairs: list[RData_DNSKEY] = []
+    incomparable = 0
+    disqualified = False
+    for ds in trust_points:
+        if known_digest_octets(int(ds.digest_type)) is None:
+            incomparable += 1
+            continue
+        for key in records:
+            if int(key.key_tag) != int(ds.key_tag) or int(key.algorithm) != int(ds.algorithm):
+                continue
+            if ds_digest(zone, bytes(key), int(ds.digest_type)) != bytes(ds.digest):
+                continue
+            if not key.is_zone_key:
+                # RFC 4034 §5.2¶1 reaches further than a mismatch: a DS that points at a
+                # key without bit 7 is unusable *as well as* the key -- the report should
+                # say the pair was excluded, not that nothing matched.
+                disqualified = True
+                continue
+            pairs.append(key)
+    if not pairs:
+        if incomparable == len(trust_points):
+            return ChainVerdict(
+                ChainOutcome.INDETERMINATE,
+                "no trust point carries a digest type this package can compute; RFC "
+                "4035 §5.2¶10 says treat the child as unsigned, not as forged",
+            )
+        if disqualified:
+            return ChainVerdict(
+                ChainOutcome.BOGUS,
+                "the digest-matched DNSKEY lacks the Zone Flag bit; RFC 4034 §5.2¶1 "
+                "excludes it and the DS naming it from the validation process",
+            )
+        return ChainVerdict(
+            ChainOutcome.BOGUS,
+            f"no DNSKEY in the {len(records)}-record apex RRset matches any trusted DS "
+            f"digest (RFC 4035 §5.2¶4)",
+        )
+
+    if not signatures:
+        return ChainVerdict(
+            ChainOutcome.BOGUS,
+            "the apex DNSKEY RRset carries no RRSIG at all; §5.2¶5 requires the "
+            "matched key's private key to have signed it",
+            matched_key_tag=pairs[0].key_tag,
+        )
+
+    apex = DomainName(zone)
+    dnskey_type = int(DnsRType.DNSKEY)
+    attempts = 0
+    blocked: str | None = None
+    for key in pairs:
+        for rrsig in signatures:
+            if int(rrsig.type_covered) != dnskey_type:
+                continue
+            if int(rrsig.key_tag) != int(key.key_tag) or int(rrsig.algorithm) != int(key.algorithm):
+                continue
+            if rrsig.signer_name != apex:
+                # A signature by this key tag from a *different* zone is not §5.2¶5's
+                # "signed the child zone's apex DNSKEY RRset"; tags are 16 bits wide and
+                # collisions exist, so the signer's name decides, not the tag.
+                continue
+            verdict = verify_rrsig(rrsig, zone, records, records, now=now, rclass=rclass)
+            attempts += verdict.attempts
+            if verdict.verified:
+                return ChainVerdict(
+                    ChainOutcome.SECURE,
+                    f"the DS-matched key tag {key.key_tag} signed this apex DNSKEY "
+                    f"RRset and its signature verifies (RFC 4035 §5.2¶2-¶5)",
+                    matched_key_tag=key.key_tag,
+                    attempts=attempts,
+                )
+            if verdict.outcome is SignatureOutcome.UNSUPPORTED:
+                blocked = verdict.reason
+    if blocked is not None and not attempts:
+        # Nothing could be examined: no arithmetic ran, which is the one state a
+        # validator must not upgrade to "forged" -- or downgrade to silence.
+        return ChainVerdict(
+            ChainOutcome.INDETERMINATE,
+            f"the candidate signatures could not be examined: {blocked}",
+            matched_key_tag=pairs[0].key_tag,
+        )
+    return ChainVerdict(
+        ChainOutcome.BOGUS,
+        f"none of the {len(signatures)} RRSIG(s) verifies as a signature by a "
+        f"DS-matched key over this RRset (RFC 4035 §5.2¶5)",
+        attempts=attempts,
     )
