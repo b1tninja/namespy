@@ -201,10 +201,15 @@ def test_names_survive_encode_parse_and_back(labels: list[bytes]) -> None:
     Labels are arbitrary octets (RFC 2181 section 11 forbids restricting them),
     so a dot or a backslash inside a label is the interesting case: it must not
     split into two labels or swallow a neighbour on the way back. Length limits
-    are the encoder's business and are assumed away here.
+    are the encoder's business and are assumed away here -- computed from the
+    labels rather than measured on the encoding, because the encoding is exactly
+    what raises when the budget is blown, and an assumption placed after it
+    guards nothing. Found the slow way, by a stored counterexample: six labels
+    of 39 to 40 octets, and a DomainNameError escaping where an assume() should
+    have filtered the draw.
     """
+    assume(sum(len(label) + 1 for label in labels) + 1 <= MAX_NAME_OCTETS)
     name = DomainName.from_labels(labels)
-    assume(len(bytes(name)) <= MAX_NAME_OCTETS)
     wire = bytes(name)
     assert len(wire) <= MAX_NAME_OCTETS
 
@@ -243,8 +248,10 @@ def test_unregistered_types_carry_their_rdata_untouched(
     the code reached for ``.value`` on a plain int and the whole datagram died.
     """
     assume(rtype not in all_rdata_classes())
+    # The name-length bound as arithmetic, before from_labels can raise on it --
+    # the same ordering rule test_names_survive_encode_parse_and_back documents.
+    assume(sum(len(label) + 1 for label in labels) + 1 + 10 + len(blob) <= 0xFFFF)
     name = DomainName.from_labels(labels)
-    assume(len(bytes(name)) + 10 + len(blob) <= 0xFFFF)
 
     record = DnsRecord(name, rtype, rclass, ttl, rdata=blob)
     wire = bytes(record)
